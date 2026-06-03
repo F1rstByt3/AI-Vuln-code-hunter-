@@ -16,5 +16,7 @@ RUN mkdir -p app && echo '__version__ = "0.1.0"' > app/__init__.py && \
 
 COPY . .
 
+ENV PYTHONPATH=/app
+
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

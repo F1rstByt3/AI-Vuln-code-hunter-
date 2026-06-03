@@ -59,6 +59,7 @@ services:
       - path: .env
         required: false
     environment:
+      PYTHONPATH: /app
       ENVIRONMENT: dev
       AUTH_DISABLED: "true"
       DATABASE_URL: postgresql+asyncpg://hunter:hunter@db:5432/hunter
@@ -86,6 +87,7 @@ services:
       - path: .env
         required: false
     environment:
+      PYTHONPATH: /app
       ENVIRONMENT: dev
       AUTH_DISABLED: "true"
       DATABASE_URL: postgresql+asyncpg://hunter:hunter@db:5432/hunter
