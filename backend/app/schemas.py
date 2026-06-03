@@ -233,6 +233,16 @@ class SeverityBreakdown(BaseModel):
     info: int = 0
 
 
+class EndpointOut(BaseModel):
+    method: str
+    path: str
+    file_path: str
+    line: int
+    framework: str
+    handler: str | None = None
+    auth_hints: list[str] = Field(default_factory=list)
+
+
 class DashboardSummary(BaseModel):
     project_id: str
     total_findings: int
@@ -243,3 +253,4 @@ class DashboardSummary(BaseModel):
     by_category: dict[str, int]
     top_files: list[dict]
     latest_scan: ScanOut | None = None
+    endpoints: list[EndpointOut] = Field(default_factory=list)

@@ -11,6 +11,7 @@ from app.api import (
     artifacts,
     chat,
     clients,
+    export,
     findings,
     mcp,
     projects,
@@ -44,7 +45,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-for module in (clients, projects, artifacts, scans, findings, mcp, chat, stream, settings_api):
+for module in (clients, projects, artifacts, scans, findings, export, mcp, chat, stream, settings_api):
     app.include_router(module.router, prefix="/api")
 
 

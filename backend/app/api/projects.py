@@ -14,6 +14,7 @@ from app.db import get_session
 from app.models import Client, Finding, FindingState, Project, Role, Scan
 from app.schemas import (
     DashboardSummary,
+    EndpointOut,
     ProjectCreate,
     ProjectOut,
     ScanOut,
@@ -86,6 +87,9 @@ async def project_dashboard(project_id: str, session: AsyncSession = Depends(get
     open_f = sum(1 for f in findings if f.state != FindingState.dismissed)
     needs = sum(1 for f in findings if f.state == FindingState.needs_info)
 
+    raw_endpoints = (latest.summary or {}).get("endpoints", [])
+    endpoints = [EndpointOut(**ep) for ep in raw_endpoints if isinstance(ep, dict)]
+
     return DashboardSummary(
         project_id=project_id,
         total_findings=len(findings),
@@ -97,4 +101,5 @@ async def project_dashboard(project_id: str, session: AsyncSession = Depends(get
         by_category=dict(cat.most_common(12)),
         top_files=[{"path": p, "count": n} for p, n in files.most_common(10)],
         latest_scan=ScanOut.model_validate(latest),
+        endpoints=endpoints,
     )

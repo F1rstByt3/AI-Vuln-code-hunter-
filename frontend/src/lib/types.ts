@@ -46,11 +46,15 @@ export interface FoundrySettings {
   api_key_set: boolean; mock_mode: boolean; auth_mode: string;
   roles: ModelRoles;
 }
+export interface Endpoint {
+  method: string; path: string; file_path: string; line: number;
+  framework: string; handler: string; auth_hints: string[];
+}
 export interface Dashboard {
   project_id: string; total_findings: number; open_findings: number; needs_review: number;
   risk_score: number; by_severity: Record<Severity, number>;
   by_category: Record<string, number>; top_files: { path: string; count: number }[];
-  latest_scan?: Scan;
+  latest_scan?: Scan; endpoints?: Endpoint[];
 }
 export interface ScanEvent {
   type: string; ts?: string; status?: string; message?: string; text?: string;

@@ -3,7 +3,7 @@ import { useNavigate, useParams } from "react-router-dom";
 import { Button, Card, SeverityBadge, Spinner, StateBadge } from "../components/ui";
 import { useScanEvents } from "../hooks/useScanEvents";
 import { api } from "../lib/api";
-import type { ChatMessage, Finding, Scan } from "../lib/types";
+import type { ChatMessage, Endpoint, Finding, Scan } from "../lib/types";
 
 export default function ScanPage() {
   const { scanId } = useParams();
@@ -56,6 +56,14 @@ export default function ScanPage() {
         </span>
         {(scan?.status === "running" || scan?.status === "queued") &&
           <Button variant="danger" onClick={() => api.cancelScan(scanId!).then(refresh)}>Cancel</Button>}
+        {scan?.status && !["queued", "running"].includes(scan.status) && (
+          <div className="flex gap-1 ml-auto">
+            <ExportBtn scanId={scanId!} format="burp" label="Burp XML" />
+            <ExportBtn scanId={scanId!} format="sarif" label="SARIF" />
+            <ExportBtn scanId={scanId!} format="csv" label="CSV" />
+            <ExportBtn scanId={scanId!} format="endpoints" label="Endpoints" />
+          </div>
+        )}
       </div>
 
       <div className="grid grid-cols-3 gap-6">
@@ -81,6 +89,10 @@ export default function ScanPage() {
               {findings.length === 0 && <div className="text-muted text-sm">No findings yet.</div>}
             </div>
           </div>
+
+          {scan?.summary?.endpoints?.length > 0 && (
+            <EndpointsPanel endpoints={scan.summary.endpoints} />
+          )}
         </div>
 
         <ChatPanel chat={chat} msg={msg} setMsg={setMsg} send={send} sending={sending} />
@@ -121,6 +133,63 @@ function FindingRow({ f, onTriage }: { f: Finding; onTriage: (id: string, s: str
             <Button variant="ghost" onClick={() => onTriage(f.id, "dismissed")}>Dismiss (FP)</Button>
             <Button variant="ghost" onClick={() => onTriage(f.id, "needs_info")}>Needs review</Button>
           </div>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function ExportBtn({ scanId, format, label }: { scanId: string; format: string; label: string }) {
+  return (
+    <a href={api.exportUrl(scanId, format)} target="_blank" rel="noreferrer"
+      className="px-2 py-1 rounded text-xs border border-border hover:bg-border text-slate-300">
+      {label}
+    </a>
+  );
+}
+
+function EndpointsPanel({ endpoints }: { endpoints: Endpoint[] }) {
+  const [open, setOpen] = useState(false);
+  const unauthCount = endpoints.filter((e) => e.auth_hints.length === 0).length;
+  return (
+    <Card className="p-4">
+      <button onClick={() => setOpen((o) => !o)}
+        className="flex items-center gap-2 w-full text-left">
+        <span className="text-sm font-semibold">
+          {open ? "▼" : "▶"} Discovered endpoints ({endpoints.length})
+        </span>
+        {unauthCount > 0 && (
+          <span className="text-xs text-amber-400">{unauthCount} without auth</span>
+        )}
+      </button>
+      {open && (
+        <div className="mt-2 max-h-64 overflow-auto">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-muted border-b border-border">
+                <th className="text-left px-2 py-1">Method</th>
+                <th className="text-left px-2 py-1">Path</th>
+                <th className="text-left px-2 py-1">Handler</th>
+                <th className="text-left px-2 py-1">File</th>
+                <th className="text-left px-2 py-1">Auth</th>
+              </tr>
+            </thead>
+            <tbody>
+              {endpoints.map((ep, i) => (
+                <tr key={i} className={`border-b border-border/50 ${ep.auth_hints.length === 0 ? "text-amber-300/80" : ""}`}>
+                  <td className="px-2 py-0.5 font-mono">{ep.method}</td>
+                  <td className="px-2 py-0.5 font-mono">{ep.path}</td>
+                  <td className="px-2 py-0.5 text-muted">{ep.handler}</td>
+                  <td className="px-2 py-0.5 text-muted">{ep.file_path}:{ep.line}</td>
+                  <td className="px-2 py-0.5">
+                    {ep.auth_hints.length > 0
+                      ? <span className="text-emerald-400">{ep.auth_hints.join(", ")}</span>
+                      : <span className="text-amber-400">none</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
     </Card>

@@ -17,7 +17,7 @@ export default function ProjectPage() {
   const [models, setModels] = useState<string[]>([]);
   const [model, setModel] = useState("");
   const [gitUrl, setGitUrl] = useState("");
-  const [progress, setProgress] = useState<number | null>(null);
+  const [progress, setProgress] = useState<string | null>(null);
   const [artifactId, setArtifactId] = useState("");
   const [artifactFiles, setArtifactFiles] = useState<ArtifactFile[]>([]);
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
@@ -47,12 +47,18 @@ export default function ProjectPage() {
   }, [artifactId]);
 
   const onUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file || !projectId) return;
-    setProgress(0);
-    try { await api.uploadFile(projectId, file, setProgress); await reload(); }
-    catch (e) { setErr(String(e)); }
-    finally { setProgress(null); }
+    const files = e.target.files;
+    if (!files?.length || !projectId) return;
+    const total = files.length;
+    try {
+      for (let i = 0; i < total; i++) {
+        const file = files[i];
+        setProgress(`Uploading ${file.name} (${i + 1}/${total})…`);
+        await api.uploadFile(projectId, file, () => {});
+      }
+      await reload();
+    } catch (e) { setErr(String(e)); }
+    finally { setProgress(null); e.target.value = ""; }
   };
 
   const addGit = async () => {
@@ -83,9 +89,9 @@ export default function ProjectPage() {
         <Card className="p-4">
           <h2 className="font-semibold mb-3">Code (artifacts)</h2>
           <label className="block mb-3">
-            <span className="text-sm text-muted">Upload archive / file (resumable, 10GB+)</span>
-            <input type="file" onChange={onUpload} className="block mt-1 text-sm" />
-            {progress !== null && <div className="text-xs text-emerald-400 mt-1">Uploading… {progress}%</div>}
+            <span className="text-sm text-muted">Upload archives / files (resumable, 10GB+)</span>
+            <input type="file" multiple onChange={onUpload} className="block mt-1 text-sm" />
+            {progress !== null && <div className="text-xs text-emerald-400 mt-1">{progress}</div>}
           </label>
           <div className="flex gap-2 mb-4">
             <Input placeholder="git url#ref" value={gitUrl} onChange={(e) => setGitUrl(e.target.value)} />
@@ -163,6 +169,10 @@ export default function ProjectPage() {
 }
 
 function DashboardPanel({ d }: { d: Dashboard }) {
+  const [showEndpoints, setShowEndpoints] = useState(false);
+  const endpoints = d.endpoints || [];
+  const unauthEndpoints = endpoints.filter((e) => e.auth_hints.length === 0);
+
   return (
     <Card className="p-4">
       <div className="flex items-center justify-between mb-4">
@@ -193,6 +203,50 @@ function DashboardPanel({ d }: { d: Dashboard }) {
               <span className="truncate">{f.path}</span><span className="text-muted">{f.count}</span>
             </div>
           ))}
+        </div>
+      )}
+      {endpoints.length > 0 && (
+        <div className="mt-4">
+          <div className="flex items-center justify-between mb-1">
+            <button onClick={() => setShowEndpoints((o) => !o)}
+              className="text-xs text-muted hover:text-slate-200 flex items-center gap-1">
+              <span>{showEndpoints ? "▼" : "▶"}</span>
+              Discovered endpoints ({endpoints.length})
+              {unauthEndpoints.length > 0 && (
+                <span className="text-amber-400 ml-1">
+                  {unauthEndpoints.length} without auth
+                </span>
+              )}
+            </button>
+          </div>
+          {showEndpoints && (
+            <div className="max-h-64 overflow-auto border border-border rounded-md bg-bg">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="text-muted border-b border-border">
+                    <th className="text-left px-2 py-1">Method</th>
+                    <th className="text-left px-2 py-1">Path</th>
+                    <th className="text-left px-2 py-1">File</th>
+                    <th className="text-left px-2 py-1">Auth</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {endpoints.map((ep, i) => (
+                    <tr key={i} className={`border-b border-border/50 ${ep.auth_hints.length === 0 ? "text-amber-300/80" : ""}`}>
+                      <td className="px-2 py-0.5 font-mono">{ep.method}</td>
+                      <td className="px-2 py-0.5 font-mono">{ep.path}</td>
+                      <td className="px-2 py-0.5 text-muted">{ep.file_path}:{ep.line}</td>
+                      <td className="px-2 py-0.5">
+                        {ep.auth_hints.length > 0
+                          ? <span className="text-emerald-400">{ep.auth_hints.join(", ")}</span>
+                          : <span className="text-amber-400">none detected</span>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       )}
     </Card>

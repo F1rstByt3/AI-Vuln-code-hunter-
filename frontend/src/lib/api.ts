@@ -67,6 +67,9 @@ export const api = {
   listModels: () => req<{ models: string[]; mock: boolean }>("/settings/foundry/models"),
   testFoundry: () => req<{ ok: boolean; detail: string; models: string[] }>("/settings/foundry/test", { method: "POST" }),
 
+  exportUrl: (scanId: string, format: string) =>
+    `${BASE}/api/scans/${scanId}/export/${format}`,
+
   eventsUrl: (scanId: string) => `${BASE}/api/scans/${scanId}/events`,
 
   // Resumable upload: init -> PUT each chunk -> complete. Handles 10GB+ files.

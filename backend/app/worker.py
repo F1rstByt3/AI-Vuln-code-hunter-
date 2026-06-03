@@ -36,6 +36,7 @@ from app.models import (
     Severity,
 )
 from app.runtime_config import get_foundry_config
+from app.scanners.endpoints import extract_endpoints
 from app.scanners.mcp_client import McpClient
 from app.scanners.semgrep import SemgrepScanner
 from app.storage import get_storage
@@ -71,6 +72,11 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
             workdir = await _ingest(session, artifact, emit)
 
             candidates = await _static_scan(session, scan, artifact, workdir, emit)
+
+            await emit({"type": "status", "status": "extracting endpoints"})
+            endpoints = await extract_endpoints(workdir)
+            await emit({"type": "log", "message":
+                        f"Extracted {len(endpoints)} endpoints"})
 
             async def read_file(rel: str) -> str | None:
                 return _safe_read(workdir, rel)
@@ -115,7 +121,7 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
             )
 
             await _persist_findings(session, scan, result["findings"])
-            scan.summary = result["summary"]
+            scan.summary = {**result["summary"], "endpoints": endpoints}
             scan.status = (
                 ScanStatus.needs_review if result["summary"].get("needs_review")
                 else ScanStatus.completed
