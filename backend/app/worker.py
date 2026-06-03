@@ -90,6 +90,17 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
                     ArtifactFile.artifact_id == artifact.id, ArtifactFile.included.is_(True)
                 )
             )).scalars().all()
+
+            selected_paths = (scan.config or {}).get("file_paths")
+            if selected_paths:
+                artifact_files = [
+                    f for f in artifact_files
+                    if any(f.path == p or f.path.startswith(p.rstrip("/") + "/")
+                           for p in selected_paths)
+                ]
+                await emit({"type": "log", "message":
+                            f"Scoped to {len(artifact_files)} files ({len(selected_paths)} selections)"})
+
             files = [{"path": f.path, "language": f.language, "size": f.size_bytes}
                      for f in artifact_files]
 

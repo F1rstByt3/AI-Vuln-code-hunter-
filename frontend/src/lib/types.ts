@@ -29,6 +29,10 @@ export interface McpServer {
   id: string; project_id?: string; name: string; kind: string; transport: string;
   url?: string; enabled: boolean;
 }
+export interface ArtifactFile {
+  id: string; path: string; size_bytes: number; language: string | null;
+  is_binary: boolean; is_vendored: boolean; included: boolean;
+}
 export interface ChatMessage { id: string; scan_id: string; role: string; content: string; }
 export interface ModelRole {
   deployment: string; transport: string; reasoning_effort?: string | null;

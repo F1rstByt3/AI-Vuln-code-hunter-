@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { Button, Card, Input } from "../components/ui";
+import FileTree from "../components/FileTree";
+import { Button, Card, Input, Spinner } from "../components/ui";
 import { api } from "../lib/api";
-import type { Artifact, Dashboard, Project, Scan } from "../lib/types";
+import type { Artifact, ArtifactFile, Dashboard, Project, Scan } from "../lib/types";
 
 const SEV_ORDER = ["critical", "high", "medium", "low", "info"] as const;
 
@@ -18,6 +19,9 @@ export default function ProjectPage() {
   const [gitUrl, setGitUrl] = useState("");
   const [progress, setProgress] = useState<number | null>(null);
   const [artifactId, setArtifactId] = useState("");
+  const [artifactFiles, setArtifactFiles] = useState<ArtifactFile[]>([]);
+  const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
+  const [loadingFiles, setLoadingFiles] = useState(false);
   const [instructions, setInstructions] = useState("");
   const [err, setErr] = useState("");
 
@@ -32,6 +36,15 @@ export default function ProjectPage() {
   };
   useEffect(() => { reload().catch((e) => setErr(String(e))); }, [projectId]);
   useEffect(() => { api.listModels().then((m) => { setModels(m.models); if (!model && m.models[0]) setModel(m.models[0]); }).catch(() => {}); }, []);
+
+  useEffect(() => {
+    if (!artifactId) { setArtifactFiles([]); setSelectedPaths([]); return; }
+    setLoadingFiles(true);
+    api.listArtifactFiles(artifactId)
+      .then((f) => { setArtifactFiles(f); setSelectedPaths([]); })
+      .catch(() => setArtifactFiles([]))
+      .finally(() => setLoadingFiles(false));
+  }, [artifactId]);
 
   const onUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -52,6 +65,7 @@ export default function ProjectPage() {
     if (!projectId || !artifactId) return;
     const scan = await api.createScan(projectId, {
       artifact_id: artifactId, scanners: ["semgrep", "ai"], instructions, model,
+      file_paths: selectedPaths.length > 0 ? selectedPaths : undefined,
     });
     nav(`/scans/${scan.id}`);
   };
@@ -121,6 +135,29 @@ export default function ProjectPage() {
           </div>
         </Card>
       </div>
+
+      {artifactId && (
+        <Card className="p-4 mt-6">
+          <h2 className="font-semibold mb-3">
+            Scope: select files & folders
+            {selectedPaths.length > 0 && (
+              <span className="text-xs font-normal text-emerald-400 ml-2">
+                {selectedPaths.length} selected
+              </span>
+            )}
+            {selectedPaths.length === 0 && (
+              <span className="text-xs font-normal text-muted ml-2">
+                all files (click to narrow scope)
+              </span>
+            )}
+          </h2>
+          {loadingFiles ? (
+            <div className="flex items-center gap-2 text-muted text-sm p-4"><Spinner /> Loading file tree...</div>
+          ) : (
+            <FileTree files={artifactFiles} selectedPaths={selectedPaths} onSelectionChange={setSelectedPaths} />
+          )}
+        </Card>
+      )}
     </div>
   );
 }

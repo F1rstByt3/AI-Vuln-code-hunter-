@@ -121,11 +121,12 @@ async def get_artifact(artifact_id: str, session: AsyncSession = Depends(get_ses
 
 @router.get("/artifacts/{artifact_id}/files", response_model=list[ArtifactFileOut])
 async def list_artifact_files(
-    artifact_id: str, included_only: bool = True, limit: int = 1000,
+    artifact_id: str, included_only: bool = False, limit: int = 50000,
     session: AsyncSession = Depends(get_session),
 ):
     stmt = select(ArtifactFile).where(ArtifactFile.artifact_id == artifact_id)
     if included_only:
         stmt = stmt.where(ArtifactFile.included.is_(True))
+    stmt = stmt.order_by(ArtifactFile.path)
     rows = (await session.execute(stmt.limit(limit))).scalars().all()
     return rows

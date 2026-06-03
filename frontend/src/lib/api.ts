@@ -1,6 +1,6 @@
 import type {
-  Artifact, ChatMessage, Client, Dashboard, Finding, FoundrySettings,
-  McpServer, Project, Scan,
+  Artifact, ArtifactFile, ChatMessage, Client, Dashboard, Finding,
+  FoundrySettings, McpServer, Project, Scan,
 } from "./types";
 
 const BASE = (import.meta as any).env?.VITE_API_BASE_URL || "http://localhost:8000";
@@ -38,10 +38,12 @@ export const api = {
   listArtifacts: (projectId: string) => req<Artifact[]>(`/projects/${projectId}/artifacts`),
   createArtifact: (projectId: string, b: { kind: string; source_ref?: string; label?: string }) =>
     req<Artifact>(`/projects/${projectId}/artifacts`, { method: "POST", body: JSON.stringify(b) }),
+  listArtifactFiles: (artifactId: string) =>
+    req<ArtifactFile[]>(`/artifacts/${artifactId}/files`),
 
   // scans
   listScans: (projectId: string) => req<Scan[]>(`/projects/${projectId}/scans`),
-  createScan: (projectId: string, b: { artifact_id: string; scanners: string[]; instructions?: string; model?: string }) =>
+  createScan: (projectId: string, b: { artifact_id: string; scanners: string[]; instructions?: string; model?: string; file_paths?: string[] }) =>
     req<Scan>(`/projects/${projectId}/scans`, { method: "POST", body: JSON.stringify(b) }),
   getScan: (id: string) => req<Scan>(`/scans/${id}`),
   cancelScan: (id: string) => req<Scan>(`/scans/${id}/cancel`, { method: "POST" }),

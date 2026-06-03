@@ -42,7 +42,10 @@ async def create_scan(
         project_id=project_id,
         artifact_id=body.artifact_id,
         status=ScanStatus.queued,
-        config={"scanners": body.scanners, "instructions": body.instructions, "model": body.model},
+        config={
+            "scanners": body.scanners, "instructions": body.instructions,
+            "model": body.model, "file_paths": body.file_paths,
+        },
     )
     session.add(scan)
     await session.commit()
