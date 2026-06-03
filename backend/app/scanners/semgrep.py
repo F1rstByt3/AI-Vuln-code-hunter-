@@ -1,0 +1,71 @@
+"""Semgrep adapter — runs Semgrep over the extracted code and normalises results
+into Candidate dicts. This is the broad, high-recall sweep over the whole tree."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+
+from app.config import settings
+from app.scanners.base import Candidate
+
+_SEV_MAP = {"ERROR": "high", "WARNING": "medium", "INFO": "low"}
+_EXCLUDES = ["node_modules", "vendor", ".git", "dist", "build", "*.min.js", "*.lock"]
+
+
+class SemgrepScanner:
+    name = "semgrep"
+
+    async def scan(self, workdir: str) -> list[Candidate]:
+        cmd = [
+            "semgrep", "scan",
+            "--config", settings.semgrep_ruleset,
+            "--json", "--quiet", "--no-git-ignore",
+            "--max-target-bytes", str(settings.max_file_bytes_for_ai * 5),
+            "--timeout", "120",
+        ]
+        for ex in _EXCLUDES:
+            cmd += ["--exclude", ex]
+        cmd.append(".")
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=workdir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _stderr = await proc.communicate()
+        if not stdout:
+            return []
+        try:
+            data = json.loads(stdout)
+        except json.JSONDecodeError:
+            return []
+        return [self._to_candidate(r, workdir) for r in data.get("results", [])]
+
+    def _to_candidate(self, r: dict, workdir: str) -> Candidate:
+        extra = r.get("extra", {})
+        meta = extra.get("metadata", {})
+        sev = _SEV_MAP.get(extra.get("severity", "WARNING"), "medium")
+        cwe = meta.get("cwe")
+        if isinstance(cwe, list):
+            cwe = cwe[0] if cwe else None
+        owasp = meta.get("owasp")
+        if isinstance(owasp, list):
+            owasp = owasp[0] if owasp else None
+        rel = os.path.relpath(r.get("path", ""), workdir)
+        return Candidate(
+            source="semgrep",
+            rule=r.get("check_id", ""),
+            title=(meta.get("shortDescription") or r.get("check_id", "")).split("\n")[0][:200],
+            message=extra.get("message", ""),
+            severity=sev,
+            cwe=str(cwe) if cwe else None,
+            owasp=str(owasp) if owasp else None,
+            category=meta.get("category", "security"),
+            file_path=rel,
+            line_start=r.get("start", {}).get("line"),
+            line_end=r.get("end", {}).get("line"),
+            code_snippet=extra.get("lines"),
+        )
