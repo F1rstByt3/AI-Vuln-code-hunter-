@@ -80,8 +80,13 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
             await emit({"type": "log", "message": f"AI reviewer: {cfg.deployment} "
                                                   f"({'mock' if cfg.mock else 'azure'})"})
 
+            artifact_files = (await session.execute(
+                select(ArtifactFile).where(
+                    ArtifactFile.artifact_id == artifact.id, ArtifactFile.included.is_(True)
+                )
+            )).scalars().all()
             files = [{"path": f.path, "language": f.language, "size": f.size_bytes}
-                     for f in artifact.files if f.included]
+                     for f in artifact_files]
             model = (scan.config or {}).get("model") or cfg.deployment
 
             result = await run_review(
@@ -121,9 +126,13 @@ async def _ingest(session, artifact: Artifact, emit) -> str:
     workdir = await materialize(artifact, storage)
     result = index_files(workdir)
 
-    # refresh the file index
-    for f in list(artifact.files):
+    # delete old file index (explicit query — no lazy loading in async)
+    old_files = (await session.execute(
+        select(ArtifactFile).where(ArtifactFile.artifact_id == artifact.id)
+    )).scalars().all()
+    for f in old_files:
         await session.delete(f)
+
     session.add_all([
         ArtifactFile(
             artifact_id=artifact.id, path=f.path, size_bytes=f.size_bytes, language=f.language,
