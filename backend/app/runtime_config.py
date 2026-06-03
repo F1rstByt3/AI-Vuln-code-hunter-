@@ -17,6 +17,20 @@ from app.models import Setting
 FOUNDRY_KEY = "foundry"
 _SECRET_FIELDS = {"api_key"}
 
+_STRIP_SUFFIXES = ("/openai/v1", "/openai/v1/", "/openai", "/openai/", "/v1", "/v1/")
+
+
+def _normalize_endpoint(url: str | None) -> str | None:
+    if not url:
+        return url
+    url = url.strip().rstrip("/")
+    lower = url.lower()
+    for suffix in _STRIP_SUFFIXES:
+        if lower.endswith(suffix):
+            url = url[: -len(suffix)]
+            break
+    return url
+
 
 async def _get(session: AsyncSession, key: str) -> dict:
     row = (await session.execute(select(Setting).where(Setting.key == key))).scalar_one_or_none()
@@ -41,6 +55,7 @@ async def get_foundry_config(session: AsyncSession) -> FoundryConfig:
             setattr(cfg, field, stored[field])
     if "use_agent_service" in stored:
         cfg.use_agent_service = bool(stored["use_agent_service"])
+    cfg.endpoint = _normalize_endpoint(cfg.endpoint)
     return cfg
 
 
@@ -65,6 +80,8 @@ async def update_foundry_settings(session: AsyncSession, patch: dict) -> dict:
     for field in ("endpoint", "deployment", "api_version"):
         if field in patch and patch[field] is not None:
             stored[field] = patch[field].strip()
+    if "endpoint" in stored:
+        stored["endpoint"] = _normalize_endpoint(stored["endpoint"]) or ""
     if "use_agent_service" in patch and patch["use_agent_service"] is not None:
         stored["use_agent_service"] = bool(patch["use_agent_service"])
     if patch.get("api_key"):  # only overwrite when a non-empty value is supplied
