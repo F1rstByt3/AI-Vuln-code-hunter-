@@ -1,0 +1,167 @@
+import { useEffect, useState } from "react";
+import { useNavigate, useParams } from "react-router-dom";
+import { Button, Card, Input } from "../components/ui";
+import { api } from "../lib/api";
+import type { Artifact, Dashboard, Project, Scan } from "../lib/types";
+
+const SEV_ORDER = ["critical", "high", "medium", "low", "info"] as const;
+
+export default function ProjectPage() {
+  const { projectId } = useParams();
+  const nav = useNavigate();
+  const [project, setProject] = useState<Project>();
+  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+  const [scans, setScans] = useState<Scan[]>([]);
+  const [dash, setDash] = useState<Dashboard>();
+  const [models, setModels] = useState<string[]>([]);
+  const [model, setModel] = useState("");
+  const [gitUrl, setGitUrl] = useState("");
+  const [progress, setProgress] = useState<number | null>(null);
+  const [artifactId, setArtifactId] = useState("");
+  const [instructions, setInstructions] = useState("");
+  const [err, setErr] = useState("");
+
+  const reload = async () => {
+    if (!projectId) return;
+    const [p, a, s, d] = await Promise.all([
+      api.getProject(projectId), api.listArtifacts(projectId),
+      api.listScans(projectId), api.dashboard(projectId),
+    ]);
+    setProject(p); setArtifacts(a); setScans(s); setDash(d);
+    if (a[0] && !artifactId) setArtifactId(a[0].id);
+  };
+  useEffect(() => { reload().catch((e) => setErr(String(e))); }, [projectId]);
+  useEffect(() => { api.listModels().then((m) => { setModels(m.models); setModel(m.models[0] || ""); }).catch(() => {}); }, []);
+
+  const onUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !projectId) return;
+    setProgress(0);
+    try { await api.uploadFile(projectId, file, setProgress); await reload(); }
+    catch (e) { setErr(String(e)); }
+    finally { setProgress(null); }
+  };
+
+  const addGit = async () => {
+    if (!projectId || !gitUrl.trim()) return;
+    await api.createArtifact(projectId, { kind: "git", source_ref: gitUrl.trim() });
+    setGitUrl(""); reload();
+  };
+
+  const startScan = async () => {
+    if (!projectId || !artifactId) return;
+    const scan = await api.createScan(projectId, {
+      artifact_id: artifactId, scanners: ["semgrep", "ai"], instructions, model,
+    });
+    nav(`/scans/${scan.id}`);
+  };
+
+  return (
+    <div>
+      <button onClick={() => nav("/")} className="text-sm text-muted hover:text-slate-200 mb-2">← Clients</button>
+      <h1 className="text-2xl font-bold">{project?.name || "Project"}</h1>
+      <p className="text-muted text-sm mb-6">{project?.description}</p>
+      {err && <div className="text-red-400 text-sm mb-4">{err}</div>}
+
+      {dash && <DashboardPanel d={dash} />}
+
+      <div className="grid grid-cols-2 gap-6 mt-6">
+        <Card className="p-4">
+          <h2 className="font-semibold mb-3">Code (artifacts)</h2>
+          <label className="block mb-3">
+            <span className="text-sm text-muted">Upload archive / file (resumable, 10GB+)</span>
+            <input type="file" onChange={onUpload} className="block mt-1 text-sm" />
+            {progress !== null && <div className="text-xs text-emerald-400 mt-1">Uploading… {progress}%</div>}
+          </label>
+          <div className="flex gap-2 mb-4">
+            <Input placeholder="git url#ref" value={gitUrl} onChange={(e) => setGitUrl(e.target.value)} />
+            <Button variant="ghost" onClick={addGit}>Link git</Button>
+          </div>
+          <div className="space-y-1 max-h-48 overflow-auto">
+            {artifacts.map((a) => (
+              <label key={a.id} className="flex items-center gap-2 px-2 py-1 rounded hover:bg-border text-sm">
+                <input type="radio" name="artifact" checked={artifactId === a.id} onChange={() => setArtifactId(a.id)} />
+                <span className="flex-1 truncate">{a.label || a.source_ref || a.id}</span>
+                <span className="text-xs text-muted">{a.kind} · {a.analyzable_count || 0} files</span>
+              </label>
+            ))}
+            {artifacts.length === 0 && <div className="text-muted text-sm">No code yet.</div>}
+          </div>
+        </Card>
+
+        <Card className="p-4">
+          <h2 className="font-semibold mb-3">Start a review</h2>
+          <label className="text-sm text-muted">AI model (from Foundry project)</label>
+          <select value={model} onChange={(e) => setModel(e.target.value)}
+            className="w-full mt-1 mb-3 px-3 py-2 rounded-md bg-bg border border-border text-sm">
+            {models.map((m) => <option key={m} value={m}>{m}</option>)}
+            {models.length === 0 && <option value="">(configure Foundry in Settings)</option>}
+          </select>
+          <label className="text-sm text-muted">Instructions for the agent (optional)</label>
+          <textarea value={instructions} onChange={(e) => setInstructions(e.target.value)}
+            placeholder="e.g. focus on auth & the payments module; ignore tests"
+            className="w-full mt-1 mb-3 px-3 py-2 rounded-md bg-bg border border-border text-sm h-20" />
+          <Button onClick={startScan} disabled={!artifactId}>▶ Run analysis</Button>
+
+          <h3 className="font-semibold mt-6 mb-2 text-sm">Recent scans</h3>
+          <div className="space-y-1 max-h-40 overflow-auto">
+            {scans.map((s) => (
+              <button key={s.id} onClick={() => nav(`/scans/${s.id}`)}
+                className="w-full flex justify-between px-2 py-1.5 rounded hover:bg-border text-sm">
+                <span>{new Date(s.created_at).toLocaleString()}</span>
+                <span className="text-xs text-muted">{s.status}</span>
+              </button>
+            ))}
+            {scans.length === 0 && <div className="text-muted text-sm">No scans yet.</div>}
+          </div>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+function DashboardPanel({ d }: { d: Dashboard }) {
+  return (
+    <Card className="p-4">
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="font-semibold">Vulnerability dashboard</h2>
+        <div className="text-right">
+          <div className="text-3xl font-bold text-emerald-400">{d.risk_score}</div>
+          <div className="text-xs text-muted">risk score</div>
+        </div>
+      </div>
+      <div className="grid grid-cols-5 gap-2 mb-4">
+        {SEV_ORDER.map((s) => (
+          <div key={s} className="text-center rounded-md border border-border py-2">
+            <div className="text-xl font-bold">{d.by_severity?.[s] ?? 0}</div>
+            <div className="text-[11px] uppercase text-muted">{s}</div>
+          </div>
+        ))}
+      </div>
+      <div className="grid grid-cols-3 gap-4 text-sm">
+        <Stat label="Total findings" value={d.total_findings} />
+        <Stat label="Open" value={d.open_findings} />
+        <Stat label="Needs human review" value={d.needs_review} highlight />
+      </div>
+      {d.top_files.length > 0 && (
+        <div className="mt-4">
+          <div className="text-xs text-muted mb-1">Hotspot files</div>
+          {d.top_files.slice(0, 5).map((f) => (
+            <div key={f.path} className="flex justify-between text-xs py-0.5">
+              <span className="truncate">{f.path}</span><span className="text-muted">{f.count}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function Stat({ label, value, highlight }: { label: string; value: number; highlight?: boolean }) {
+  return (
+    <div className="rounded-md border border-border p-3">
+      <div className={`text-2xl font-bold ${highlight && value > 0 ? "text-fuchsia-300" : ""}`}>{value}</div>
+      <div className="text-xs text-muted">{label}</div>
+    </div>
+  );
+}
