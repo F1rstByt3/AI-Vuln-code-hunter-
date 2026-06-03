@@ -28,25 +28,52 @@ Client → Project → Artifact (code snapshot) → Scan → Findings
 | Entra ID auth (+ dev bypass), runtime-editable Foundry settings, model picker | ✅ |
 | Azure infra (Bicep, all fresh except Foundry) | ✅ starting point |
 
-## Quickstart (local, no Azure needed)
+## V1 — local deployment (no auth, no cloud infra needed)
 
 ```bash
-cp .env.example .env          # defaults run in mock + no-auth mode
+git clone <this-repo> && cd AI-Vuln-code-hunter-
 docker compose up --build
 ```
 
-- UI: http://localhost:5173 · API docs: http://localhost:8000/docs · MinIO: http://localhost:9001
+That's it. No `.env` file needed — all defaults are inlined. First build takes a
+few minutes (installs Semgrep etc.); subsequent starts are fast.
 
-With `FOUNDRY_ENDPOINT` blank, the reviewer runs in **deterministic mock mode** —
-create a client → project → link a git repo or upload a file → **Run analysis** and
-watch the full pipeline stream findings, including a human-review item. Then add your
-Foundry endpoint/key in **Settings** and pick a model to use the real reviewer.
+| Service | URL |
+|---|---|
+| **UI** | http://localhost:5173 |
+| **API docs** (Swagger) | http://localhost:8000/docs |
+| **MinIO** (file browser) | http://localhost:9001 — `hunter` / `hunter-secret` |
 
-### Run the tests
+### Connect to your Azure AI Foundry
+
+With no Foundry endpoint, the reviewer runs in **deterministic mock mode** so you
+can drive the entire flow end-to-end. To go live:
+
+1. Open **Settings** in the UI (left sidebar).
+2. Paste your **Foundry endpoint URL** and **API key**.
+3. Pick a **model** from the dropdown (auto-lists your deployments).
+4. Click **Test connection** → save.
+
+All scans from that point use the real model. No restart, no config file.
+
+Alternatively, create a `.env` (copy `.env.example`) and set `FOUNDRY_ENDPOINT` /
+`FOUNDRY_API_KEY` / `FOUNDRY_DEPLOYMENT` there — those are picked up on next start.
+
+### Useful commands
+
+```bash
+make up             # start (detached) — prints URLs
+make logs           # tail API + worker logs
+make down           # stop
+make clean          # stop + wipe DB/files/Redis
+make test           # backend tests (no Docker needed, just a Python venv)
+```
+
+### Run the tests (no Docker)
 
 ```bash
 cd backend && python -m venv .venv && . .venv/bin/activate
-pip install -e ".[dev]" && pytest -q          # agent pipeline runs without infra
+pip install -e ".[dev]" && pytest -q
 ```
 
 ## How a scan works

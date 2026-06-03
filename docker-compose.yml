@@ -1,5 +1,9 @@
-# Dev stack. Brings up Postgres, Redis, MinIO (S3), the API, a scan worker,
-# and the Vite frontend. Prod uses the Azure manifests under infra/azure/.
+# V1 — local dev stack. One command: docker compose up --build
+#
+# No .env file needed — all defaults are inlined. To connect to Azure AI Foundry,
+# set FOUNDRY_ENDPOINT and FOUNDRY_API_KEY in a .env file (copy .env.example).
+# Auth is disabled for local use.
+
 services:
   db:
     image: postgres:16-alpine
@@ -38,12 +42,10 @@ services:
       timeout: 3s
       retries: 10
 
-  # Creates the bucket on startup, then exits.
   minio-init:
     image: minio/mc:latest
     depends_on:
-      minio:
-        condition: service_started
+      minio: { condition: service_started }
     entrypoint: >
       /bin/sh -c "
       until mc alias set local http://minio:9000 hunter hunter-secret; do sleep 1; done;
@@ -53,40 +55,68 @@ services:
   api:
     build: ./backend
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-    env_file: .env
+    env_file:
+      - path: .env
+        required: false
     environment:
+      ENVIRONMENT: dev
+      AUTH_DISABLED: "true"
       DATABASE_URL: postgresql+asyncpg://hunter:hunter@db:5432/hunter
       REDIS_URL: redis://redis:6379/0
+      STORAGE_BACKEND: s3
       S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: hunter
+      S3_SECRET_KEY: hunter-secret
+      S3_BUCKET: hunter-artifacts
+      SEMGREP_ENABLED: "true"
+      SEMGREP_RULESET: auto
     ports: ["8000:8000"]
-    volumes: ["./backend:/app", "scanwork:/scan-workdir"]
+    volumes:
+      - ./backend:/app
+      - scanwork:/scan-workdir
     depends_on:
       db: { condition: service_healthy }
       redis: { condition: service_healthy }
-      minio: { condition: service_started }
+      minio-init: { condition: service_completed_successfully }
 
   worker:
     build: ./backend
     command: arq app.worker.WorkerSettings
-    env_file: .env
+    env_file:
+      - path: .env
+        required: false
     environment:
+      ENVIRONMENT: dev
+      AUTH_DISABLED: "true"
       DATABASE_URL: postgresql+asyncpg://hunter:hunter@db:5432/hunter
       REDIS_URL: redis://redis:6379/0
+      STORAGE_BACKEND: s3
       S3_ENDPOINT_URL: http://minio:9000
-    volumes: ["./backend:/app", "scanwork:/scan-workdir"]
+      S3_ACCESS_KEY: hunter
+      S3_SECRET_KEY: hunter-secret
+      S3_BUCKET: hunter-artifacts
+      SEMGREP_ENABLED: "true"
+      SEMGREP_RULESET: auto
+    volumes:
+      - ./backend:/app
+      - scanwork:/scan-workdir
     depends_on:
       db: { condition: service_healthy }
       redis: { condition: service_healthy }
-      minio: { condition: service_started }
+      minio-init: { condition: service_completed_successfully }
 
   web:
-    image: node:20-alpine
-    working_dir: /web
-    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
     environment:
       VITE_API_BASE_URL: http://localhost:8000
     ports: ["5173:5173"]
-    volumes: ["./frontend:/web"]
+    volumes:
+      - ./frontend/src:/web/src
+      - ./frontend/index.html:/web/index.html
+    depends_on:
+      - api
 
 volumes:
   pgdata:
