@@ -9,6 +9,7 @@ export default function SettingsPage() {
   const [apiKey, setApiKey] = useState("");
   const [deployment, setDeployment] = useState("");
   const [apiVersion, setApiVersion] = useState("");
+  const [apiStyle, setApiStyle] = useState("v1");
   const [models, setModels] = useState<string[]>([]);
   const [test, setTest] = useState<string>("");
   const [mcp, setMcp] = useState<McpServer[]>([]);
@@ -18,6 +19,7 @@ export default function SettingsPage() {
   const load = async () => {
     const s = await api.getFoundry();
     setFs(s); setEndpoint(s.endpoint || ""); setDeployment(s.deployment); setApiVersion(s.api_version);
+    setApiStyle(s.api_style || "v1");
     api.listModels().then((m) => setModels(m.models)).catch(() => {});
     api.listMcp().then(setMcp).catch(() => {});
   };
@@ -25,7 +27,7 @@ export default function SettingsPage() {
 
   const save = async () => {
     setMsg("");
-    const body: Record<string, any> = { endpoint, deployment, api_version: apiVersion };
+    const body: Record<string, any> = { endpoint, deployment, api_version: apiVersion, api_style: apiStyle };
     if (apiKey) body.api_key = apiKey;
     try { await api.updateFoundry(body); setApiKey(""); setMsg("Saved ✓"); await load(); }
     catch (e) { setMsg(String(e)); }
@@ -78,7 +80,18 @@ export default function SettingsPage() {
             )}
           </label>
           <label className="text-sm">API version
-            <Input value={apiVersion} onChange={(e) => setApiVersion(e.target.value)} />
+            <Input value={apiVersion} onChange={(e) => setApiVersion(e.target.value)}
+              placeholder="preview" />
+          </label>
+          <label className="text-sm">API style
+            <select value={apiStyle} onChange={(e) => setApiStyle(e.target.value)}
+              className="w-full mt-1 px-3 py-2 rounded-md bg-bg border border-border text-sm">
+              <option value="v1">v1 — Foundry Models API (recommended)</option>
+              <option value="azure">azure — legacy (deployments + api-version)</option>
+            </select>
+            <div className="text-[11px] text-muted mt-1">
+              v1 calls <code>/openai/v1/</code>; azure calls <code>/openai/deployments/…</code>
+            </div>
           </label>
         </div>
         <div className="flex items-center gap-3 mt-4">

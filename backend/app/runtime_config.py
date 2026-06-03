@@ -50,7 +50,7 @@ async def get_foundry_config(session: AsyncSession) -> FoundryConfig:
     """Build the effective Foundry config (DB overrides win over env)."""
     cfg = FoundryConfig.from_settings()
     stored = await _get(session, FOUNDRY_KEY)
-    for field in ("endpoint", "api_key", "deployment", "api_version"):
+    for field in ("endpoint", "api_key", "deployment", "api_version", "api_style"):
         if stored.get(field):
             setattr(cfg, field, stored[field])
     if "use_agent_service" in stored:
@@ -66,6 +66,7 @@ async def get_foundry_settings_masked(session: AsyncSession) -> dict:
         "endpoint": cfg.endpoint,
         "deployment": cfg.deployment,
         "api_version": cfg.api_version,
+        "api_style": cfg.api_style,
         "use_agent_service": cfg.use_agent_service,
         "api_key_set": bool(cfg.api_key),
         "mock_mode": cfg.mock,
@@ -77,7 +78,7 @@ async def update_foundry_settings(session: AsyncSession, patch: dict) -> dict:
     """Apply a partial update. Empty strings clear a field; absent keys are left
     untouched. A blank api_key leaves the stored secret unchanged."""
     stored = await _get(session, FOUNDRY_KEY)
-    for field in ("endpoint", "deployment", "api_version"):
+    for field in ("endpoint", "deployment", "api_version", "api_style"):
         if field in patch and patch[field] is not None:
             stored[field] = patch[field].strip()
     if "endpoint" in stored:

@@ -180,6 +180,7 @@ class FoundrySettingsOut(BaseModel):
     endpoint: str | None = None
     deployment: str
     api_version: str
+    api_style: str = "v1"
     use_agent_service: bool
     api_key_set: bool
     mock_mode: bool
@@ -191,6 +192,7 @@ class FoundrySettingsUpdate(BaseModel):
     api_key: str | None = None       # blank => leave existing secret unchanged
     deployment: str | None = None
     api_version: str | None = None
+    api_style: str | None = None     # v1 | azure
     use_agent_service: bool | None = None
 
 

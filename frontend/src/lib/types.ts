@@ -30,7 +30,8 @@ export interface McpServer {
 }
 export interface ChatMessage { id: string; scan_id: string; role: string; content: string; }
 export interface FoundrySettings {
-  endpoint?: string; deployment: string; api_version: string; use_agent_service: boolean;
+  endpoint?: string; deployment: string; api_version: string; api_style: string;
+  use_agent_service: boolean;
   api_key_set: boolean; mock_mode: boolean; auth_mode: string;
 }
 export interface Dashboard {
