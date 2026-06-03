@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Button, Card, Input } from "../components/ui";
 import { api } from "../lib/api";
-import type { FoundrySettings, McpServer, ModelRole, ModelRoles } from "../lib/types";
+import type { FoundrySettings, McpServer, ModelRole, ModelRoles, ScannerSettings } from "../lib/types";
 
 const emptyRole = (deployment = ""): ModelRole => ({ deployment, transport: "auto", reasoning_effort: null });
 
@@ -18,6 +18,11 @@ export default function SettingsPage() {
   const [mcp, setMcp] = useState<McpServer[]>([]);
   const [newMcp, setNewMcp] = useState({ name: "", kind: "semgrep", transport: "http", url: "" });
   const [msg, setMsg] = useState("");
+  const [scanners, setScanners] = useState<ScannerSettings>();
+  const [sonarUrl, setSonarUrl] = useState("");
+  const [sonarToken, setSonarToken] = useState("");
+  const [scanMsg, setScanMsg] = useState("");
+  const [sonarTest, setSonarTest] = useState("");
 
   const load = async () => {
     const s = await api.getFoundry();
@@ -30,8 +35,29 @@ export default function SettingsPage() {
     });
     api.listModels().then((m) => setModels(m.models)).catch(() => {});
     api.listMcp().then(setMcp).catch(() => {});
+    api.getScanners().then((sc) => { setScanners(sc); setSonarUrl(sc.sonarqube_url || ""); }).catch(() => {});
   };
   useEffect(() => { load().catch((e) => setMsg(String(e))); }, []);
+
+  const patchScanners = async (patch: Record<string, any>) => {
+    setScanMsg("");
+    try {
+      const sc = await api.updateScanners(patch);
+      setScanners(sc); setSonarToken(""); setScanMsg("Saved ✓");
+    } catch (e) { setScanMsg(String(e)); }
+  };
+
+  const saveSonar = () => {
+    const patch: Record<string, any> = { sonarqube_url: sonarUrl };
+    if (sonarToken) patch.sonarqube_token = sonarToken;
+    return patchScanners(patch);
+  };
+
+  const runSonarTest = async () => {
+    setSonarTest("testing…");
+    try { const r = await api.testSonar(); setSonarTest(`${r.ok ? "✓" : "✗"} ${r.detail}`); }
+    catch (e) { setSonarTest(String(e)); }
+  };
 
   const save = async () => {
     setMsg("");
@@ -170,6 +196,59 @@ export default function SettingsPage() {
       </Card>
 
       <Card className="p-4">
+        <h2 className="font-semibold mb-1">Static scanners</h2>
+        <p className="text-xs text-muted mb-3">
+          The high-recall sweep that runs before the AI reviews code. Semgrep runs
+          on the worker; SonarQube uploads to a server and pulls issues back. Both
+          normalise into the same findings the AI judge then validates.
+        </p>
+
+        {/* Semgrep */}
+        <div className="flex items-center justify-between py-2 border-b border-border">
+          <div>
+            <div className="text-sm font-medium">Semgrep</div>
+            <div className="text-[11px] text-muted">
+              ruleset: <code>{scanners?.semgrep_ruleset || "auto"}</code> · runs locally
+            </div>
+          </div>
+          <Toggle on={!!scanners?.semgrep_enabled}
+            onChange={(v) => patchScanners({ semgrep_enabled: v })} />
+        </div>
+
+        {/* SonarQube */}
+        <div className="py-3">
+          <div className="flex items-center justify-between">
+            <div>
+              <div className="text-sm font-medium">SonarQube</div>
+              <div className="text-[11px] text-muted">
+                needs a server · start with <code>docker compose --profile sonar up</code>
+              </div>
+            </div>
+            <Toggle on={!!scanners?.sonarqube_enabled}
+              onChange={(v) => patchScanners({ sonarqube_enabled: v })} />
+          </div>
+          {scanners?.sonarqube_enabled && (
+            <div className="mt-3 grid grid-cols-2 gap-3">
+              <label className="text-sm">Server URL
+                <Input value={sonarUrl} onChange={(e) => setSonarUrl(e.target.value)}
+                  placeholder="http://sonarqube:9000" />
+              </label>
+              <label className="text-sm">Token {scanners?.sonarqube_token_set && <span className="text-emerald-400 text-xs">(set)</span>}
+                <Input type="password" value={sonarToken} onChange={(e) => setSonarToken(e.target.value)}
+                  placeholder={scanners?.sonarqube_token_set ? "•••••• (unchanged)" : "squ_…"} />
+              </label>
+              <div className="col-span-2 flex items-center gap-3">
+                <Button onClick={saveSonar}>Save</Button>
+                <Button variant="ghost" onClick={runSonarTest}>Test connection</Button>
+                {scanMsg && <span className="text-sm text-muted">{scanMsg}</span>}
+                {sonarTest && <span className="text-sm text-muted">{sonarTest}</span>}
+              </div>
+            </div>
+          )}
+        </div>
+      </Card>
+
+      <Card className="p-4">
         <h2 className="font-semibold mb-3">MCP servers (Semgrep / SonarQube / custom)</h2>
         <div className="grid grid-cols-5 gap-2 mb-3">
           <Input placeholder="name" value={newMcp.name} onChange={(e) => setNewMcp({ ...newMcp, name: e.target.value })} />
@@ -198,6 +277,15 @@ export default function SettingsPage() {
         </div>
       </Card>
     </div>
+  );
+}
+
+function Toggle({ on, onChange }: { on: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <button onClick={() => onChange(!on)} type="button"
+      className={`relative w-11 h-6 rounded-full transition flex-shrink-0 ${on ? "bg-emerald-600" : "bg-border"}`}>
+      <span className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-transform ${on ? "translate-x-5" : ""}`} />
+    </button>
   );
 }
 

@@ -46,6 +46,11 @@ export interface FoundrySettings {
   api_key_set: boolean; mock_mode: boolean; auth_mode: string;
   roles: ModelRoles;
 }
+export interface ScannerSettings {
+  semgrep_enabled: boolean; semgrep_ruleset: string;
+  sonarqube_enabled: boolean; sonarqube_url?: string | null;
+  sonarqube_token_set: boolean;
+}
 export interface Endpoint {
   method: string; path: string; file_path: string; line: number;
   framework: string; handler: string; auth_hints: string[];

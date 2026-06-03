@@ -40,9 +40,10 @@ _OWASP_TAG = re.compile(r"owasp-(a\d+)", re.IGNORECASE)
 class SonarScanner:
     name = "sonarqube"
 
-    def __init__(self) -> None:
-        self.host = (settings.sonarqube_url or "").rstrip("/")
-        self.token = settings.sonarqube_token or ""
+    def __init__(self, url: str | None = None, token: str | None = None) -> None:
+        # Explicit args (from in-app Settings) win over .env defaults.
+        self.host = (url or settings.sonarqube_url or "").rstrip("/")
+        self.token = token or settings.sonarqube_token or ""
 
     async def scan(self, workdir: str) -> list[Candidate]:
         if not self.host or not self.token:

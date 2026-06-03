@@ -13,9 +13,19 @@ from app.models import Role
 from app.runtime_config import (
     get_foundry_config,
     get_foundry_settings_masked,
+    get_scanner_config,
+    get_scanner_settings_masked,
     update_foundry_settings,
+    update_scanner_settings,
 )
-from app.schemas import ConnectionTest, FoundrySettingsOut, FoundrySettingsUpdate, ModelsOut
+from app.schemas import (
+    ConnectionTest,
+    FoundrySettingsOut,
+    FoundrySettingsUpdate,
+    ModelsOut,
+    ScannerSettingsOut,
+    ScannerSettingsUpdate,
+)
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
@@ -77,5 +87,47 @@ async def test_connection(session: AsyncSession = Depends(get_session)):
                 ok = False
                 results.append(f"{label}:{role.deployment}✗ ({exc})")
         return ConnectionTest(ok=ok, detail="connected · " + " · ".join(results), models=models)
+    except Exception as exc:  # noqa: BLE001
+        return ConnectionTest(ok=False, detail=str(exc))
+
+
+# --------------------------------------------------------------------------- scanners
+@router.get("/scanners", response_model=ScannerSettingsOut)
+async def get_scanners(session: AsyncSession = Depends(get_session)):
+    return await get_scanner_settings_masked(session)
+
+
+@router.put("/scanners", response_model=ScannerSettingsOut,
+            dependencies=[Depends(require_role(Role.admin))])
+async def put_scanners(body: ScannerSettingsUpdate, session: AsyncSession = Depends(get_session)):
+    return await update_scanner_settings(session, body.model_dump(exclude_unset=True))
+
+
+@router.post("/scanners/sonar-test", response_model=ConnectionTest,
+             dependencies=[Depends(require_role(Role.admin))])
+async def test_sonarqube(session: AsyncSession = Depends(get_session)):
+    """Verify the SonarQube server is reachable and the token authenticates."""
+    import httpx
+
+    cfg = await get_scanner_config(session)
+    if not cfg.sonarqube_url or not cfg.sonarqube_token:
+        return ConnectionTest(ok=False, detail="SonarQube URL or token not set")
+    try:
+        async with httpx.AsyncClient(
+            base_url=cfg.sonarqube_url.rstrip("/"),
+            auth=(cfg.sonarqube_token, ""), timeout=15,
+        ) as client:
+            resp = await client.get("/api/system/status")
+            resp.raise_for_status()
+            data = resp.json()
+            status = data.get("status", "UNKNOWN")
+            ok = status == "UP"
+            detail = f"{data.get('id', 'server')} · status={status}"
+            if ok:
+                # Confirm the token actually authenticates (not just anonymous access).
+                auth = await client.get("/api/authentication/validate")
+                if auth.is_success and not auth.json().get("valid", False):
+                    return ConnectionTest(ok=False, detail=f"{detail} · token invalid")
+            return ConnectionTest(ok=ok, detail=detail)
     except Exception as exc:  # noqa: BLE001
         return ConnectionTest(ok=False, detail=str(exc))

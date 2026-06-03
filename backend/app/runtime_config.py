@@ -8,13 +8,17 @@ should hold a Key Vault secret reference instead (see infra/azure).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.foundry import FoundryConfig, ModelRole
+from app.config import settings
 from app.models import Setting
 
 FOUNDRY_KEY = "foundry"
+SCANNERS_KEY = "scanners"
 _SECRET_FIELDS = {"api_key"}
 
 _STRIP_SUFFIXES = ("/openai/v1", "/openai/v1/", "/openai", "/openai/", "/v1", "/v1/")
@@ -133,3 +137,54 @@ def _auth_mode(cfg: FoundryConfig) -> str:
     if cfg.endpoint:
         return "managed_identity"
     return "none"
+
+
+# --------------------------------------------------------------------------- scanners
+@dataclass
+class ScannerConfig:
+    """Effective static-scanner config (DB Settings layered over .env)."""
+
+    semgrep_enabled: bool
+    semgrep_ruleset: str
+    sonarqube_enabled: bool
+    sonarqube_url: str | None
+    sonarqube_token: str | None
+
+
+async def get_scanner_config(session: AsyncSession) -> ScannerConfig:
+    stored = await _get(session, SCANNERS_KEY)
+    return ScannerConfig(
+        semgrep_enabled=bool(stored.get("semgrep_enabled", settings.semgrep_enabled)),
+        semgrep_ruleset=stored.get("semgrep_ruleset") or settings.semgrep_ruleset,
+        sonarqube_enabled=bool(stored.get("sonarqube_enabled", settings.sonarqube_enabled)),
+        sonarqube_url=(stored.get("sonarqube_url") or settings.sonarqube_url) or None,
+        sonarqube_token=(stored.get("sonarqube_token") or settings.sonarqube_token) or None,
+    )
+
+
+async def get_scanner_settings_masked(session: AsyncSession) -> dict:
+    cfg = await get_scanner_config(session)
+    return {
+        "semgrep_enabled": cfg.semgrep_enabled,
+        "semgrep_ruleset": cfg.semgrep_ruleset,
+        "sonarqube_enabled": cfg.sonarqube_enabled,
+        "sonarqube_url": cfg.sonarqube_url,
+        "sonarqube_token_set": bool(cfg.sonarqube_token),
+    }
+
+
+async def update_scanner_settings(session: AsyncSession, patch: dict) -> dict:
+    """Partial update. A blank sonarqube_token leaves the stored secret unchanged."""
+    stored = await _get(session, SCANNERS_KEY)
+    if "semgrep_enabled" in patch and patch["semgrep_enabled"] is not None:
+        stored["semgrep_enabled"] = bool(patch["semgrep_enabled"])
+    if "semgrep_ruleset" in patch and patch["semgrep_ruleset"] is not None:
+        stored["semgrep_ruleset"] = patch["semgrep_ruleset"].strip()
+    if "sonarqube_enabled" in patch and patch["sonarqube_enabled"] is not None:
+        stored["sonarqube_enabled"] = bool(patch["sonarqube_enabled"])
+    if "sonarqube_url" in patch and patch["sonarqube_url"] is not None:
+        stored["sonarqube_url"] = patch["sonarqube_url"].strip()
+    if patch.get("sonarqube_token"):  # only overwrite when non-empty
+        stored["sonarqube_token"] = patch["sonarqube_token"]
+    await _set(session, SCANNERS_KEY, stored)
+    return await get_scanner_settings_masked(session)

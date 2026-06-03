@@ -1,6 +1,6 @@
 import type {
   Artifact, ArtifactFile, ChatMessage, Client, Dashboard, Finding,
-  FoundrySettings, McpServer, Project, Scan,
+  FoundrySettings, McpServer, Project, Scan, ScannerSettings,
 } from "./types";
 
 const BASE = (import.meta as any).env?.VITE_API_BASE_URL || "http://localhost:8000";
@@ -66,6 +66,9 @@ export const api = {
   updateFoundry: (b: Record<string, any>) => req<FoundrySettings>("/settings/foundry", { method: "PUT", body: JSON.stringify(b) }),
   listModels: () => req<{ models: string[]; mock: boolean }>("/settings/foundry/models"),
   testFoundry: () => req<{ ok: boolean; detail: string; models: string[] }>("/settings/foundry/test", { method: "POST" }),
+  getScanners: () => req<ScannerSettings>("/settings/scanners"),
+  updateScanners: (b: Record<string, any>) => req<ScannerSettings>("/settings/scanners", { method: "PUT", body: JSON.stringify(b) }),
+  testSonar: () => req<{ ok: boolean; detail: string }>("/settings/scanners/sonar-test", { method: "POST" }),
 
   exportUrl: (scanId: string, format: string) =>
     `${BASE}/api/scans/${scanId}/export/${format}`,

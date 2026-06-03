@@ -35,7 +35,7 @@ from app.models import (
     ScanStatus,
     Severity,
 )
-from app.runtime_config import get_foundry_config
+from app.runtime_config import get_foundry_config, get_scanner_config
 from app.scanners.endpoints import extract_endpoints
 from app.scanners.mcp_client import McpClient
 from app.scanners.semgrep import SemgrepScanner
@@ -175,9 +175,10 @@ async def _ingest(session, artifact: Artifact, emit) -> str:
 
 async def _static_scan(session, scan: Scan, artifact: Artifact, workdir: str, emit) -> list[dict]:
     requested = set((scan.config or {}).get("scanners", ["semgrep", "ai"]))
+    scfg = await get_scanner_config(session)
     candidates: list[dict] = []
 
-    if settings.semgrep_enabled and "semgrep" in requested:
+    if scfg.semgrep_enabled and "semgrep" in requested:
         await emit({"type": "status", "status": "semgrep"})
         try:
             sem = await SemgrepScanner().scan(workdir)
@@ -188,10 +189,12 @@ async def _static_scan(session, scan: Scan, artifact: Artifact, workdir: str, em
 
     # SonarQube is admin-gated (heavy, needs a server); run whenever enabled and
     # not explicitly opted out of for this scan.
-    if settings.sonarqube_enabled and "no-sonar" not in requested:
+    if scfg.sonarqube_enabled and "no-sonar" not in requested:
         await emit({"type": "status", "status": "sonarqube"})
         try:
-            sonar = await SonarScanner().scan(workdir)
+            sonar = await SonarScanner(
+                url=scfg.sonarqube_url, token=scfg.sonarqube_token
+            ).scan(workdir)
             candidates.extend(sonar)
             await emit({"type": "log", "message": f"SonarQube: {len(sonar)} candidates"})
         except Exception as exc:  # noqa: BLE001

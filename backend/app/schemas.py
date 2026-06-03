@@ -213,6 +213,22 @@ class FoundrySettingsUpdate(BaseModel):
     roles: ModelRolesOut | None = None
 
 
+class ScannerSettingsOut(BaseModel):
+    semgrep_enabled: bool = True
+    semgrep_ruleset: str = "auto"
+    sonarqube_enabled: bool = False
+    sonarqube_url: str | None = None
+    sonarqube_token_set: bool = False
+
+
+class ScannerSettingsUpdate(BaseModel):
+    semgrep_enabled: bool | None = None
+    semgrep_ruleset: str | None = None
+    sonarqube_enabled: bool | None = None
+    sonarqube_url: str | None = None
+    sonarqube_token: str | None = None  # blank => leave existing secret unchanged
+
+
 class ModelsOut(BaseModel):
     models: list[str]
     mock: bool
