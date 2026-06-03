@@ -73,8 +73,16 @@ async def run_review(
             ),
         },
     ]
-    async for token in client.chat_stream(plan_msgs, model=model):
-        await emit({"type": "token", "text": token})
+    try:
+        async for token in client.chat_stream(plan_msgs, model=model):
+            await emit({"type": "token", "text": token})
+    except Exception as exc:
+        await emit({"type": "token", "text": f"\n\n[Foundry error: {exc}]\n"})
+        raise RuntimeError(
+            f"AI model call failed: {exc}. Check Settings — the endpoint, API key, "
+            f"and deployment name must match your Azure AI Foundry project. "
+            f"Clear the endpoint to use mock mode."
+        ) from exc
 
     # ---- 3. triage + hunt (structured) ----
     await emit({"type": "status", "status": "analyzing"})

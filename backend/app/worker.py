@@ -77,8 +77,9 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
 
             cfg = await get_foundry_config(session)
             client = get_foundry_client(cfg)
-            await emit({"type": "log", "message": f"AI reviewer: {cfg.deployment} "
-                                                  f"({'mock' if cfg.mock else 'azure'})"})
+            mode = "MOCK (no endpoint)" if cfg.mock else f"LIVE → {cfg.endpoint}"
+            await emit({"type": "log", "message": f"AI reviewer: model={cfg.deployment} "
+                                                  f"mode={mode}"})
 
             artifact_files = (await session.execute(
                 select(ArtifactFile).where(
