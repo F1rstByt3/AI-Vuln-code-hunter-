@@ -69,6 +69,7 @@ async def cancel_scan(scan_id: str, session: AsyncSession = Depends(get_session)
         scan.status = ScanStatus.canceled
         scan.finished_at = datetime.now(timezone.utc)
         await session.commit()
+        await session.refresh(scan)
         await events.publish(scan_id, {"type": "canceled"})
     return scan
 
