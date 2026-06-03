@@ -36,6 +36,24 @@
 Finding state machine: `proposed → confirmed | dismissed | needs_info`. Triage
 decisions persist and are intended to feed back into later scans.
 
+## Static scanners
+
+The high-recall sweep runs over the *entire* tree before any LLM sees code:
+
+- **Semgrep** — always on; self-contained CLI, `--config auto` (or a pinned/local
+  ruleset). Runs fully on the worker.
+- **SonarQube** — optional, admin-gated (`SONARQUBE_ENABLED`). Unlike Semgrep it
+  needs a **server**: `sonar-scanner` uploads the code, the server's Compute
+  Engine analyses it, and we pull issues back via the Web API
+  (`/api/issues/search`). Run it locally with `docker compose --profile sonar up`
+  (off by default — ~2GB RAM) or point `SONARQUBE_URL`/`SONARQUBE_TOKEN` at any
+  instance. Failures degrade gracefully: logged, and the review continues on
+  Semgrep + AI.
+- **MCP servers** — any registered `scan`-tool server folds into the same
+  `Candidate` shape (see *Extending scanners*).
+
+All scanner outputs normalise to one `Candidate` shape the AI agent then triages.
+
 ## Why SAST-first, LLM-second
 
 Feeding 10GB to a model is impossible and pointless. Instead:

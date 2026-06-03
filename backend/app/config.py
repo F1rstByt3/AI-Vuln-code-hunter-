@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     # ---- Scanners ----
     semgrep_enabled: bool = True
     semgrep_ruleset: str = "auto"
+    sonarqube_enabled: bool = False
     sonarqube_url: str | None = None
     sonarqube_token: str | None = None
 

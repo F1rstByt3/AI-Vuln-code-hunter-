@@ -39,6 +39,7 @@ from app.runtime_config import get_foundry_config
 from app.scanners.endpoints import extract_endpoints
 from app.scanners.mcp_client import McpClient
 from app.scanners.semgrep import SemgrepScanner
+from app.scanners.sonarqube import SonarScanner
 from app.storage import get_storage
 
 
@@ -184,6 +185,17 @@ async def _static_scan(session, scan: Scan, artifact: Artifact, workdir: str, em
             await emit({"type": "log", "message": f"Semgrep: {len(sem)} candidates"})
         except Exception as exc:  # noqa: BLE001
             await emit({"type": "log", "message": f"Semgrep error: {exc}"})
+
+    # SonarQube is admin-gated (heavy, needs a server); run whenever enabled and
+    # not explicitly opted out of for this scan.
+    if settings.sonarqube_enabled and "no-sonar" not in requested:
+        await emit({"type": "status", "status": "sonarqube"})
+        try:
+            sonar = await SonarScanner().scan(workdir)
+            candidates.extend(sonar)
+            await emit({"type": "log", "message": f"SonarQube: {len(sonar)} candidates"})
+        except Exception as exc:  # noqa: BLE001
+            await emit({"type": "log", "message": f"SonarQube error: {exc}"})
 
     mcp_rows = (await session.execute(
         select(McpServer).where(

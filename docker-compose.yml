@@ -71,6 +71,9 @@ services:
       S3_BUCKET: hunter-artifacts
       SEMGREP_ENABLED: "true"
       SEMGREP_RULESET: auto
+      # SonarQube off unless you opt in (set SONARQUBE_ENABLED=true + token in .env
+      # and start the optional service: docker compose --profile sonar up).
+      SONARQUBE_URL: http://sonarqube:9000
     ports: ["8000:8000"]
     volumes:
       - ./backend:/app
@@ -99,6 +102,9 @@ services:
       S3_BUCKET: hunter-artifacts
       SEMGREP_ENABLED: "true"
       SEMGREP_RULESET: auto
+      # SonarQube off unless you opt in (set SONARQUBE_ENABLED=true + token in .env
+      # and start the optional service: docker compose --profile sonar up).
+      SONARQUBE_URL: http://sonarqube:9000
     volumes:
       - ./backend:/app
       - scanwork:/scan-workdir
@@ -120,7 +126,48 @@ services:
     depends_on:
       - api
 
+  # ---------------------------------------------------------------------------
+  # SonarQube — optional, heavy (~2GB RAM). Off by default; start on demand with:
+  #   docker compose --profile sonar up
+  # Then create a token in the SonarQube UI (http://localhost:9000, admin/admin)
+  # and set SONARQUBE_ENABLED=true + SONARQUBE_TOKEN=... in your .env.
+  # ---------------------------------------------------------------------------
+  sonarqube:
+    image: sonarqube:community
+    profiles: ["sonar"]
+    environment:
+      SONAR_JDBC_URL: jdbc:postgresql://sonar-db:5432/sonar
+      SONAR_JDBC_USERNAME: sonar
+      SONAR_JDBC_PASSWORD: sonar
+    ports: ["9000:9000"]
+    volumes:
+      - sonar_data:/opt/sonarqube/data
+      - sonar_extensions:/opt/sonarqube/extensions
+      - sonar_logs:/opt/sonarqube/logs
+    # SonarQube needs a higher mmap limit; on Linux hosts you may need:
+    #   sudo sysctl -w vm.max_map_count=262144
+    depends_on:
+      sonar-db: { condition: service_healthy }
+
+  sonar-db:
+    image: postgres:16-alpine
+    profiles: ["sonar"]
+    environment:
+      POSTGRES_USER: sonar
+      POSTGRES_PASSWORD: sonar
+      POSTGRES_DB: sonar
+    volumes: ["sonar_pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sonar"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
 volumes:
   pgdata:
   miniodata:
   scanwork:
+  sonar_data:
+  sonar_extensions:
+  sonar_logs:
+  sonar_pgdata:
