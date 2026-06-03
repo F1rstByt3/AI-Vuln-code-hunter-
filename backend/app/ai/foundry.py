@@ -403,7 +403,9 @@ class MockFoundryClient(FoundryClient):
                 "source": "correlated",
                 "state": "proposed",
             })
-        first_file = (ctx.get("files") or [{}])[0].get("path")
+        source_files = ctx.get("source_files") or []
+        first_file = (source_files[0].get("path") if source_files
+                       else (ctx.get("file_manifest") or [{}])[0].get("path"))
         findings.append({
             "title": "Possible broken access control on object lookup",
             "description": (

@@ -244,7 +244,7 @@ async def _persist_findings(session, scan: Scan, findings: list[dict]) -> None:
     await session.commit()
 
 
-def _safe_read(workdir: str, rel: str, max_bytes: int = 200_000) -> str | None:
+def _safe_read(workdir: str, rel: str, max_bytes: int = 1_048_576) -> str | None:
     target = os.path.realpath(os.path.join(workdir, rel))
     if not target.startswith(os.path.realpath(workdir) + os.sep):
         return None
