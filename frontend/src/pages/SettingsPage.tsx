@@ -67,13 +67,15 @@ export default function SettingsPage() {
             <Input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)}
               placeholder={fs?.api_key_set ? "•••••• (unchanged)" : "paste key"} />
           </label>
-          <label className="text-sm">Model / deployment
-            <select value={deployment} onChange={(e) => setDeployment(e.target.value)}
-              className="w-full mt-1 px-3 py-2 rounded-md bg-bg border border-border text-sm">
-              {[deployment, ...models.filter((m) => m !== deployment)].filter(Boolean).map((m) => (
-                <option key={m} value={m}>{m}</option>
-              ))}
-            </select>
+          <label className="text-sm">Model / deployment name
+            <Input value={deployment} onChange={(e) => setDeployment(e.target.value)}
+              placeholder="e.g. gpt-4o, my-codex-deployment" list="models-list" />
+            <datalist id="models-list">
+              {models.map((m) => <option key={m} value={m} />)}
+            </datalist>
+            {models.length > 0 && (
+              <div className="text-[11px] text-muted mt-1">Discovered: {models.join(", ")}</div>
+            )}
           </label>
           <label className="text-sm">API version
             <Input value={apiVersion} onChange={(e) => setApiVersion(e.target.value)} />

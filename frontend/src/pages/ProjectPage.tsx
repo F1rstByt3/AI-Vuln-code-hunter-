@@ -31,7 +31,7 @@ export default function ProjectPage() {
     if (a[0] && !artifactId) setArtifactId(a[0].id);
   };
   useEffect(() => { reload().catch((e) => setErr(String(e))); }, [projectId]);
-  useEffect(() => { api.listModels().then((m) => { setModels(m.models); setModel(m.models[0] || ""); }).catch(() => {}); }, []);
+  useEffect(() => { api.listModels().then((m) => { setModels(m.models); if (!model && m.models[0]) setModel(m.models[0]); }).catch(() => {}); }, []);
 
   const onUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -91,12 +91,17 @@ export default function ProjectPage() {
 
         <Card className="p-4">
           <h2 className="font-semibold mb-3">Start a review</h2>
-          <label className="text-sm text-muted">AI model (from Foundry project)</label>
-          <select value={model} onChange={(e) => setModel(e.target.value)}
-            className="w-full mt-1 mb-3 px-3 py-2 rounded-md bg-bg border border-border text-sm">
-            {models.map((m) => <option key={m} value={m}>{m}</option>)}
-            {models.length === 0 && <option value="">(configure Foundry in Settings)</option>}
-          </select>
+          <label className="text-sm text-muted">AI model / deployment name
+            <Input value={model} onChange={(e) => setModel(e.target.value)}
+              placeholder="e.g. gpt-4o, my-codex-deployment" list="project-models-list"
+              className="mt-1 mb-3" />
+            <datalist id="project-models-list">
+              {models.map((m) => <option key={m} value={m} />)}
+            </datalist>
+            {models.length > 0 && (
+              <div className="text-[11px] text-muted">Discovered: {models.join(", ")}</div>
+            )}
+          </label>
           <label className="text-sm text-muted">Instructions for the agent (optional)</label>
           <textarea value={instructions} onChange={(e) => setInstructions(e.target.value)}
             placeholder="e.g. focus on auth & the payments module; ignore tests"
