@@ -68,7 +68,7 @@ class Settings(BaseSettings):
 
     # ---- AI controls ----
     ai_max_findings_per_scan: int = 500
-    ai_context_budget_bytes: int = 4_194_304  # 4 MiB of source text sent to reviewer
+    ai_batch_bytes: int = 2_097_152  # 2 MiB per reviewer batch (tune to model context)
     ai_triage_model: str | None = None
     ai_require_evidence: bool = True
 

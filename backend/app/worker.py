@@ -244,13 +244,17 @@ async def _persist_findings(session, scan: Scan, findings: list[dict]) -> None:
     await session.commit()
 
 
-def _safe_read(workdir: str, rel: str, max_bytes: int = 1_048_576) -> str | None:
+def _safe_read(workdir: str, rel: str) -> str | None:
+    """Read a file's full text content. Returns None for binary/missing files."""
     target = os.path.realpath(os.path.join(workdir, rel))
     if not target.startswith(os.path.realpath(workdir) + os.sep):
         return None
     try:
+        size = os.path.getsize(target)
+        if size > settings.max_file_bytes_for_ai:
+            return None
         with open(target, encoding="utf-8", errors="replace") as fh:
-            return fh.read(max_bytes)
+            return fh.read()
     except OSError:
         return None
 

@@ -383,7 +383,7 @@ class MockFoundryClient(FoundryClient):
 
     def _review(self, ctx: dict) -> list[dict]:
         findings: list[dict] = []
-        for c in ctx.get("candidates", []):
+        for c in (ctx.get("static_analysis_results") or ctx.get("candidates") or []):
             findings.append({
                 "title": c.get("title") or c.get("rule") or "Static-analysis candidate",
                 "description": (
@@ -405,7 +405,7 @@ class MockFoundryClient(FoundryClient):
             })
         source_files = ctx.get("source_files") or []
         first_file = (source_files[0].get("path") if source_files
-                       else (ctx.get("file_manifest") or [{}])[0].get("path"))
+                       else None)
         findings.append({
             "title": "Possible broken access control on object lookup",
             "description": (
