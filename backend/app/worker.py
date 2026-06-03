@@ -77,8 +77,9 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
 
             cfg = await get_foundry_config(session)
             client = get_foundry_client(cfg)
+            model = (scan.config or {}).get("model") or cfg.deployment
             mode = "MOCK (no endpoint)" if cfg.mock else f"LIVE → {cfg.endpoint}"
-            await emit({"type": "log", "message": f"AI reviewer: model={cfg.deployment} "
+            await emit({"type": "log", "message": f"AI reviewer: deployment={model} "
                                                   f"mode={mode}"})
 
             artifact_files = (await session.execute(
@@ -88,7 +89,6 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
             )).scalars().all()
             files = [{"path": f.path, "language": f.language, "size": f.size_bytes}
                      for f in artifact_files]
-            model = (scan.config or {}).get("model") or cfg.deployment
 
             result = await run_review(
                 client=client,

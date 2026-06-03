@@ -46,7 +46,17 @@ async def test_connection(session: AsyncSession = Depends(get_session)):
     client = get_foundry_client(cfg)
     try:
         models = await client.list_models()
-        detail = "mock mode (no endpoint configured)" if cfg.mock else "connected"
+        detail = "mock mode (no endpoint configured)" if cfg.mock else f"connected · deployment={cfg.deployment}"
+        # Verify the configured deployment actually works
+        if not cfg.mock:
+            try:
+                test_msgs = [{"role": "user", "content": "Reply with OK"}]
+                async for _ in client.chat_stream(test_msgs, model=cfg.deployment):
+                    break  # one token is enough to confirm it works
+                detail += " · inference OK"
+            except Exception as exc:  # noqa: BLE001
+                detail += f" · inference FAILED: {exc}"
+                return ConnectionTest(ok=False, detail=detail, models=models)
         return ConnectionTest(ok=True, detail=detail, models=models)
     except Exception as exc:  # noqa: BLE001
         return ConnectionTest(ok=False, detail=str(exc))
