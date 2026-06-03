@@ -7,7 +7,15 @@ from __future__ import annotations
 import pytest
 
 from app.ai.agent import run_review
-from app.ai.foundry import MockFoundryClient
+from app.ai.foundry import MockFoundryClient, ModelRole, ReviewRoles
+
+
+def _roles(reviewers=("gpt-codex",), judge=None):
+    return ReviewRoles(
+        chat=ModelRole(deployment="gpt-4o"),
+        reviewers=[ModelRole(deployment=r) for r in reviewers],
+        judge=ModelRole(deployment=judge) if judge else None,
+    )
 
 
 @pytest.mark.asyncio
@@ -30,7 +38,7 @@ async def test_run_review_mock_pipeline():
 
     result = await run_review(
         client=MockFoundryClient(),
-        model="gpt-codex",
+        roles=_roles(),
         instructions="focus on injection",
         files=files,
         candidates=candidates,
@@ -53,10 +61,48 @@ async def test_run_review_mock_pipeline():
 
 
 @pytest.mark.asyncio
+async def test_ensemble_with_judge_confirms_and_dismisses():
+    """Two reviewers + a judge: the judge confirms evidence-backed findings, dismisses
+    the no-evidence one, and dedupes identical findings from both reviewers."""
+    candidates = [{
+        "source": "semgrep", "title": "SQL injection", "severity": "high", "cwe": "CWE-89",
+        "file_path": "app/db.py", "line_start": 12, "code_snippet": "cur.execute(q)",
+    }]
+    files = [{"path": "app/db.py", "language": "python", "size": 200}]
+    statuses: list[str] = []
+
+    async def emit(event):
+        if event.get("type") == "status":
+            statuses.append(event["status"])
+
+    async def read_file(_path):
+        return "x\n" * 20
+
+    result = await run_review(
+        client=MockFoundryClient(),
+        roles=_roles(reviewers=("gpt-5-codex", "gpt-5"), judge="o4-mini"),
+        instructions=None, files=files, candidates=candidates,
+        read_file=read_file, emit=emit,
+    )
+
+    assert "judging" in statuses
+    findings = result["findings"]
+    # the SQLi (has file evidence) gets confirmed by the judge
+    assert any(f["state"] == "confirmed" and f["triaged_by"] for f in findings)
+    # the no-evidence access-control item is dismissed or routed to a human
+    assert any(f["state"] in ("dismissed", "needs_info") for f in findings)
+    # dedupe: identical SQLi from both reviewers collapses to one confirmed entry
+    sqli = [f for f in findings if f.get("cwe") == "CWE-89"]
+    assert len(sqli) == 1
+
+
+@pytest.mark.asyncio
 async def test_evidence_policy_demotes_unconfirmed():
     """A 'confirmed' finding with no file evidence must be demoted to 'proposed'."""
     from app.ai.agent import _normalize
 
-    f = _normalize({"title": "x", "state": "confirmed", "severity": "high", "confidence": 0.9})
+    f = _normalize(
+        {"title": "x", "state": "confirmed", "severity": "high", "confidence": 0.9}, None
+    )
     assert f["state"] == "proposed"
     assert f["confidence"] <= 0.4

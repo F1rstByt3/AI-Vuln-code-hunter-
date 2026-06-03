@@ -72,8 +72,15 @@ async def post_chat(scan_id: str, body: ChatIn, session: AsyncSession = Depends(
         *[{"role": m.role, "content": m.content} for m in reversed(history)],
     ]
 
-    client = get_foundry_client(await get_foundry_config(session))
-    reply = "".join([tok async for tok in client.chat_stream(messages, temperature=0.3)])
+    cfg = await get_foundry_config(session)
+    client = get_foundry_client(cfg)
+    chat_role = cfg.resolve_roles().chat
+    reply = "".join([
+        tok async for tok in client.stream(
+            messages, model=chat_role.deployment,
+            transport=chat_role.effective_transport(), temperature=0.3,
+        )
+    ])
     if not reply.strip():
         reply = "(no response)"
 

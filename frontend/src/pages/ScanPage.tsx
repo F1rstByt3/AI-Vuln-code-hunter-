@@ -99,10 +99,16 @@ function FindingRow({ f, onTriage }: { f: Finding; onTriage: (id: string, s: str
         {f.cwe && <span className="text-[11px] text-muted">{f.cwe}</span>}
         <StateBadge state={f.state} />
       </div>
-      {f.file_path && <div className="text-[11px] text-muted mt-1">{f.file_path}:{f.line_start}</div>}
+      <div className="flex items-center gap-2 mt-1 text-[11px] text-muted">
+        {f.file_path && <span>{f.file_path}:{f.line_start}</span>}
+        {f.raw?.reviewed_by && <span className="px-1.5 rounded bg-border/60">🔍 {f.raw.reviewed_by}</span>}
+        {f.raw?.merged_count && f.raw.merged_count > 1 && <span>×{f.raw.merged_count} reviewers</span>}
+        {f.triaged_by && <span className="px-1.5 rounded bg-border/60">⚖ {f.triaged_by}</span>}
+      </div>
       {open && (
         <div className="mt-3 text-sm space-y-2">
           <p className="text-slate-300">{f.description}</p>
+          {f.triage_note && <p className="text-xs text-amber-300/90">⚖ {f.triage_note}</p>}
           {f.code_snippet && <pre className="text-xs bg-bg border border-border rounded p-2 overflow-auto">{f.code_snippet}</pre>}
           {f.remediation && <p className="text-xs"><span className="text-emerald-400">Fix:</span> {f.remediation}</p>}
           {f.human_question && (

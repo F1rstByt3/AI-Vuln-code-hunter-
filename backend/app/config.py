@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     foundry_deployment: str = "gpt-codex"
     foundry_api_version: str = "preview"
     foundry_api_style: str = "v1"  # v1 (Foundry Models v1 API) | azure (legacy)
+    # ---- Multi-model roles (optional; default to FOUNDRY_DEPLOYMENT) ----
+    # Reviewers can be a comma-separated list to run an ensemble.
+    foundry_chat_model: str | None = None
+    foundry_reviewer_models: str | None = None
+    foundry_judge_model: str | None = None
     foundry_api_key: str | None = None
     azure_tenant_id: str | None = None
     azure_client_id: str | None = None

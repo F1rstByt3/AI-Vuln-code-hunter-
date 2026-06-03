@@ -45,6 +45,30 @@ Feeding 10GB to a model is impossible and pointless. Instead:
 - Result: bounded token cost/latency **independent of repo size**, and far fewer
   hallucinations because every finding must cite `file:line` + quoted code.
 
+## Multi-model pipeline (roles + ensemble + judge)
+
+The AI stage is split into roles, each mapped to its own Foundry deployment
+(editable in **Settings → Model roles**, or via `FOUNDRY_*_MODEL` env vars):
+
+| Role | Job | Typical model |
+|------|-----|---------------|
+| **chat** | Live plan narration + interactive Q&A | gpt-4o / gpt-5 |
+| **reviewer(s)** | Deep vuln hunting on candidates + code windows | gpt-5-codex, gpt-5 |
+| **judge** | Validates each finding vs. evidence, dedupes, sets final state | o4-mini / gpt-5 |
+
+Flow: SAST candidates → **N reviewers run concurrently** (each finding tagged with
+its `reviewed_by` model) → **judge** consolidates: merges duplicates, `confirm`s
+evidence-backed issues, `dismiss`es unsupported ones, routes business-logic calls to
+`needs_info`. Adding reviewers raises recall; the judge keeps precision high.
+
+**Transport.** Codex and o-series models are *Responses-API only* and reject Chat
+Completions; conversational models use Chat Completions. Each role's transport is
+`auto` (inferred from the model name) by default, overridable to `chat`/`responses`.
+All roles share one Foundry v1 client (`<endpoint>/openai/v1/`).
+
+Reviewers and the judge degrade gracefully: a single reviewer erroring is logged and
+skipped; if the judge call fails the raw reviewer findings are kept.
+
 ## Large-file handling (10GB+)
 
 - **Upload**: resumable multipart (`init → PUT parts → complete`) straight to

@@ -11,7 +11,7 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.ai.foundry import FoundryConfig
+from app.ai.foundry import FoundryConfig, ModelRole
 from app.models import Setting
 
 FOUNDRY_KEY = "foundry"
@@ -55,6 +55,15 @@ async def get_foundry_config(session: AsyncSession) -> FoundryConfig:
             setattr(cfg, field, stored[field])
     if "use_agent_service" in stored:
         cfg.use_agent_service = bool(stored["use_agent_service"])
+    roles = stored.get("roles") or {}
+    if "chat" in roles:
+        cfg.chat_model = ModelRole.parse(roles.get("chat"))
+    if "reviewers" in roles:
+        cfg.reviewer_models = [
+            r for r in (ModelRole.parse(x) for x in roles.get("reviewers") or []) if r
+        ]
+    if "judge" in roles:
+        cfg.judge_model = ModelRole.parse(roles.get("judge"))
     cfg.endpoint = _normalize_endpoint(cfg.endpoint)
     return cfg
 
@@ -71,6 +80,11 @@ async def get_foundry_settings_masked(session: AsyncSession) -> dict:
         "api_key_set": bool(cfg.api_key),
         "mock_mode": cfg.mock,
         "auth_mode": _auth_mode(cfg),
+        "roles": {
+            "chat": cfg.chat_model.to_dict() if cfg.chat_model else None,
+            "reviewers": [r.to_dict() for r in cfg.reviewer_models],
+            "judge": cfg.judge_model.to_dict() if cfg.judge_model else None,
+        },
     }
 
 
@@ -87,8 +101,28 @@ async def update_foundry_settings(session: AsyncSession, patch: dict) -> dict:
         stored["use_agent_service"] = bool(patch["use_agent_service"])
     if patch.get("api_key"):  # only overwrite when a non-empty value is supplied
         stored["api_key"] = patch["api_key"]
+    if "roles" in patch and patch["roles"] is not None:
+        stored["roles"] = _clean_roles(patch["roles"])
     await _set(session, FOUNDRY_KEY, stored)
     return await get_foundry_settings_masked(session)
+
+
+def _clean_role(data) -> dict | None:
+    role = ModelRole.parse(data)
+    return role.to_dict() if role else None
+
+
+def _clean_roles(roles: dict) -> dict:
+    out: dict = {}
+    if "chat" in roles:
+        out["chat"] = _clean_role(roles.get("chat"))
+    if "reviewers" in roles:
+        out["reviewers"] = [
+            r.to_dict() for r in (ModelRole.parse(x) for x in roles.get("reviewers") or []) if r
+        ]
+    if "judge" in roles:
+        out["judge"] = _clean_role(roles.get("judge"))
+    return out
 
 
 def _auth_mode(cfg: FoundryConfig) -> str:

@@ -136,6 +136,8 @@ class FindingOut(ORMModel):
     remediation: str | None = None
     human_question: str | None = None
     triage_note: str | None = None
+    triaged_by: str | None = None
+    raw: dict = {}
 
 
 class FindingTriage(BaseModel):
@@ -176,6 +178,18 @@ class ChatOut(ORMModel):
 
 
 # ---- Settings (Foundry connection, editable in-app) ----
+class ModelRoleOut(BaseModel):
+    deployment: str
+    transport: str = "auto"          # auto | chat | responses
+    reasoning_effort: str | None = None
+
+
+class ModelRolesOut(BaseModel):
+    chat: ModelRoleOut | None = None
+    reviewers: list[ModelRoleOut] = []
+    judge: ModelRoleOut | None = None
+
+
 class FoundrySettingsOut(BaseModel):
     endpoint: str | None = None
     deployment: str
@@ -185,6 +199,7 @@ class FoundrySettingsOut(BaseModel):
     api_key_set: bool
     mock_mode: bool
     auth_mode: str
+    roles: ModelRolesOut = ModelRolesOut()
 
 
 class FoundrySettingsUpdate(BaseModel):
@@ -194,6 +209,7 @@ class FoundrySettingsUpdate(BaseModel):
     api_version: str | None = None
     api_style: str | None = None     # v1 | azure
     use_agent_service: bool | None = None
+    roles: ModelRolesOut | None = None
 
 
 class ModelsOut(BaseModel):

@@ -77,10 +77,13 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
 
             cfg = await get_foundry_config(session)
             client = get_foundry_client(cfg)
-            model = (scan.config or {}).get("model") or cfg.deployment
+            roles = cfg.resolve_roles(reviewer_override=(scan.config or {}).get("model"))
             mode = "MOCK (no endpoint)" if cfg.mock else f"LIVE → {cfg.endpoint}"
-            await emit({"type": "log", "message": f"AI reviewer: deployment={model} "
-                                                  f"mode={mode}"})
+            reviewers = ", ".join(r.deployment for r in roles.reviewers)
+            judge = roles.judge.deployment if roles.judge else "none"
+            await emit({"type": "log", "message": (
+                f"AI pipeline [{mode}] — chat={roles.chat.deployment} "
+                f"reviewers=[{reviewers}] judge={judge}")})
 
             artifact_files = (await session.execute(
                 select(ArtifactFile).where(
@@ -92,7 +95,7 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
 
             result = await run_review(
                 client=client,
-                model=model,
+                roles=roles,
                 instructions=(scan.config or {}).get("instructions"),
                 files=files,
                 candidates=candidates,
@@ -202,6 +205,8 @@ async def _persist_findings(session, scan: Scan, findings: list[dict]) -> None:
             code_snippet=f.get("code_snippet"),
             remediation=f.get("remediation"),
             human_question=f.get("human_question"),
+            triage_note=f.get("triage_note"),
+            triaged_by=f.get("triaged_by"),
             raw=f,
         ))
     await session.commit()

@@ -23,16 +23,24 @@ export interface Finding {
   confidence: number; source: string; state: FindingState; cwe?: string; owasp?: string;
   category?: string; file_path?: string; line_start?: number; line_end?: number;
   code_snippet?: string; remediation?: string; human_question?: string; triage_note?: string;
+  triaged_by?: string; raw?: { reviewed_by?: string; merged_count?: number } & Record<string, any>;
 }
 export interface McpServer {
   id: string; project_id?: string; name: string; kind: string; transport: string;
   url?: string; enabled: boolean;
 }
 export interface ChatMessage { id: string; scan_id: string; role: string; content: string; }
+export interface ModelRole {
+  deployment: string; transport: string; reasoning_effort?: string | null;
+}
+export interface ModelRoles {
+  chat?: ModelRole | null; reviewers: ModelRole[]; judge?: ModelRole | null;
+}
 export interface FoundrySettings {
   endpoint?: string; deployment: string; api_version: string; api_style: string;
   use_agent_service: boolean;
   api_key_set: boolean; mock_mode: boolean; auth_mode: string;
+  roles: ModelRoles;
 }
 export interface Dashboard {
   project_id: string; total_findings: number; open_findings: number; needs_review: number;
