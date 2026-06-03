@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     # ---- Azure AI Foundry ----
     foundry_endpoint: str | None = None  # blank => mock mode
     foundry_deployment: str = "gpt-codex"
-    foundry_api_version: str = "2024-12-01-preview"
+    foundry_api_version: str = "2025-04-01-preview"
     foundry_api_key: str | None = None
     azure_tenant_id: str | None = None
     azure_client_id: str | None = None

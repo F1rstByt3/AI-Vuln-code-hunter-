@@ -15,12 +15,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 from app.config import settings
+
+log = logging.getLogger(__name__)
 
 _CTX_RE = re.compile(r"<<CONTEXT_JSON>>(.*?)<<END>>", re.DOTALL)
 
@@ -32,7 +35,7 @@ class FoundryConfig:
     endpoint: str | None = None
     api_key: str | None = None
     deployment: str = "gpt-codex"
-    api_version: str = "2024-12-01-preview"
+    api_version: str = "2025-04-01-preview"
     tenant_id: str | None = None
     client_id: str | None = None
     client_secret: str | None = None
@@ -96,8 +99,11 @@ class AzureFoundryClient(FoundryClient):
         self._client = AsyncAzureOpenAI(**kwargs)
 
     async def chat_stream(self, messages, temperature=0.2, model=None):
+        deployment = model or self.cfg.deployment
+        log.info("chat_stream: endpoint=%s deployment=%s api_version=%s",
+                 self.cfg.endpoint, deployment, self.cfg.api_version)
         stream = await self._client.chat.completions.create(
-            model=model or self.cfg.deployment,
+            model=deployment,
             messages=messages,
             temperature=temperature,
             stream=True,
