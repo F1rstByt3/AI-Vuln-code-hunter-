@@ -80,6 +80,17 @@ _VALID_STATE = {s.value for s in FindingState}
 _VALID_SOURCE = {s.value for s in FindingSource}
 _RISK_WEIGHT = {"critical": 10.0, "high": 6.0, "medium": 3.0, "low": 1.0, "info": 0.2}
 
+# JSON encoding roughly doubles source size (escaping \n, \t, quotes, plus
+# structural keys). We measure the actual encoded size when batching, but
+# this constant estimates the system/user prompt overhead outside the context
+# payload so we leave room for it.
+_PROMPT_OVERHEAD_TOKENS = 3000
+_CHARS_PER_TOKEN = 3.5  # conservative for code
+
+
+def _estimate_tokens(text: str) -> int:
+    return int(len(text) / _CHARS_PER_TOKEN)
+
 
 async def run_review(
     *,
@@ -105,9 +116,9 @@ async def run_review(
         else:
             orphan_candidates.append(cand)
 
-    # ---- 3. batch files into chunks ----
-    batch_bytes = settings.ai_batch_bytes
-    batches = _build_batches(all_sources, candidates_by_file, batch_bytes)
+    # ---- 3. batch files into chunks sized for the model context ----
+    batch_token_limit = settings.ai_batch_tokens
+    batches = _build_batches(all_sources, candidates_by_file, batch_token_limit)
     if orphan_candidates:
         if batches:
             batches[0]["candidates"].extend(orphan_candidates)
@@ -116,7 +127,8 @@ async def run_review(
 
     await emit({"type": "log", "message":
                 f"Loaded {len(all_sources)}/{len(files)} files, "
-                f"{total_bytes // 1024}KB total — split into {len(batches)} batches"})
+                f"{total_bytes // 1024}KB total — split into {len(batches)} batches "
+                f"(token limit {batch_token_limit:,}/batch)"})
 
     # ---- 4. CHAT model narrates the plan (streamed) ----
     await emit({"type": "status", "status": "planning"})
@@ -149,47 +161,16 @@ async def run_review(
 
     # ---- 5. REVIEWERS review every batch (map phase) ----
     await emit({"type": "status", "status": "reviewing"})
-    raw_findings: list[dict] = []
 
     async def review_batch(
         reviewer: ModelRole, batch_idx: int, batch: dict,
     ) -> list[dict]:
-        ctx = {
-            "instructions": instructions,
-            "batch": batch_idx + 1,
-            "total_batches": len(batches),
-            "source_files": batch["source_files"],
-            "static_analysis_results": batch["candidates"],
-        }
-        ctx_blob = "<<CONTEXT_JSON>>" + json.dumps(ctx) + "<<END>>"
-        msgs = [
-            {"role": "system", "content": REVIEWER_SYSTEM},
-            {"role": "user", "content": (
-                f"Batch {batch_idx + 1}/{len(batches)}. Review EVERY line of the "
-                f"source files below. Triage the static-analysis results "
-                f"(Semgrep/SonarQube) AND hunt for additional vulnerabilities the "
-                f"scanners missed. source_files contains full file contents.\n\n"
-                + ctx_blob
-            )},
-        ]
-        try:
-            result = await client.complete_json(
-                msgs, model=reviewer.deployment,
-                transport=reviewer.effective_transport(),
-                reasoning_effort=reviewer.reasoning_effort,
-            )
-        except Exception as exc:  # noqa: BLE001
-            await emit({"type": "log",
-                        "message": f"Reviewer {reviewer.deployment} batch "
-                                   f"{batch_idx + 1} failed: {exc}"})
-            return []
-        out = []
-        for f in result.get("findings", []):
-            if isinstance(f, dict):
-                out.append({**f, "reviewed_by": reviewer.deployment})
-        return out
+        """Send one batch to a reviewer. On context overflow, split and retry."""
+        return await _review_with_adaptive_split(
+            client, reviewer, batch, batch_idx, len(batches),
+            instructions, emit,
+        )
 
-    # Run each reviewer across all batches; reviewers in parallel, batches sequential
     async def run_reviewer(reviewer: ModelRole) -> list[dict]:
         findings: list[dict] = []
         for i, batch in enumerate(batches):
@@ -212,7 +193,6 @@ async def run_review(
         await emit({"type": "log", "message": f"Judge {roles.judge.deployment}: "
                                               f"adjudicating {len(raw_findings)} findings"})
 
-        # If findings are too many for one judge call, batch the judge too
         judge_batch_size = 200
         adjudicated: list[dict] = []
         for j_start in range(0, len(raw_findings), judge_batch_size):
@@ -254,6 +234,92 @@ async def run_review(
 
 
 # ---------------------------------------------------------------------------
+# Adaptive batch review — splits on context overflow
+# ---------------------------------------------------------------------------
+
+_CONTEXT_OVERFLOW_MARKERS = ("context_length_exceeded", "context window", "maximum context")
+
+
+def _is_context_overflow(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(m in msg for m in _CONTEXT_OVERFLOW_MARKERS)
+
+
+async def _review_with_adaptive_split(
+    client: FoundryClient,
+    reviewer: ModelRole,
+    batch: dict,
+    batch_idx: int,
+    total_batches: int,
+    instructions: str | None,
+    emit: EmitFn,
+    depth: int = 0,
+) -> list[dict]:
+    """Try to review a batch; if the model rejects it for context length,
+    split the batch in half and retry each half. Max 3 levels of splitting."""
+    ctx = {
+        "instructions": instructions,
+        "batch": batch_idx + 1,
+        "total_batches": total_batches,
+        "source_files": batch["source_files"],
+        "static_analysis_results": batch["candidates"],
+    }
+    ctx_blob = "<<CONTEXT_JSON>>" + json.dumps(ctx) + "<<END>>"
+    msgs = [
+        {"role": "system", "content": REVIEWER_SYSTEM},
+        {"role": "user", "content": (
+            f"Batch {batch_idx + 1}/{total_batches}. Review EVERY line of the "
+            f"source files below. Triage the static-analysis results "
+            f"(Semgrep/SonarQube) AND hunt for additional vulnerabilities the "
+            f"scanners missed. source_files contains full file contents.\n\n"
+            + ctx_blob
+        )},
+    ]
+    try:
+        result = await client.complete_json(
+            msgs, model=reviewer.deployment,
+            transport=reviewer.effective_transport(),
+            reasoning_effort=reviewer.reasoning_effort,
+        )
+        out = []
+        for f in result.get("findings", []):
+            if isinstance(f, dict):
+                out.append({**f, "reviewed_by": reviewer.deployment})
+        return out
+    except Exception as exc:  # noqa: BLE001
+        if _is_context_overflow(exc) and depth < 3 and len(batch["source_files"]) > 1:
+            mid = len(batch["source_files"]) // 2
+            files_a = batch["source_files"][:mid]
+            files_b = batch["source_files"][mid:]
+            # split candidates by which half their file belongs to
+            paths_a = {f["path"] for f in files_a}
+            cands_a = [c for c in batch["candidates"] if c.get("file_path") in paths_a]
+            cands_b = [c for c in batch["candidates"] if c.get("file_path") not in paths_a]
+            batch_a = {"source_files": files_a, "candidates": cands_a}
+            batch_b = {"source_files": files_b, "candidates": cands_b}
+            size_a = sum(len(f.get("content") or "") for f in files_a)
+            size_b = sum(len(f.get("content") or "") for f in files_b)
+            await emit({"type": "log",
+                        "message": f"Batch {batch_idx + 1} overflowed context "
+                                   f"(depth={depth}); splitting into "
+                                   f"{len(files_a)} files ({size_a // 1024}KB) + "
+                                   f"{len(files_b)} files ({size_b // 1024}KB)"})
+            results_a = await _review_with_adaptive_split(
+                client, reviewer, batch_a, batch_idx, total_batches,
+                instructions, emit, depth + 1,
+            )
+            results_b = await _review_with_adaptive_split(
+                client, reviewer, batch_b, batch_idx, total_batches,
+                instructions, emit, depth + 1,
+            )
+            return results_a + results_b
+        await emit({"type": "log",
+                    "message": f"Reviewer {reviewer.deployment} batch "
+                               f"{batch_idx + 1} failed: {exc}"})
+        return []
+
+
+# ---------------------------------------------------------------------------
 # File loading & batching
 # ---------------------------------------------------------------------------
 
@@ -288,30 +354,36 @@ async def _load_all_files(
 def _build_batches(
     sources: list[dict],
     candidates_by_file: dict[str, list[dict]],
-    batch_bytes: int,
+    token_limit: int,
 ) -> list[dict]:
-    """Split source files into batches of roughly *batch_bytes* each.
+    """Split source files into batches that fit within *token_limit* tokens.
+    Uses JSON-encoded size estimation to account for escaping overhead.
     Each batch includes the SAST candidates for its files."""
     batches: list[dict] = []
     current_files: list[dict] = []
     current_candidates: list[dict] = []
-    current_size = 0
+    current_tokens = 0
 
     for src in sources:
-        file_size = len(src.get("content") or "")
-        # start new batch if this file would exceed the limit (unless batch is empty)
-        if current_files and current_size + file_size > batch_bytes:
+        # estimate tokens from the JSON-encoded file content (accounts for escaping)
+        encoded_size = len(json.dumps(src.get("content") or ""))
+        file_tokens = _estimate_tokens(encoded_size)
+        file_cands = candidates_by_file.get(src["path"], [])
+        cand_tokens = _estimate_tokens(len(json.dumps(file_cands))) if file_cands else 0
+
+        entry_tokens = file_tokens + cand_tokens
+
+        if current_files and current_tokens + entry_tokens > token_limit:
             batches.append({
                 "source_files": current_files,
                 "candidates": current_candidates,
             })
             current_files = []
             current_candidates = []
-            current_size = 0
+            current_tokens = 0
 
         current_files.append(src)
-        current_size += file_size
-        file_cands = candidates_by_file.get(src["path"], [])
+        current_tokens += entry_tokens
         current_candidates.extend(file_cands)
 
     if current_files:
@@ -320,6 +392,10 @@ def _build_batches(
             "candidates": current_candidates,
         })
     return batches
+
+
+def _estimate_tokens(char_count: int) -> int:
+    return int(char_count / _CHARS_PER_TOKEN)
 
 
 # ---------------------------------------------------------------------------
