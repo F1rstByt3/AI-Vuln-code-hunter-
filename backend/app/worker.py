@@ -235,7 +235,9 @@ async def _persist_findings(session, scan: Scan, findings: list[dict]) -> None:
             line_start=f.get("line_start"),
             line_end=f.get("line_end"),
             code_snippet=f.get("code_snippet"),
-            remediation=f.get("remediation"),
+            # Prefer the exploit analyst's specific recommendation; fall back to
+            # the reviewer's terser remediation. Full PoC/risk live in raw.
+            remediation=f.get("recommendation") or f.get("remediation"),
             human_question=f.get("human_question"),
             triage_note=f.get("triage_note"),
             triaged_by=f.get("triaged_by"),

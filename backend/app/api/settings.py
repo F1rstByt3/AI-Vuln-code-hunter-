@@ -66,6 +66,8 @@ async def test_connection(session: AsyncSession = Depends(get_session)):
         checks += [(f"reviewer[{i}]", r) for i, r in enumerate(roles.reviewers)]
         if roles.judge:
             checks.append(("judge", roles.judge))
+        if roles.exploit:
+            checks.append(("exploit", roles.exploit))
 
         # de-dup identical (deployment, transport) pairs to keep the test fast
         seen: set[tuple[str, str]] = set()

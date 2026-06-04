@@ -189,6 +189,7 @@ class ModelRolesOut(BaseModel):
     chat: ModelRoleOut | None = None
     reviewers: list[ModelRoleOut] = []
     judge: ModelRoleOut | None = None
+    exploit: ModelRoleOut | None = None
 
 
 class FoundrySettingsOut(BaseModel):

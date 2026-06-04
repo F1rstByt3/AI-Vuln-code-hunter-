@@ -23,7 +23,12 @@ export interface Finding {
   confidence: number; source: string; state: FindingState; cwe?: string; owasp?: string;
   category?: string; file_path?: string; line_start?: number; line_end?: number;
   code_snippet?: string; remediation?: string; human_question?: string; triage_note?: string;
-  triaged_by?: string; raw?: { reviewed_by?: string; merged_count?: number } & Record<string, any>;
+  triaged_by?: string;
+  raw?: {
+    reviewed_by?: string; merged_count?: number;
+    where_to_look?: string; attack_scenario?: string; proof_of_concept?: string;
+    risk?: string; recommendation?: string; exploited_by?: string;
+  } & Record<string, any>;
 }
 export interface McpServer {
   id: string; project_id?: string; name: string; kind: string; transport: string;
@@ -39,6 +44,7 @@ export interface ModelRole {
 }
 export interface ModelRoles {
   chat?: ModelRole | null; reviewers: ModelRole[]; judge?: ModelRole | null;
+  exploit?: ModelRole | null;
 }
 export interface FoundrySettings {
   endpoint?: string; deployment: string; api_version: string; api_style: string;

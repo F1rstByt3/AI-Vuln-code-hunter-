@@ -122,7 +122,39 @@ function FindingRow({ f, onTriage }: { f: Finding; onTriage: (id: string, s: str
           <p className="text-slate-300">{f.description}</p>
           {f.triage_note && <p className="text-xs text-amber-300/90">⚖ {f.triage_note}</p>}
           {f.code_snippet && <pre className="text-xs bg-bg border border-border rounded p-2 overflow-auto">{f.code_snippet}</pre>}
-          {f.remediation && <p className="text-xs"><span className="text-emerald-400">Fix:</span> {f.remediation}</p>}
+
+          {f.raw?.where_to_look && (
+            <div className="text-xs">
+              <span className="text-sky-400 font-medium">🔎 Where to look:</span>{" "}
+              <span className="text-slate-300 whitespace-pre-wrap">{f.raw.where_to_look}</span>
+            </div>
+          )}
+          {f.raw?.attack_scenario && (
+            <div className="text-xs">
+              <span className="text-orange-400 font-medium">🎯 Attack scenario:</span>{" "}
+              <span className="text-slate-300 whitespace-pre-wrap">{f.raw.attack_scenario}</span>
+            </div>
+          )}
+          {f.raw?.proof_of_concept && (
+            <div className="text-xs">
+              <div className="text-rose-400 font-medium mb-1">
+                💥 Proof of concept {f.raw.exploited_by && <span className="text-muted font-normal">· {f.raw.exploited_by}</span>}
+              </div>
+              <pre className="text-xs bg-bg border border-rose-500/30 rounded p-2 overflow-auto whitespace-pre-wrap">{f.raw.proof_of_concept}</pre>
+            </div>
+          )}
+          {f.raw?.risk && (
+            <div className="text-xs">
+              <span className="text-amber-400 font-medium">⚠ Risk:</span>{" "}
+              <span className="text-slate-300 whitespace-pre-wrap">{f.raw.risk}</span>
+            </div>
+          )}
+          {(f.raw?.recommendation || f.remediation) && (
+            <p className="text-xs">
+              <span className="text-emerald-400 font-medium">✓ Recommendation:</span>{" "}
+              <span className="text-slate-300 whitespace-pre-wrap">{f.raw?.recommendation || f.remediation}</span>
+            </p>
+          )}
           {f.human_question && (
             <div className="text-xs p-2 rounded border border-fuchsia-500/40 bg-fuchsia-500/10 text-fuchsia-200">
               ❓ {f.human_question}

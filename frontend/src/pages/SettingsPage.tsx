@@ -32,6 +32,7 @@ export default function SettingsPage() {
       chat: s.roles?.chat ?? null,
       reviewers: s.roles?.reviewers?.length ? s.roles.reviewers : [],
       judge: s.roles?.judge ?? null,
+      exploit: s.roles?.exploit ?? null,
     });
     api.listModels().then((m) => setModels(m.models)).catch(() => {});
     api.listMcp().then(setMcp).catch(() => {});
@@ -65,6 +66,7 @@ export default function SettingsPage() {
       chat: roles.chat?.deployment ? roles.chat : null,
       reviewers: roles.reviewers.filter((r) => r.deployment.trim()),
       judge: roles.judge?.deployment ? roles.judge : null,
+      exploit: roles.exploit?.deployment ? roles.exploit : null,
     };
     const body: Record<string, any> = {
       endpoint, deployment, api_version: apiVersion, api_style: apiStyle, roles: cleanRoles,
@@ -196,6 +198,17 @@ export default function SettingsPage() {
               onChange={(r) => setRoles({ ...roles, judge: r })} />
             <div className="text-[11px] text-muted mt-1">
               Leave blank to skip adjudication and keep raw reviewer findings.
+            </div>
+          </div>
+
+          <div>
+            <div className="text-sm font-medium mb-1">Exploit analyst (optional)</div>
+            <RoleEditor role={roles.exploit ?? emptyRole()} models={models}
+              onChange={(r) => setRoles({ ...roles, exploit: r })} />
+            <div className="text-[11px] text-muted mt-1">
+              Runs after the judge on confirmed findings: writes where-to-look, a
+              non-destructive proof-of-concept, a risk assessment, and a concrete
+              fix for each vulnerability. Leave blank to skip.
             </div>
           </div>
         </div>

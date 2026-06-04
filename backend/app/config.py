@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     foundry_chat_model: str | None = None
     foundry_reviewer_models: str | None = None
     foundry_judge_model: str | None = None
+    foundry_exploit_model: str | None = None  # writes PoC / risk / recommendation
     foundry_api_key: str | None = None
     azure_tenant_id: str | None = None
     azure_client_id: str | None = None

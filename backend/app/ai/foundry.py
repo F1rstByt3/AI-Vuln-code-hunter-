@@ -38,6 +38,7 @@ log = logging.getLogger(__name__)
 
 _CTX_RE = re.compile(r"<<CONTEXT_JSON>>(.*?)<<END>>", re.DOTALL)
 _FINDINGS_RE = re.compile(r"<<FINDINGS_JSON>>(.*?)<<END>>", re.DOTALL)
+_EXPLOIT_RE = re.compile(r"<<EXPLOIT_JSON>>(.*?)<<END>>", re.DOTALL)
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 # Models that only speak the Responses API (no Chat Completions).
@@ -111,6 +112,7 @@ class ReviewRoles:
     chat: ModelRole
     reviewers: list[ModelRole]
     judge: ModelRole | None
+    exploit: ModelRole | None = None  # writes PoC / where-to-look / risk
 
 
 @dataclass
@@ -133,6 +135,7 @@ class FoundryConfig:
     chat_model: ModelRole | None = None
     reviewer_models: list[ModelRole] = field(default_factory=list)
     judge_model: ModelRole | None = None
+    exploit_model: ModelRole | None = None  # PoC / exploitation analyst
 
     @property
     def mock(self) -> bool:
@@ -150,7 +153,10 @@ class FoundryConfig:
         else:
             reviewers = list(self.reviewer_models) or [fallback]
         judge = self.judge_model
-        return ReviewRoles(chat=chat, reviewers=reviewers, judge=judge)
+        exploit = self.exploit_model
+        return ReviewRoles(
+            chat=chat, reviewers=reviewers, judge=judge, exploit=exploit
+        )
 
     @classmethod
     def from_settings(cls) -> FoundryConfig:
@@ -172,6 +178,7 @@ class FoundryConfig:
             chat_model=ModelRole.parse(settings.foundry_chat_model),
             reviewer_models=reviewers,
             judge_model=ModelRole.parse(settings.foundry_judge_model),
+            exploit_model=ModelRole.parse(settings.foundry_exploit_model),
         )
 
 
@@ -425,6 +432,9 @@ class MockFoundryClient(FoundryClient):
 
     async def complete_json(self, messages, *, model=None, transport="auto",
                             temperature=0.1, reasoning_effort=None):
+        exploit = self._extract(messages, _EXPLOIT_RE)
+        if exploit is not None:
+            return {"findings": self._exploit(exploit.get("findings", []))}
         judged = self._extract(messages, _FINDINGS_RE)
         if judged is not None:
             return {"findings": self._judge(judged.get("findings", []))}
@@ -501,6 +511,49 @@ class MockFoundryClient(FoundryClient):
                 verdict["triage_note"] = "Judge: no file:line evidence; likely false positive."
             verdict["triaged_by"] = "judge:mock"
             seen[key] = verdict
+            out.append(verdict)
+        return out
+
+    def _exploit(self, findings: list[dict]) -> list[dict]:
+        """Attach a deterministic PoC / risk / recommendation to each finding."""
+        out: list[dict] = []
+        for f in findings:
+            loc = f.get("file_path") or "the affected handler"
+            line = f.get("line_start")
+            where = f"{loc}:{line}" if line else loc
+            verdict = dict(f)
+            verdict["where_to_look"] = (
+                f"Start at {where}. Trace the tainted input from its entry point "
+                f"(request parameter / header / body) to the sink quoted in the "
+                f"evidence, noting any validation or encoding along the way."
+            )
+            verdict["attack_scenario"] = (
+                "An unauthenticated or low-privileged attacker supplies crafted "
+                "input that reaches the vulnerable sink, altering the intended "
+                "control or data flow."
+            )
+            verdict["proof_of_concept"] = (
+                "# PoC (authorized testing only)\n"
+                f"# Target: {where}\n"
+                "1. Identify the request that reaches this code path.\n"
+                "2. Replace the relevant parameter with a boundary-testing payload\n"
+                "   appropriate to the vuln class (e.g. `' OR '1'='1` for SQLi,\n"
+                "   `../../etc/passwd` for path traversal, `${7*7}` for SSTI).\n"
+                "3. Observe the response for the injected effect and confirm impact."
+            )
+            verdict["risk"] = (
+                f"Severity {f.get('severity', 'medium')}. Impact depends on the sink; "
+                "successful exploitation could lead to data disclosure, integrity "
+                "loss, or remote code execution. Likelihood is a function of "
+                "reachability and required privileges."
+            )
+            verdict["recommendation"] = (
+                f.get("remediation")
+                or "Validate and canonicalize input, use safe APIs "
+                "(parameterized queries, allow-lists), and enforce authorization "
+                "at the sink."
+            )
+            verdict["exploited_by"] = "exploit:mock"
             out.append(verdict)
         return out
 

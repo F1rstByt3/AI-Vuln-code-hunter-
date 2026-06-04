@@ -115,7 +115,16 @@ async def export_burp(
         rem.text = _cdata(f.remediation)
 
         detail = SubElement(issue, "issueDetail")
+        raw = f.raw or {}
         detail_parts: list[str] = []
+        if raw.get("where_to_look"):
+            detail_parts.append(f"Where to look:\n{raw['where_to_look']}")
+        if raw.get("attack_scenario"):
+            detail_parts.append(f"Attack scenario:\n{raw['attack_scenario']}")
+        if raw.get("proof_of_concept"):
+            detail_parts.append(f"Proof of concept:\n{raw['proof_of_concept']}")
+        if raw.get("risk"):
+            detail_parts.append(f"Risk:\n{raw['risk']}")
         if f.code_snippet:
             detail_parts.append(f"Code:\n{f.code_snippet}")
         if f.cwe:
@@ -211,17 +220,24 @@ async def export_sarif(
                 physical["region"] = region
             location["physicalLocation"] = physical
 
+        raw = f.raw or {}
+        props: dict = {
+            "severity": f.severity.value,
+            "confidence": f.confidence,
+            "state": f.state.value,
+            "source": f.source.value,
+        }
+        for k in ("where_to_look", "attack_scenario", "proof_of_concept",
+                  "risk", "recommendation"):
+            if raw.get(k):
+                props[k] = raw[k]
+
         sarif_result: dict = {
             "ruleId": rule_id,
             "ruleIndex": rule_index,
             "level": _SEVERITY_TO_SARIF_LEVEL.get(f.severity, "note"),
             "message": {"text": f.description or f.title},
-            "properties": {
-                "severity": f.severity.value,
-                "confidence": f.confidence,
-                "state": f.state.value,
-                "source": f.source.value,
-            },
+            "properties": props,
         }
         if location:
             sarif_result["locations"] = [location]
@@ -260,6 +276,7 @@ _CSV_COLUMNS = [
     "title", "severity", "confidence", "state", "source",
     "cwe", "owasp", "category", "file_path", "line_start", "line_end",
     "description", "remediation", "code_snippet",
+    "where_to_look", "attack_scenario", "proof_of_concept", "risk", "recommendation",
 ]
 
 
@@ -282,6 +299,7 @@ async def export_csv(
     writer.writeheader()
 
     for f in findings:
+        raw = f.raw or {}
         writer.writerow({
             "title": f.title,
             "severity": f.severity.value,
@@ -297,6 +315,11 @@ async def export_csv(
             "description": f.description,
             "remediation": f.remediation or "",
             "code_snippet": f.code_snippet or "",
+            "where_to_look": raw.get("where_to_look") or "",
+            "attack_scenario": raw.get("attack_scenario") or "",
+            "proof_of_concept": raw.get("proof_of_concept") or "",
+            "risk": raw.get("risk") or "",
+            "recommendation": raw.get("recommendation") or "",
         })
 
     return Response(

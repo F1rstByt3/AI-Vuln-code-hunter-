@@ -68,6 +68,8 @@ async def get_foundry_config(session: AsyncSession) -> FoundryConfig:
         ]
     if "judge" in roles:
         cfg.judge_model = ModelRole.parse(roles.get("judge"))
+    if "exploit" in roles:
+        cfg.exploit_model = ModelRole.parse(roles.get("exploit"))
     cfg.endpoint = _normalize_endpoint(cfg.endpoint)
     return cfg
 
@@ -88,6 +90,7 @@ async def get_foundry_settings_masked(session: AsyncSession) -> dict:
             "chat": cfg.chat_model.to_dict() if cfg.chat_model else None,
             "reviewers": [r.to_dict() for r in cfg.reviewer_models],
             "judge": cfg.judge_model.to_dict() if cfg.judge_model else None,
+            "exploit": cfg.exploit_model.to_dict() if cfg.exploit_model else None,
         },
     }
 
@@ -126,6 +129,8 @@ def _clean_roles(roles: dict) -> dict:
         ]
     if "judge" in roles:
         out["judge"] = _clean_role(roles.get("judge"))
+    if "exploit" in roles:
+        out["exploit"] = _clean_role(roles.get("exploit"))
     return out
 
 
