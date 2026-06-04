@@ -23,8 +23,44 @@ WORKROOT = os.environ.get("SCAN_WORKDIR", "/scan-workdir")
 
 _VENDOR_MARKERS = (
     "/node_modules/", "/vendor/", "/.git/", "/dist/", "/build/",
-    "/site-packages/", "/.venv/", "/target/", "/.gradle/", "/bower_components/",
+    "/site-packages/", "/.venv/", "/venv/", "/target/", "/.gradle/",
+    "/bower_components/", "/jspm_packages/", "/.next/", "/.nuxt/",
+    "/out/", "/coverage/", "/__pycache__/", "/.tox/", "/.mypy_cache/",
+    "/.pytest_cache/", "/.terraform/", "/Pods/", "/Carthage/",
+    "/storybook-static/",
 )
+
+# Heavy/vendored dirs pruned during the walk entirely (never indexed) — pure
+# speed: we don't want to stat millions of dependency files.
+_PRUNE_DIRS = {
+    "node_modules", ".git", "vendor", "dist", "build", ".venv", "venv",
+    "site-packages", "target", ".gradle", "bower_components", "jspm_packages",
+    ".next", ".nuxt", "out", "coverage", "__pycache__", ".tox", ".mypy_cache",
+    ".pytest_cache", ".terraform", "Pods", "Carthage", "storybook-static",
+    ".idea", ".vscode",
+}
+
+# Non-product code: indexed (so it shows in the file tree and can be opted into
+# via scope selection) but kept OUT of the default AI surface. Tests/fixtures/
+# generated migrations rarely hold the vulnerabilities worth a manual review and
+# they dominate token budget on large repos.
+_NOISE_MARKERS = (
+    "/test/", "/tests/", "/__tests__/", "/spec/", "/specs/", "/testdata/",
+    "/fixtures/", "/__mocks__/", "/e2e/", "/migrations/", "/examples/",
+    "/example/", "/samples/", "/.storybook/",
+)
+
+# Generated / minified / lock artifacts — excluded by filename, no real review value.
+_GENERATED_SUFFIXES = (
+    ".min.js", ".min.css", ".bundle.js", ".bundle.css", "-min.js", ".map",
+    ".pb.go", ".pb.cc", ".pb.h", "_pb2.py", "_pb2_grpc.py", ".g.dart",
+    ".generated.ts", ".generated.js", ".d.ts",
+)
+_GENERATED_NAMES = {
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "composer.lock",
+    "gemfile.lock", "poetry.lock", "cargo.lock", "go.sum", "go.mod",
+    "pipfile.lock", "packages.lock.json",
+}
 _LANG_BY_EXT = {
     ".py": "python", ".js": "javascript", ".jsx": "javascript", ".ts": "typescript",
     ".tsx": "typescript", ".java": "java", ".go": "go", ".rb": "ruby", ".php": "php",
@@ -152,7 +188,7 @@ def index_files(workdir: str) -> IngestResult:
     result = IngestResult(workdir=workdir)
     for root, dirs, files in os.walk(workdir):
         # prune common heavy/vendored dirs early for speed
-        dirs[:] = [d for d in dirs if d not in {"node_modules", ".git", "vendor"}]
+        dirs[:] = [d for d in dirs if d not in _PRUNE_DIRS]
         for name in files:
             abs_path = os.path.join(root, name)
             if os.path.islink(abs_path):
@@ -165,10 +201,16 @@ def index_files(workdir: str) -> IngestResult:
             ext = os.path.splitext(name)[1].lower()
             language = _LANG_BY_EXT.get(ext)
             is_binary = _looks_binary(abs_path)
-            is_vendored = any(m in f"/{rel}/" for m in _VENDOR_MARKERS)
+            rel_padded = f"/{rel.lower()}/"
+            is_vendored = any(m in rel_padded for m in _VENDOR_MARKERS)
+            is_noise = any(m in rel_padded for m in _NOISE_MARKERS)
+            lname = name.lower()
+            is_generated = lname in _GENERATED_NAMES or lname.endswith(_GENERATED_SUFFIXES)
             included = (
                 not is_binary
                 and not is_vendored
+                and not is_noise
+                and not is_generated
                 and language is not None
                 and size <= settings.max_file_bytes_for_ai
             )

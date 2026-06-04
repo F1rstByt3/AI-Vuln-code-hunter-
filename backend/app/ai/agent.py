@@ -578,7 +578,14 @@ def _build_batches(
 ) -> list[dict]:
     """Split source files into batches that fit within *token_limit* tokens.
     Uses JSON-encoded size estimation to account for escaping overhead.
-    Each batch includes the SAST candidates for its files."""
+    Each batch includes the SAST candidates for its files.
+
+    Files are ordered by path first, so a directory/module's files stay
+    contiguous and land in the same batch wherever they fit. That keeps related
+    code (controller + model + helper + its config) together, letting a reviewer
+    trace a source→sink chain within one batch instead of having the pieces
+    scattered across batches in filesystem-walk order."""
+    sources = sorted(sources, key=lambda s: s.get("path") or "")
     batches: list[dict] = []
     current_files: list[dict] = []
     current_candidates: list[dict] = []
