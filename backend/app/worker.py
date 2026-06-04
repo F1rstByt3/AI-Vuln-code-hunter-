@@ -84,7 +84,8 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
 
             cfg = await get_foundry_config(session)
             client = get_foundry_client(cfg)
-            roles = cfg.resolve_roles(reviewer_override=(scan.config or {}).get("model"))
+            reviewer_override = (scan.config or {}).get("model") or None
+            roles = cfg.resolve_roles(reviewer_override=reviewer_override)
             mode = "MOCK (no endpoint)" if cfg.mock else f"LIVE → {cfg.endpoint}"
             reviewers = ", ".join(r.deployment for r in roles.reviewers)
             judge = roles.judge.deployment if roles.judge else "none"

@@ -35,7 +35,7 @@ export default function ProjectPage() {
     if (a[0] && !artifactId) setArtifactId(a[0].id);
   };
   useEffect(() => { reload().catch((e) => setErr(String(e))); }, [projectId]);
-  useEffect(() => { api.listModels().then((m) => { setModels(m.models); if (!model && m.models[0]) setModel(m.models[0]); }).catch(() => {}); }, []);
+  useEffect(() => { api.listModels().then((m) => { setModels(m.models); }).catch(() => {}); }, []);
 
   useEffect(() => {
     if (!artifactId) { setArtifactFiles([]); setSelectedPaths([]); return; }
@@ -70,7 +70,8 @@ export default function ProjectPage() {
   const startScan = async () => {
     if (!projectId || !artifactId) return;
     const scan = await api.createScan(projectId, {
-      artifact_id: artifactId, scanners: ["semgrep", "ai"], instructions, model,
+      artifact_id: artifactId, scanners: ["semgrep", "ai"], instructions,
+      model: model.trim() || undefined,
       file_paths: selectedPaths.length > 0 ? selectedPaths : undefined,
     });
     nav(`/scans/${scan.id}`);
@@ -111,15 +112,15 @@ export default function ProjectPage() {
 
         <Card className="p-4">
           <h2 className="font-semibold mb-3">Start a review</h2>
-          <label className="text-sm text-muted">AI model / deployment name
+          <label className="text-sm text-muted">Reviewer model override (optional)
             <Input value={model} onChange={(e) => setModel(e.target.value)}
-              placeholder="e.g. gpt-4o, my-codex-deployment" list="project-models-list"
+              placeholder="Leave blank to use Settings roles" list="project-models-list"
               className="mt-1 mb-3" />
             <datalist id="project-models-list">
               {models.map((m) => <option key={m} value={m} />)}
             </datalist>
             {models.length > 0 && (
-              <div className="text-[11px] text-muted">Discovered: {models.join(", ")}</div>
+              <div className="text-[11px] text-muted">Available: {models.join(", ")}</div>
             )}
           </label>
           <label className="text-sm text-muted">Instructions for the agent (optional)</label>

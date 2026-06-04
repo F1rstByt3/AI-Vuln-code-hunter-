@@ -9,10 +9,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # download is best-effort: if the network blocks it the image still builds and
 # SonarQube simply degrades (the worker logs the missing binary and continues).
 ENV SONAR_SCANNER_VERSION=6.2.1.4610
-RUN curl -sSLo /tmp/sonar-scanner.zip \
-      "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-${SONAR_SCANNER_VERSION}-linux-x64.zip" \
+RUN ARCH="$(dpkg --print-architecture)" \
+    && if [ "$ARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; then \
+         SONAR_ARCH="linux-aarch64"; \
+       else \
+         SONAR_ARCH="linux-x64"; \
+       fi \
+    && curl -sSLo /tmp/sonar-scanner.zip \
+         "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-${SONAR_SCANNER_VERSION}-${SONAR_ARCH}.zip" \
     && unzip -q /tmp/sonar-scanner.zip -d /opt \
-    && mv "/opt/sonar-scanner-${SONAR_SCANNER_VERSION}-linux-x64" /opt/sonar-scanner \
+    && mv "/opt/sonar-scanner-${SONAR_SCANNER_VERSION}-${SONAR_ARCH}" /opt/sonar-scanner \
     && ln -s /opt/sonar-scanner/bin/sonar-scanner /usr/local/bin/sonar-scanner \
     && rm /tmp/sonar-scanner.zip \
     || echo "WARN: sonar-scanner download failed; SonarQube scanning unavailable"
