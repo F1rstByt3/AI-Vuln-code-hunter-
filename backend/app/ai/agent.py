@@ -115,7 +115,11 @@ _RISK_WEIGHT = {"critical": 10.0, "high": 6.0, "medium": 3.0, "low": 1.0, "info"
 # this constant estimates the system/user prompt overhead outside the context
 # payload so we leave room for it.
 _PROMPT_OVERHEAD_TOKENS = 3000
-_CHARS_PER_TOKEN = 3.5  # conservative for code
+# Conservative: dense source code (lots of symbols/short tokens) runs ~2.8–3.2
+# chars/token once JSON-escaped. Estimating low here makes batches smaller and
+# leaves headroom for the model's own reasoning + completion output, which on
+# reasoning models (codex/o-series/gpt-5) can consume a large slice of context.
+_CHARS_PER_TOKEN = 3.0  # conservative for code
 
 
 def _estimate_tokens(text: str) -> int:
@@ -292,9 +296,13 @@ async def _review_with_adaptive_split(
     instructions: str | None,
     emit: EmitFn,
     depth: int = 0,
+    line_offset: int = 0,
 ) -> list[dict]:
     """Try to review a batch; if the model rejects it for context length,
-    split the batch in half and retry each half. Max 3 levels of splitting."""
+    split it and retry each half. Multi-file batches split by file; a single
+    oversized file splits along line boundaries (line numbers in the resulting
+    findings are shifted back by ``line_offset`` so citations stay correct).
+    Up to 4 levels of splitting (a single file → up to 16 slices)."""
     ctx = {
         "instructions": instructions,
         "batch": batch_idx + 1,
@@ -322,14 +330,16 @@ async def _review_with_adaptive_split(
         out = []
         for f in result.get("findings", []):
             if isinstance(f, dict):
-                out.append({**f, "reviewed_by": reviewer.deployment})
+                out.append({**_shift_finding(f, line_offset),
+                            "reviewed_by": reviewer.deployment})
         return out
     except Exception as exc:  # noqa: BLE001
-        if _is_context_overflow(exc) and depth < 3 and len(batch["source_files"]) > 1:
-            mid = len(batch["source_files"]) // 2
-            files_a = batch["source_files"][:mid]
-            files_b = batch["source_files"][mid:]
-            # split candidates by which half their file belongs to
+        files = batch["source_files"]
+        if _is_context_overflow(exc) and depth < 4 and len(files) > 1:
+            # Multi-file batch: split by file (each half keeps true line numbers).
+            mid = len(files) // 2
+            files_a = files[:mid]
+            files_b = files[mid:]
             paths_a = {f["path"] for f in files_a}
             cands_a = [c for c in batch["candidates"] if c.get("file_path") in paths_a]
             cands_b = [c for c in batch["candidates"] if c.get("file_path") not in paths_a]
@@ -344,17 +354,70 @@ async def _review_with_adaptive_split(
                                    f"{len(files_b)} files ({size_b // 1024}KB)"})
             results_a = await _review_with_adaptive_split(
                 client, reviewer, batch_a, batch_idx, total_batches,
-                instructions, emit, depth + 1,
+                instructions, emit, depth + 1, line_offset,
             )
             results_b = await _review_with_adaptive_split(
                 client, reviewer, batch_b, batch_idx, total_batches,
-                instructions, emit, depth + 1,
+                instructions, emit, depth + 1, line_offset,
             )
             return results_a + results_b
+
+        if _is_context_overflow(exc) and depth < 4 and len(files) == 1:
+            # A single file is too big for the window. Slice it along line
+            # boundaries and review each half; findings from the second half get
+            # their line numbers shifted back so they reference the real file.
+            only = files[0]
+            lines = (only.get("content") or "").splitlines(keepends=True)
+            if len(lines) > 1:
+                mid = len(lines) // 2
+                part_a = {**only, "content": "".join(lines[:mid])}
+                part_b = {**only, "content": "".join(lines[mid:])}
+                cands = batch["candidates"]
+                cands_a = [c for c in cands if (_as_int(c.get("line_start")) or 1) <= mid]
+                cands_b = [_shift_candidate(c, -mid) for c in cands
+                           if (_as_int(c.get("line_start")) or 1) > mid]
+                batch_a = {"source_files": [part_a], "candidates": cands_a}
+                batch_b = {"source_files": [part_b], "candidates": cands_b}
+                await emit({"type": "log",
+                            "message": f"Batch {batch_idx + 1}: file "
+                                       f"{only.get('path')} too large (depth={depth}); "
+                                       f"splitting its {len(lines)} lines at line {mid}"})
+                results_a = await _review_with_adaptive_split(
+                    client, reviewer, batch_a, batch_idx, total_batches,
+                    instructions, emit, depth + 1, line_offset,
+                )
+                results_b = await _review_with_adaptive_split(
+                    client, reviewer, batch_b, batch_idx, total_batches,
+                    instructions, emit, depth + 1, line_offset + mid,
+                )
+                return results_a + results_b
+
         await emit({"type": "log",
                     "message": f"Reviewer {reviewer.deployment} batch "
                                f"{batch_idx + 1} failed: {exc}"})
         return []
+
+
+def _shift_finding(f: dict, offset: int) -> dict:
+    """Add *offset* to a finding's line numbers (for sliced single-file review)."""
+    if not offset:
+        return f
+    g = dict(f)
+    for k in ("line_start", "line_end"):
+        v = _as_int(g.get(k))
+        if v is not None:
+            g[k] = v + offset
+    return g
+
+
+def _shift_candidate(c: dict, offset: int) -> dict:
+    """Shift a static-analysis candidate's line numbers by *offset* (>=1)."""
+    g = dict(c)
+    for k in ("line_start", "line_end"):
+        v = _as_int(g.get(k))
+        if v is not None:
+            g[k] = max(1, v + offset)
+    return g
 
 
 # ---------------------------------------------------------------------------
