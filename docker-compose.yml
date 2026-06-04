@@ -131,7 +131,7 @@ services:
   # ---------------------------------------------------------------------------
   # SonarQube — optional, heavy (~2GB RAM). Off by default; start on demand with:
   #   docker compose --profile sonar up
-  # Then create a token in the SonarQube UI (http://localhost:9000, admin/admin)
+  # Then create a token in the SonarQube UI (http://localhost:9090, admin/admin)
   # and set SONARQUBE_ENABLED=true + SONARQUBE_TOKEN=... in your .env.
   # ---------------------------------------------------------------------------
   sonarqube:
@@ -144,7 +144,7 @@ services:
       SONAR_JDBC_PASSWORD: sonar
       # Elasticsearch needs to resolve the container hostname
       SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"
-    ports: ["9000:9000"]
+    ports: ["9090:9000"]
     volumes:
       - sonar_data:/opt/sonarqube/data
       - sonar_extensions:/opt/sonarqube/extensions
