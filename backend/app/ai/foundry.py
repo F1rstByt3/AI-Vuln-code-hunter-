@@ -1,20 +1,24 @@
-"""Azure AI Foundry client.
+"""AI inference client — supports Azure AI Foundry, local models, and mock.
 
-Two interchangeable implementations behind one interface:
-  * AzureFoundryClient  — real inference via the Azure AI Foundry v1 API
-                          (OpenAI client, API key OR service-principal / managed
-                          identity). Speaks both Chat Completions and the
-                          Responses API (required by Codex / reasoning models).
-  * MockFoundryClient   — deterministic, offline. Lets the entire review flow run
-                          (and stream) with zero Azure setup, so you can demo first.
+Three implementations behind one interface:
+  * AzureFoundryClient  — real inference via the Azure AI Foundry v1 API or
+                          any OpenAI-compatible endpoint (Ollama, vLLM, LM
+                          Studio, llama.cpp, etc.). Auto-detects local vs
+                          Azure from the endpoint URL.
+  * MockFoundryClient   — deterministic, offline. Lets the entire review flow
+                          run (and stream) with zero setup, so you can demo.
 
-Connection settings come from a FoundryConfig, which the app builds at runtime by
-layering the in-app Settings (DB) over .env defaults — so the endpoint, API key and
-models can be changed from the UI without a redeploy. No endpoint => mock mode.
+Connection settings come from a FoundryConfig, which the app builds at runtime
+by layering the in-app Settings (DB) over .env defaults — so the endpoint, API
+key and models can be changed from the UI without a redeploy.
 
-Transport: some models (gpt-5-codex, o-series reasoning models) are *Responses API
-only* and reject Chat Completions. We auto-detect the transport from the model name
-unless a role pins it explicitly.
+  No endpoint             => mock mode
+  localhost / 127.0.0.1   => local mode (Ollama, vLLM, etc.)
+  *.openai.azure.com      => Azure AI Foundry
+
+Transport: some Azure models (gpt-5-codex, o-series) are *Responses API only*
+and reject Chat Completions. We auto-detect from the model name unless a role
+pins it explicitly. Local models always use Chat Completions.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
 
 from app.config import settings
 
@@ -38,8 +43,22 @@ _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 # Models that only speak the Responses API (no Chat Completions).
 _RESPONSES_HINTS = ("codex", "o1", "o1-", "o3", "o3-", "o4", "o4-", "-reasoning")
 
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "host.docker.internal"}
 
-def _auto_transport(model: str | None) -> str:
+
+def _is_local_endpoint(endpoint: str | None) -> bool:
+    if not endpoint:
+        return False
+    try:
+        host = urlparse(endpoint).hostname or ""
+        return host in _LOCAL_HOSTS or host.startswith("192.168.") or host.startswith("10.")
+    except Exception:
+        return False
+
+
+def _auto_transport(model: str | None, local: bool = False) -> str:
+    if local:
+        return "chat"
     m = (model or "").lower()
     if any(h in m for h in _RESPONSES_HINTS) or m.startswith(("o1", "o3", "o4")):
         return "responses"
@@ -59,9 +78,9 @@ class ModelRole:
     transport: str = "auto"           # auto | chat | responses
     reasoning_effort: str | None = None  # low | medium | high (reasoning/codex only)
 
-    def effective_transport(self) -> str:
+    def effective_transport(self, local: bool = False) -> str:
         t = (self.transport or "auto").lower()
-        return _auto_transport(self.deployment) if t == "auto" else t
+        return _auto_transport(self.deployment, local=local) if t == "auto" else t
 
     @classmethod
     def parse(cls, data) -> ModelRole | None:
@@ -107,7 +126,8 @@ class FoundryConfig:
     client_secret: str | None = None
     use_agent_service: bool = False
     # "v1" = new Foundry Models v1 API (OpenAI client, base_url .../openai/v1/);
-    # "azure" = legacy AzureOpenAI (/openai/deployments/{dep}/...?api-version=).
+    # "azure" = legacy AzureOpenAI (/openai/deployments/{dep}/...?api-version=);
+    # "local" = OpenAI-compatible local server (Ollama, vLLM, LM Studio).
     api_style: str = "v1"
     # Multi-model roles (all optional; fall back to `deployment`).
     chat_model: ModelRole | None = None
@@ -118,16 +138,18 @@ class FoundryConfig:
     def mock(self) -> bool:
         return not self.endpoint
 
+    @property
+    def is_local(self) -> bool:
+        return (self.api_style or "").lower() == "local" or _is_local_endpoint(self.endpoint)
+
     def resolve_roles(self, reviewer_override: str | None = None) -> ReviewRoles:
-        """Build the role set for a scan. A scan-level reviewer override (the model
-        picker on the project page) replaces the configured reviewer ensemble."""
         fallback = ModelRole(deployment=self.deployment)
         chat = self.chat_model or fallback
         if reviewer_override:
             reviewers = [ModelRole(deployment=reviewer_override)]
         else:
             reviewers = list(self.reviewer_models) or [fallback]
-        judge = self.judge_model  # optional; None => no judge stage
+        judge = self.judge_model
         return ReviewRoles(chat=chat, reviewers=reviewers, judge=judge)
 
     @classmethod
@@ -170,9 +192,8 @@ class FoundryClient(ABC):
 
     @abstractmethod
     async def list_models(self) -> list[str]:
-        """Deployments/models available from the configured Foundry project."""
+        """Deployments/models available from the configured project/server."""
 
-    # ---- backward-compatible helpers (chat transport) ----
     def chat_stream(self, messages, temperature: float = 0.2, model: str | None = None):
         return self.stream(messages, model=model, transport="chat", temperature=temperature)
 
@@ -194,12 +215,20 @@ def _entra_token(cfg: FoundryConfig, scope: str) -> str:
     return cred.get_token(scope).token
 
 
-def _v1_base_url(endpoint: str) -> str:
-    """Turn a bare resource endpoint into the Foundry Models v1 base URL.
-    Accepts a host with or without a trailing /openai/v1."""
+def _resolve_base_url(endpoint: str, api_style: str) -> str:
+    """Build the OpenAI client base_url from the user-provided endpoint.
+
+    Local servers (Ollama, vLLM, LM Studio) use /v1 directly.
+    Azure Foundry v1 API uses /openai/v1/.
+    If the URL already ends with /v1, use it as-is.
+    """
     base = endpoint.rstrip("/")
-    if base.lower().endswith("/openai/v1"):
+    lower = base.lower()
+    if lower.endswith("/v1") or lower.endswith("/openai/v1"):
         return base + "/"
+    style = (api_style or "v1").lower()
+    if style == "local" or _is_local_endpoint(endpoint):
+        return base + "/v1/"
     return base + "/openai/v1/"
 
 
@@ -226,7 +255,6 @@ def _parse_json(text: str | None) -> dict:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # salvage the first {...} block
         start, end = text.find("{"), text.rfind("}")
         if 0 <= start < end:
             try:
@@ -236,38 +264,45 @@ def _parse_json(text: str | None) -> dict:
         return {}
 
 
-class AzureFoundryClient(FoundryClient):
-    """Connects to Azure AI Foundry. Defaults to the v1 API (the current
-    Microsoft-recommended path): the standard OpenAI client pointed at
-    ``<endpoint>/openai/v1/`` with no api-version. Set api_style="azure" to fall
-    back to the legacy AzureOpenAI client (/openai/deployments/...?api-version=)."""
+class InferenceClient(FoundryClient):
+    """Connects to Azure AI Foundry OR any OpenAI-compatible server (Ollama,
+    vLLM, LM Studio, llama.cpp, text-generation-inference, etc.).
+
+    Auto-detects local vs Azure from the endpoint URL and adjusts behaviour:
+    - Local: always Chat Completions, no api-version, json_object mode optional
+    - Azure v1: /openai/v1/ base, Responses API for codex/o-series
+    - Azure legacy: AzureOpenAI client with api-version query param
+    """
 
     def __init__(self, cfg: FoundryConfig) -> None:
         self.cfg = cfg
-        self._azure_style = (cfg.api_style or "v1").lower() == "azure"
+        self._local = cfg.is_local
+        self._azure_style = (cfg.api_style or "v1").lower() == "azure" and not self._local
         if self._azure_style:
             self._client = self._build_azure(cfg)
         else:
-            self._client = self._build_v1(cfg)
+            self._client = self._build_openai(cfg)
 
     @staticmethod
-    def _build_v1(cfg: FoundryConfig):
+    def _build_openai(cfg: FoundryConfig):
         from openai import AsyncOpenAI
 
-        base_url = _v1_base_url(cfg.endpoint or "")
-        # The v1 path takes no date-style api-version (that's the legacy Azure style).
-        # GA needs none; preview features want ?api-version=preview. Coerce stale
-        # date versions (e.g. 2024-12-01-preview) to "preview" so old DB values work.
-        ver = (cfg.api_version or "").strip()
-        if re.match(r"^\d{4}-\d{2}-\d{2}", ver):
+        base_url = _resolve_base_url(cfg.endpoint or "", cfg.api_style or "v1")
+        local = cfg.is_local
+
+        # API version: local servers don't need it; Azure v1 uses "preview"
+        ver = (cfg.api_version or "").strip() if not local else ""
+        if ver and re.match(r"^\d{4}-\d{2}-\d{2}", ver):
             ver = "preview"
         default_query = {"api-version": ver} if ver else None
+
         if cfg.api_key:
             api_key = cfg.api_key
+        elif local:
+            api_key = "not-needed"
         else:
-            # Entra ID: resolve a bearer token now (fresh client per scan).
-            # The OpenAI client sends api_key as `Authorization: Bearer <token>`.
             api_key = _entra_token(cfg, scope="https://ai.azure.com/.default")
+
         return AsyncOpenAI(base_url=base_url, api_key=api_key, default_query=default_query)
 
     @staticmethod
@@ -294,16 +329,15 @@ class AzureFoundryClient(FoundryClient):
 
     def _transport_for(self, model: str | None, transport: str) -> str:
         t = (transport or "auto").lower()
-        return _auto_transport(model or self.cfg.deployment) if t == "auto" else t
+        return _auto_transport(model or self.cfg.deployment, local=self._local) if t == "auto" else t
 
     async def stream(self, messages, *, model=None, transport="auto",
                      temperature=0.2, reasoning_effort=None):
         deployment = model or self.cfg.deployment
         t = self._transport_for(deployment, transport)
-        log.info("stream: base_url=%s style=%s deployment=%s transport=%s",
-                 str(self._client.base_url), "azure" if self._azure_style else "v1",
-                 deployment, t)
-        if t == "responses":
+        log.info("stream: base_url=%s local=%s deployment=%s transport=%s",
+                 str(self._client.base_url), self._local, deployment, t)
+        if t == "responses" and not self._local:
             async for tok in self._responses_stream(messages, deployment, reasoning_effort):
                 yield tok
         else:
@@ -318,8 +352,9 @@ class AzureFoundryClient(FoundryClient):
                             temperature=0.1, reasoning_effort=None):
         deployment = model or self.cfg.deployment
         t = self._transport_for(deployment, transport)
-        log.info("complete_json: deployment=%s transport=%s", deployment, t)
-        if t == "responses":
+        log.info("complete_json: deployment=%s transport=%s local=%s", deployment, t, self._local)
+
+        if t == "responses" and not self._local:
             instructions, inp = _split_messages(messages)
             kwargs: dict = dict(model=deployment, input=inp)
             if instructions:
@@ -328,11 +363,23 @@ class AzureFoundryClient(FoundryClient):
                 kwargs["reasoning"] = {"effort": reasoning_effort}
             resp = await self._client.responses.create(**kwargs)
             return _parse_json(getattr(resp, "output_text", None))
-        resp = await self._client.chat.completions.create(
-            model=deployment, messages=messages, temperature=temperature,
-            response_format={"type": "json_object"},
-        )
-        return _parse_json(resp.choices[0].message.content)
+
+        # Chat Completions — try json_object mode, fall back to plain if unsupported
+        try:
+            resp = await self._client.chat.completions.create(
+                model=deployment, messages=messages, temperature=temperature,
+                response_format={"type": "json_object"},
+            )
+            return _parse_json(resp.choices[0].message.content)
+        except Exception as e:
+            if self._local and "json" in str(e).lower():
+                # Model doesn't support json_object mode; retry without it
+                log.warning("json_object mode unsupported by %s, retrying plain", deployment)
+                resp = await self._client.chat.completions.create(
+                    model=deployment, messages=messages, temperature=temperature,
+                )
+                return _parse_json(resp.choices[0].message.content)
+            raise
 
     async def _responses_stream(self, messages, deployment, reasoning_effort):
         instructions, inp = _split_messages(messages)
@@ -351,17 +398,19 @@ class AzureFoundryClient(FoundryClient):
         try:
             resp = await self._client.models.list()
             return sorted({m.id for m in resp.data})
-        except Exception:  # noqa: BLE001 — surface as "none discovered", let user type one
+        except Exception:  # noqa: BLE001
             return []
 
 
-class MockFoundryClient(FoundryClient):
-    """Offline reviewer + judge. Narrates plausibly, turns static-tool candidates
-    into structured findings, adds a canned business-logic item for a human, and —
-    when called as the judge — validates/dedupes/cuts findings without evidence.
-    Exercises the full multi-model pipeline with zero Azure."""
+# Keep backward compat name
+AzureFoundryClient = InferenceClient
 
-    MODELS = ["gpt-5-codex", "gpt-5", "gpt-4o", "gpt-4.1", "o4-mini"]
+
+class MockFoundryClient(FoundryClient):
+    """Offline reviewer + judge. Exercises the full pipeline with zero setup."""
+
+    MODELS = ["gpt-5-codex", "gpt-5", "gpt-4o", "gpt-4.1", "o4-mini",
+              "llama3.1:70b", "qwen2.5-coder:32b", "deepseek-coder-v2"]
 
     async def stream(self, messages, *, model=None, transport="auto",
                      temperature=0.2, reasoning_effort=None):
@@ -432,8 +481,6 @@ class MockFoundryClient(FoundryClient):
         return findings
 
     def _judge(self, findings: list[dict]) -> list[dict]:
-        """Dedupe by (title,file), confirm evidence-backed items, dismiss the rest,
-        keep human-review items as-is."""
         seen: dict[tuple, dict] = {}
         out: list[dict] = []
         for f in findings:
@@ -444,7 +491,7 @@ class MockFoundryClient(FoundryClient):
                 continue
             verdict = dict(f)
             if f.get("state") == "needs_info":
-                pass  # leave for human
+                pass
             elif f.get("file_path"):
                 verdict["state"] = "confirmed"
                 verdict["confidence"] = max(float(f.get("confidence", 0.5)), 0.75)
@@ -474,4 +521,6 @@ class MockFoundryClient(FoundryClient):
 
 def get_foundry_client(cfg: FoundryConfig | None = None) -> FoundryClient:
     cfg = cfg or FoundryConfig.from_settings()
-    return MockFoundryClient() if cfg.mock else AzureFoundryClient(cfg)
+    if cfg.mock:
+        return MockFoundryClient()
+    return InferenceClient(cfg)

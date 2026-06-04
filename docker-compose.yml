@@ -75,6 +75,7 @@ services:
       # and start the optional service: docker compose --profile sonar up).
       SONARQUBE_URL: http://sonarqube:9000
     ports: ["8000:8000"]
+    extra_hosts: ["host.docker.internal:host-gateway"]  # reach Ollama/local models on host
     volumes:
       - ./backend:/app
       - scanwork:/scan-workdir
@@ -105,6 +106,7 @@ services:
       # SonarQube off unless you opt in (set SONARQUBE_ENABLED=true + token in .env
       # and start the optional service: docker compose --profile sonar up).
       SONARQUBE_URL: http://sonarqube:9000
+    extra_hosts: ["host.docker.internal:host-gateway"]  # reach Ollama/local models on host
     volumes:
       - ./backend:/app
       - scanwork:/scan-workdir

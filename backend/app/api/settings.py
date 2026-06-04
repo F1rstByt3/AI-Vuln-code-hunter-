@@ -72,14 +72,14 @@ async def test_connection(session: AsyncSession = Depends(get_session)):
         results: list[str] = []
         ok = True
         for label, role in checks:
-            key = (role.deployment, role.effective_transport())
+            key = (role.deployment, role.effective_transport(local=cfg.is_local))
             if key in seen:
                 continue
             seen.add(key)
             try:
                 async for _ in client.stream(
                     [{"role": "user", "content": "Reply with OK"}],
-                    model=role.deployment, transport=role.effective_transport(),
+                    model=role.deployment, transport=role.effective_transport(local=cfg.is_local),
                 ):
                     break  # one token is enough
                 results.append(f"{label}:{role.deployment}✓")

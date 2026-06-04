@@ -94,7 +94,7 @@ export default function SettingsPage() {
 
       <Card className="p-4">
         <div className="flex items-center justify-between mb-3">
-          <h2 className="font-semibold">Azure AI Foundry connection</h2>
+          <h2 className="font-semibold">AI reviewer connection</h2>
           {fs && (
             <span className={`text-xs px-2 py-0.5 rounded border ${fs.mock_mode ? "border-amber-500/40 text-amber-300" : "border-emerald-500/40 text-emerald-300"}`}>
               {fs.mock_mode ? "MOCK MODE" : `connected · ${fs.auth_mode}`}
@@ -104,7 +104,7 @@ export default function SettingsPage() {
         <div className="grid grid-cols-2 gap-3">
           <label className="text-sm">Endpoint URL
             <Input value={endpoint} onChange={(e) => setEndpoint(e.target.value)}
-              placeholder="https://my-foundry.openai.azure.com" />
+              placeholder="http://localhost:11434 or https://my-foundry.openai.azure.com" />
           </label>
           <label className="text-sm">API key {fs?.api_key_set && <span className="text-emerald-400 text-xs">(set)</span>}
             <Input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)}
@@ -112,7 +112,7 @@ export default function SettingsPage() {
           </label>
           <label className="text-sm">Model / deployment name
             <Input value={deployment} onChange={(e) => setDeployment(e.target.value)}
-              placeholder="e.g. gpt-4o, my-codex-deployment" list="models-list" />
+              placeholder="e.g. llama3.1:70b, gpt-4o, qwen2.5-coder:32b" list="models-list" />
             <datalist id="models-list">
               {models.map((m) => <option key={m} value={m} />)}
             </datalist>
@@ -127,11 +127,16 @@ export default function SettingsPage() {
           <label className="text-sm">API style
             <select value={apiStyle} onChange={(e) => setApiStyle(e.target.value)}
               className="w-full mt-1 px-3 py-2 rounded-md bg-bg border border-border text-sm">
-              <option value="v1">v1 — Foundry Models API (recommended)</option>
-              <option value="azure">azure — legacy (deployments + api-version)</option>
+              <option value="v1">v1 — Azure Foundry Models API</option>
+              <option value="local">local — Ollama / vLLM / LM Studio / llama.cpp</option>
+              <option value="azure">azure — legacy Azure (deployments + api-version)</option>
             </select>
             <div className="text-[11px] text-muted mt-1">
-              v1 calls <code>/openai/v1/</code>; azure calls <code>/openai/deployments/…</code>
+              {apiStyle === "local"
+                ? "Connects to any OpenAI-compatible local server at /v1. No API key needed."
+                : apiStyle === "azure"
+                ? "Legacy Azure path: /openai/deployments/…?api-version=…"
+                : "Azure Foundry v1: /openai/v1/. Auto-detects local endpoints."}
             </div>
           </label>
         </div>
@@ -142,8 +147,11 @@ export default function SettingsPage() {
           {test && <span className="text-sm text-muted">{test}</span>}
         </div>
         <p className="text-xs text-muted mt-3">
-          Leave the endpoint blank to run the agent in deterministic mock mode (no Azure required).
-          In production the API key is backed by Key Vault.
+          Leave the endpoint blank for mock mode (no AI needed).
+          For local models: install <a href="https://ollama.com" className="underline" target="_blank" rel="noreferrer">Ollama</a> and
+          run <code className="text-xs">ollama pull llama3.1:70b</code>, then set the endpoint
+          to <code className="text-xs">http://host.docker.internal:11434</code> (from Docker)
+          or <code className="text-xs">http://localhost:11434</code> (native).
         </p>
       </Card>
 
