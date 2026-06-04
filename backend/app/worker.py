@@ -271,4 +271,4 @@ class WorkerSettings:
     on_startup = _startup
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
     max_jobs = 4
-    job_timeout = 60 * 60  # 1h for large repos
+    job_timeout = 12 * 60 * 60  # 12h for very large repos (25k+ files)

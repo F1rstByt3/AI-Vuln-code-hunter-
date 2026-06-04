@@ -121,6 +121,11 @@ _PROMPT_OVERHEAD_TOKENS = 3000
 # reasoning models (codex/o-series/gpt-5) can consume a large slice of context.
 _CHARS_PER_TOKEN = 3.0  # conservative for code
 
+# How many batches each reviewer processes concurrently.  Higher = faster wall
+# clock but risks hitting the Azure per-deployment rate limit (TPM/RPM).  4 is a
+# good balance: it caps a 100-batch reviewer run at ~25 serial rounds.
+_BATCH_CONCURRENCY = 4
+
 
 def _estimate_tokens(text: str) -> int:
     return int(len(text) / _CHARS_PER_TOKEN)
@@ -208,13 +213,19 @@ async def run_review(
         )
 
     async def run_reviewer(reviewer: ModelRole) -> list[dict]:
-        findings: list[dict] = []
-        for i, batch in enumerate(batches):
-            batch_findings = await review_batch(reviewer, i, batch)
-            findings.extend(batch_findings)
-            await emit({"type": "log",
-                        "message": f"Reviewer {reviewer.deployment}: batch "
-                                   f"{i + 1}/{len(batches)} → {len(batch_findings)} findings"})
+        sem = asyncio.Semaphore(settings.ai_batch_concurrency or _BATCH_CONCURRENCY)
+        results: list[list[dict]] = [[] for _ in batches]
+
+        async def _do(i: int, batch: dict) -> None:
+            async with sem:
+                bf = await review_batch(reviewer, i, batch)
+                results[i] = bf
+                await emit({"type": "log",
+                            "message": f"Reviewer {reviewer.deployment}: batch "
+                                       f"{i + 1}/{len(batches)} → {len(bf)} findings"})
+
+        await asyncio.gather(*(_do(i, b) for i, b in enumerate(batches)))
+        findings = [f for sub in results for f in sub]
         await emit({"type": "log",
                     "message": f"Reviewer {reviewer.deployment}: "
                                f"{len(findings)} total findings"})

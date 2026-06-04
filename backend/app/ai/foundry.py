@@ -290,6 +290,10 @@ class InferenceClient(FoundryClient):
         else:
             self._client = self._build_openai(cfg)
 
+    # Per-request timeout (seconds). Reasoning models can take minutes on
+    # large batches, but anything beyond 10 min is a hang, not deep thought.
+    REQUEST_TIMEOUT = 600
+
     @staticmethod
     def _build_openai(cfg: FoundryConfig):
         from openai import AsyncOpenAI
@@ -310,7 +314,10 @@ class InferenceClient(FoundryClient):
         else:
             api_key = _entra_token(cfg, scope="https://ai.azure.com/.default")
 
-        return AsyncOpenAI(base_url=base_url, api_key=api_key, default_query=default_query)
+        return AsyncOpenAI(
+            base_url=base_url, api_key=api_key, default_query=default_query,
+            timeout=600,  # per-request; reasoning models can be slow
+        )
 
     @staticmethod
     def _build_azure(cfg: FoundryConfig):
@@ -332,6 +339,7 @@ class InferenceClient(FoundryClient):
             kwargs["azure_ad_token_provider"] = get_bearer_token_provider(
                 DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"
             )
+        kwargs["timeout"] = 600
         return AsyncAzureOpenAI(**kwargs)
 
     def _transport_for(self, model: str | None, transport: str) -> str:

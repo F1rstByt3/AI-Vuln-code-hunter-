@@ -70,6 +70,7 @@ class Settings(BaseSettings):
     # ---- AI controls ----
     ai_max_findings_per_scan: int = 500
     ai_batch_tokens: int = 150_000  # tokens per reviewer batch (tune to model context)
+    ai_batch_concurrency: int = 4   # batches per reviewer processed in parallel
     ai_triage_model: str | None = None
     ai_require_evidence: bool = True
 
