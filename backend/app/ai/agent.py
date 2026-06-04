@@ -266,6 +266,7 @@ async def run_review(
         async for token in client.stream(
             plan_msgs, model=roles.chat.deployment,
             transport=roles.chat.effective_transport(),
+            cache_key="hunter-plan",
         ):
             await emit({"type": "token", "text": token})
     except Exception as exc:  # noqa: BLE001
@@ -336,36 +337,37 @@ async def run_review(
         await emit({"type": "log", "message": f"Judge {roles.judge.deployment}: "
                                               f"adjudicating {len(raw_findings)} findings"})
 
-        # Smaller chunks than a pure-text judge: each finding now carries a
-        # window of real source so the judge can validate in context and drop
-        # false positives, which costs tokens.
-        judge_batch_size = 60
+        # Smaller chunks than a pure-text judge: each finding carries a window
+        # of real source so the judge can validate in context and drop false
+        # positives, which costs tokens. Large chunks (or a slow reasoning judge)
+        # can hit the request timeout, so on failure we split the chunk and
+        # retry — salvaging adjudication instead of dumping raw findings.
+        judge_batch_size = 30
         judge_total = (len(raw_findings) + judge_batch_size - 1) // judge_batch_size
         await stage("ai_judge", "running", done=0, total=judge_total)
         adjudicated: list[dict] = []
-        for j_start in range(0, len(raw_findings), judge_batch_size):
-            await checkpoint("ai_judge")
-            j_chunk = raw_findings[j_start : j_start + judge_batch_size]
+        done_chunks = {"n": 0}
+
+        async def _adjudicate(chunk: list[dict], depth: int = 0) -> list[dict]:
             payload_findings = []
-            for f in j_chunk:
+            for f in chunk:
                 entry = _slim(f)
                 ctx = await _source_window(
                     read_file, f.get("file_path"),
                     f.get("line_start"), f.get("line_end"),
-                    radius=15, cap=3000,
+                    radius=12, cap=2000,
                 )
                 if ctx:
                     entry["source_context"] = ctx
                 payload_findings.append(entry)
-            judge_payload = {"findings": payload_findings}
             judge_msgs = [
                 {"role": "system", "content": JUDGE_SYSTEM},
                 {"role": "user", "content": (
-                    f"Adjudicate these {len(j_chunk)} reviewer findings "
-                    f"(chunk {j_start // judge_batch_size + 1}). Use each "
+                    f"Adjudicate these {len(chunk)} reviewer findings. Use each "
                     f"finding's source_context to validate it, deduplicate, "
                     f"dismiss false positives, and set the final state.\n\n"
-                    f"<<FINDINGS_JSON>>" + json.dumps(judge_payload) + "<<END>>"
+                    f"<<FINDINGS_JSON>>" + json.dumps({"findings": payload_findings})
+                    + "<<END>>"
                 )},
             ]
             try:
@@ -373,14 +375,28 @@ async def run_review(
                     judge_msgs, model=roles.judge.deployment,
                     transport=roles.judge.effective_transport(),
                     reasoning_effort=roles.judge.reasoning_effort,
+                    cache_key="hunter-judge",
                 )
-                adjudicated.extend(judged.get("findings", j_chunk) or j_chunk)
+                return judged.get("findings", chunk) or chunk
             except Exception as exc:  # noqa: BLE001
+                if len(chunk) > 5 and depth < 3:
+                    mid = len(chunk) // 2
+                    await emit({"type": "log", "message":
+                                f"Judge chunk failed ({exc}); splitting {len(chunk)}"
+                                f"→{mid}+{len(chunk) - mid} and retrying"})
+                    return (await _adjudicate(chunk[:mid], depth + 1)
+                            + await _adjudicate(chunk[mid:], depth + 1))
                 await emit({"type": "log",
-                            "message": f"Judge failed on chunk ({exc}); keeping raw"})
-                adjudicated.extend(j_chunk)
-            await stage("ai_judge", "running",
-                        done=j_start // judge_batch_size + 1, total=judge_total)
+                            "message": f"Judge failed on {len(chunk)} findings "
+                                       f"({exc}); keeping raw"})
+                return chunk
+
+        for j_start in range(0, len(raw_findings), judge_batch_size):
+            await checkpoint("ai_judge")
+            j_chunk = raw_findings[j_start : j_start + judge_batch_size]
+            adjudicated.extend(await _adjudicate(j_chunk))
+            done_chunks["n"] += 1
+            await stage("ai_judge", "running", done=done_chunks["n"], total=judge_total)
         await stage("ai_judge", "done", done=judge_total, total=judge_total)
         judged_by = roles.judge.deployment
     else:
@@ -460,6 +476,7 @@ async def _review_with_adaptive_split(
             msgs, model=reviewer.deployment,
             transport=reviewer.effective_transport(),
             reasoning_effort=reviewer.reasoning_effort,
+            cache_key="hunter-review",
         )
         out = []
         for f in result.get("findings", []):
@@ -573,11 +590,24 @@ async def _run_exploit_phase(
 ) -> list[dict]:
     """Enrich every non-dismissed finding with exploitation guidance.
 
-    Runs the exploit-analyst model over confirmed/proposed/needs_info findings
-    (dismissed ones are skipped — no point writing a PoC for a false positive)
-    and merges PoC / risk / recommendation back onto each finding by order.
+    Runs the exploit-analyst model over non-dismissed findings at/above the
+    configured severity threshold (the exploit phase is the most expensive, so
+    by default it only writes PoCs for high+critical) and merges PoC / risk /
+    recommendation back onto each finding by order.
     """
-    targets = [f for f in findings if (f.get("state") or "").lower() != "dismissed"]
+    rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+    threshold = rank.get((settings.ai_exploit_min_severity or "high").lower(), 3)
+    targets = [
+        f for f in findings
+        if (f.get("state") or "").lower() != "dismissed"
+        and rank.get((f.get("severity") or "medium").lower(), 2) >= threshold
+    ]
+    skipped = sum(1 for f in findings
+                  if (f.get("state") or "").lower() != "dismissed") - len(targets)
+    if skipped:
+        await emit({"type": "log", "message":
+                    f"Exploit phase: writing PoCs for {len(targets)} findings "
+                    f">= {settings.ai_exploit_min_severity}; skipped {skipped} lower-severity"})
     if not targets:
         return findings
 
@@ -620,6 +650,7 @@ async def _run_exploit_phase(
                 msgs, model=exploit.deployment,
                 transport=exploit.effective_transport(),
                 reasoning_effort=exploit.reasoning_effort,
+                cache_key="hunter-exploit",
             )
             produced = result.get("findings", []) or []
         except Exception as exc:  # noqa: BLE001

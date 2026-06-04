@@ -43,7 +43,7 @@ export const api = {
 
   // scans
   listScans: (projectId: string) => req<Scan[]>(`/projects/${projectId}/scans`),
-  createScan: (projectId: string, b: { artifact_id: string; scanners: string[]; instructions?: string; model?: string; file_paths?: string[] }) =>
+  createScan: (projectId: string, b: { artifact_id: string; scanners: string[]; instructions?: string; model?: string; file_paths?: string[]; review_scope?: string }) =>
     req<Scan>(`/projects/${projectId}/scans`, { method: "POST", body: JSON.stringify(b) }),
   getScan: (id: string) => req<Scan>(`/scans/${id}`),
   cancelScan: (id: string) => req<Scan>(`/scans/${id}/cancel`, { method: "POST" }),

@@ -235,12 +235,14 @@ class FoundryClient(ABC):
     def stream(
         self, messages: list[dict], *, model: str | None = None, transport: str = "auto",
         temperature: float = 0.2, reasoning_effort: str | None = None,
+        cache_key: str | None = None,
     ) -> AsyncIterator[str]: ...
 
     @abstractmethod
     async def complete_json(
         self, messages: list[dict], *, model: str | None = None, transport: str = "auto",
         temperature: float = 0.1, reasoning_effort: str | None = None,
+        cache_key: str | None = None,
     ) -> dict: ...
 
     @abstractmethod
@@ -393,20 +395,28 @@ class InferenceClient(FoundryClient):
         t = (transport or "auto").lower()
         return _auto_transport(model or self.cfg.deployment, local=self._local) if t == "auto" else t
 
+    def _cache_kw(self, cache_key: str | None) -> dict:
+        """prompt_cache_key routes identical prompt prefixes (our static system
+        prompts) to the provider's prompt cache, cutting repeat-input cost.
+        Local servers don't support it."""
+        return {"prompt_cache_key": cache_key} if (cache_key and not self._local) else {}
+
     async def stream(self, messages, *, model=None, transport="auto",
-                     temperature=0.2, reasoning_effort=None):
+                     temperature=0.2, reasoning_effort=None, cache_key=None):
         deployment = model or self.cfg.deployment
         t = self._transport_for(deployment, transport)
         log.info("stream: base_url=%s local=%s deployment=%s transport=%s",
                  str(self._client.base_url), self._local, deployment, t)
         if t == "responses" and not self._local:
-            async for tok in self._responses_stream(messages, deployment, reasoning_effort):
+            async for tok in self._responses_stream(
+                messages, deployment, reasoning_effort, cache_key):
                 yield tok
         else:
             # include_usage adds a final usage-only chunk; some local servers
             # reject the option, so fall back without it.
             create_kw = dict(model=deployment, messages=messages,
-                             temperature=temperature, stream=True)
+                             temperature=temperature, stream=True,
+                             **self._cache_kw(cache_key))
             try:
                 stream = await self._client.chat.completions.create(
                     **create_kw, stream_options={"include_usage": True})
@@ -419,14 +429,14 @@ class InferenceClient(FoundryClient):
                     yield delta
 
     async def complete_json(self, messages, *, model=None, transport="auto",
-                            temperature=0.1, reasoning_effort=None):
+                            temperature=0.1, reasoning_effort=None, cache_key=None):
         deployment = model or self.cfg.deployment
         t = self._transport_for(deployment, transport)
         log.info("complete_json: deployment=%s transport=%s local=%s", deployment, t, self._local)
 
         if t == "responses" and not self._local:
             instructions, inp = _split_messages(messages)
-            kwargs: dict = dict(model=deployment, input=inp)
+            kwargs: dict = dict(model=deployment, input=inp, **self._cache_kw(cache_key))
             if instructions:
                 kwargs["instructions"] = instructions
             if reasoning_effort and _is_reasoning(deployment):
@@ -439,7 +449,7 @@ class InferenceClient(FoundryClient):
         try:
             resp = await self._client.chat.completions.create(
                 model=deployment, messages=messages, temperature=temperature,
-                response_format={"type": "json_object"},
+                response_format={"type": "json_object"}, **self._cache_kw(cache_key),
             )
             self.usage.add(deployment, *_usage_pair(getattr(resp, "usage", None)))
             return _parse_json(resp.choices[0].message.content)
@@ -454,9 +464,10 @@ class InferenceClient(FoundryClient):
                 return _parse_json(resp.choices[0].message.content)
             raise
 
-    async def _responses_stream(self, messages, deployment, reasoning_effort):
+    async def _responses_stream(self, messages, deployment, reasoning_effort, cache_key=None):
         instructions, inp = _split_messages(messages)
-        kwargs: dict = dict(model=deployment, input=inp, stream=True)
+        kwargs: dict = dict(model=deployment, input=inp, stream=True,
+                            **self._cache_kw(cache_key))
         if instructions:
             kwargs["instructions"] = instructions
         if reasoning_effort and _is_reasoning(deployment):
@@ -497,7 +508,7 @@ class MockFoundryClient(FoundryClient):
         return prompt, max(1, len(output) // 4)
 
     async def stream(self, messages, *, model=None, transport="auto",
-                     temperature=0.2, reasoning_effort=None):
+                     temperature=0.2, reasoning_effort=None, cache_key=None):
         text = (
             f"[MOCK {model or 'reviewer'}] Planning the review. I'll triage the "
             "static-analysis candidates first, then hunt for logic flaws the scanners "
@@ -509,7 +520,7 @@ class MockFoundryClient(FoundryClient):
             await asyncio.sleep(0.005)
 
     async def complete_json(self, messages, *, model=None, transport="auto",
-                            temperature=0.1, reasoning_effort=None):
+                            temperature=0.1, reasoning_effort=None, cache_key=None):
         result = await self._complete_json(messages, model=model)
         self.usage.add(model or "mock", *self._est(messages, json.dumps(result)))
         return result

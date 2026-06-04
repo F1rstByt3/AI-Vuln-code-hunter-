@@ -134,7 +134,8 @@ class _Stages:
 
 
 async def _ai_review(session, scan: Scan, artifact: Artifact, workdir: str,
-                     candidates: list[dict], emit, checkpoint=None) -> dict:
+                     candidates: list[dict], emit, checkpoint=None,
+                     endpoints: list[dict] | None = None) -> dict:
     """Run the AI reviewer/judge/exploit pipeline. Returns run_review's result."""
     async def read_file(rel: str) -> str | None:
         return _safe_read(workdir, rel)
@@ -165,6 +166,23 @@ async def _ai_review(session, scan: Scan, artifact: Artifact, workdir: str,
         ]
         await emit({"type": "log", "message":
                     f"Scoped to {len(artifact_files)} files ({len(selected_paths)} selections)"})
+
+    # Targeted review: only feed the LLM files that a static scanner flagged or
+    # that expose an endpoint handler — far cheaper than reading the whole tree.
+    scope = (scan.config or {}).get("review_scope") or "full"
+    if scope == "targeted":
+        focus = {c.get("file_path") for c in candidates if c.get("file_path")}
+        focus |= {ep.get("file_path") for ep in (endpoints or []) if ep.get("file_path")}
+        if focus:
+            before = len(artifact_files)
+            artifact_files = [f for f in artifact_files if f.path in focus]
+            await emit({"type": "log", "message":
+                        f"Targeted review: {len(artifact_files)}/{before} files "
+                        f"(static candidates + endpoint handlers)"})
+        else:
+            await emit({"type": "log", "message":
+                        "Targeted review requested but no candidates/endpoints to "
+                        "focus on — falling back to full review"})
 
     files = [{"path": f.path, "language": f.language, "size": f.size_bytes}
              for f in artifact_files]
@@ -258,7 +276,7 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
                 try:
                     result = await _ai_review(
                         session, scan, artifact, workdir, candidates, emit,
-                        checkpoint=controller.checkpoint,
+                        checkpoint=controller.checkpoint, endpoints=endpoints,
                     )
                     await set_stage("persist", "running")
                     await _persist_findings(session, scan, result["findings"])
@@ -603,7 +621,8 @@ async def rerun_stage(ctx: dict, scan_id: str, stage: str) -> None:
                 await emit({"type": "log", "message":
                             f"AI re-run over {len(candidates)} existing static candidates"})
                 result = await _ai_review(session, scan, artifact, workdir, candidates, emit,
-                                          checkpoint=controller.checkpoint)
+                                          checkpoint=controller.checkpoint,
+                                          endpoints=(scan.summary or {}).get("endpoints"))
                 # Replace prior AI-authored findings; keep raw static ones.
                 await _delete_findings_by_source(session, scan_id, {"ai", "correlated"})
                 await _persist_findings(session, scan, result["findings"])

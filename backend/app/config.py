@@ -73,6 +73,9 @@ class Settings(BaseSettings):
     ai_batch_concurrency: int = 4   # batches per reviewer processed in parallel
     ai_triage_model: str | None = None
     ai_require_evidence: bool = True
+    # Only write exploit PoCs for findings at/above this severity (the exploit
+    # phase is expensive). critical | high | medium | low | info.
+    ai_exploit_min_severity: str = "high"
 
     @property
     def foundry_mock(self) -> bool:

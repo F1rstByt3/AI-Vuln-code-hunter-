@@ -105,6 +105,9 @@ class ScanCreate(BaseModel):
     instructions: str | None = None  # free-form steer for the agent
     model: str | None = None         # Foundry deployment override (else app default)
     file_paths: list[str] | None = None  # scope scan to these files/folders
+    # "full" reviews every file; "targeted" reviews only files with static
+    # candidates + endpoint handlers (much cheaper, may miss scanner-blind vulns)
+    review_scope: str = "full"
 
 
 class ScanRerun(BaseModel):

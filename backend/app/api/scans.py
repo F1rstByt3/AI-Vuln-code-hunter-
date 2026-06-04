@@ -48,6 +48,7 @@ async def create_scan(
         config={
             "scanners": body.scanners, "instructions": body.instructions,
             "model": body.model, "file_paths": body.file_paths,
+            "review_scope": body.review_scope,
         },
     )
     session.add(scan)

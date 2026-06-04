@@ -26,6 +26,7 @@ export default function ProjectPage() {
   const [useSemgrep, setUseSemgrep] = useState(true);
   const [useSonar, setUseSonar] = useState(false);
   const [useAI, setUseAI] = useState(true);
+  const [targeted, setTargeted] = useState(false);
   const [err, setErr] = useState("");
 
   const reload = async () => {
@@ -82,6 +83,7 @@ export default function ProjectPage() {
       artifact_id: artifactId, scanners, instructions,
       model: model.trim() || undefined,
       file_paths: selectedPaths.length > 0 ? selectedPaths : undefined,
+      review_scope: targeted ? "targeted" : "full",
     });
     nav(`/scans/${scan.id}`);
   };
@@ -143,6 +145,20 @@ export default function ProjectPage() {
                 : "Static-only: scanner findings are saved directly, no AI triage."}
               {" "}SonarQube requires it to be enabled in Settings.
             </div>
+            {useAI && (
+              <div className="mt-2">
+                <label className="flex items-center gap-1.5 text-sm">
+                  <input type="checkbox" checked={targeted}
+                    onChange={(e) => setTargeted(e.target.checked)} />
+                  Targeted review <span className="text-[11px] text-emerald-400">(much cheaper)</span>
+                </label>
+                <div className="text-[11px] text-muted mt-0.5">
+                  {targeted
+                    ? "Only files flagged by a scanner or exposing an endpoint go to the LLM — slashes token cost, but may miss vulns the scanners didn't flag."
+                    : "Full review reads every source file (most thorough, most expensive)."}
+                </div>
+              </div>
+            )}
           </div>
           <label className="text-sm text-muted">Reviewer model override (optional)
             <Input value={model} onChange={(e) => setModel(e.target.value)}
