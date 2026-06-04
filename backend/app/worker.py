@@ -17,10 +17,11 @@ from datetime import datetime, timezone
 from arq.connections import RedisSettings
 from sqlalchemy import select
 
-from app import events
+from app import control, events
 from app.ai.agent import run_review
 from app.ai.foundry import get_foundry_client
 from app.config import settings
+from app.control import Controller, ScanCanceledSignal, StageSkippedSignal
 from app.db import SessionLocal, init_models
 from app.ingestion import index_files, materialize
 from app.models import (
@@ -58,9 +59,82 @@ RERUNNABLE_STAGES = ("semgrep", "sonarqube", "ai")
 
 _RISK_WEIGHT = {"critical": 10.0, "high": 6.0, "medium": 3.0, "low": 1.0, "info": 0.2}
 
+# Human-readable labels + canonical ordering for the pipeline stage panel.
+_STAGE_LABELS = {
+    "ingest": "Ingest & index",
+    "semgrep": "Semgrep",
+    "sonarqube": "SonarQube",
+    "mcp": "MCP scanners",
+    "endpoints": "Endpoint extraction",
+    "ai_plan": "AI plan",
+    "ai_review": "AI review",
+    "ai_judge": "AI judge",
+    "ai_exploit": "Exploit analyst",
+    "persist": "Persist findings",
+}
+_STAGE_ORDER = list(_STAGE_LABELS.keys())
+
+
+def _stage_order(name: str) -> int:
+    return _STAGE_ORDER.index(name) if name in _STAGE_ORDER else 99
+
+
+def _planned_stages(requested: set[str], scfg) -> list[str]:
+    """The ordered list of stages this scan intends to run (for the UI panel)."""
+    stages = ["ingest"]
+    if scfg.semgrep_enabled and "semgrep" in requested:
+        stages.append("semgrep")
+    if scfg.sonarqube_enabled and "sonarqube" in requested:
+        stages.append("sonarqube")
+    if "mcp" in requested:
+        stages.append("mcp")
+    stages.append("endpoints")
+    if "ai" in requested:
+        stages += ["ai_plan", "ai_review", "ai_judge", "ai_exploit"]
+    stages.append("persist")
+    return stages
+
+
+class _Stages:
+    """Tracks per-stage state for the UI. Fed by ``stage`` events (from both the
+    worker's static stages and the AI agent), persisted into the scan summary."""
+
+    def __init__(self) -> None:
+        self.state: dict[str, dict] = {}
+
+    def seed(self, names: list[str]) -> None:
+        for n in names:
+            self.state.setdefault(n, {
+                "stage": n, "label": _STAGE_LABELS.get(n, n),
+                "order": _stage_order(n), "state": "pending",
+                "done": None, "total": None,
+            })
+
+    def apply(self, event: dict) -> None:
+        n = event.get("stage")
+        if not n:
+            return
+        prev = self.state.get(n, {})
+        self.state[n] = {
+            "stage": n, "label": _STAGE_LABELS.get(n, n), "order": _stage_order(n),
+            "state": event.get("state", prev.get("state", "pending")),
+            "done": event.get("done", prev.get("done")),
+            "total": event.get("total", prev.get("total")),
+        }
+
+    def finalize(self) -> list[dict]:
+        # Any stage left pending/running after a clean finish was never reached.
+        for s in self.state.values():
+            if s["state"] in ("pending", "running"):
+                s["state"] = "skipped"
+        return sorted(self.state.values(), key=lambda s: s["order"])
+
+    def snapshot(self) -> list[dict]:
+        return sorted(self.state.values(), key=lambda s: s["order"])
+
 
 async def _ai_review(session, scan: Scan, artifact: Artifact, workdir: str,
-                     candidates: list[dict], emit) -> dict:
+                     candidates: list[dict], emit, checkpoint=None) -> dict:
     """Run the AI reviewer/judge/exploit pipeline. Returns run_review's result."""
     async def read_file(rel: str) -> str | None:
         return _safe_read(workdir, rel)
@@ -103,6 +177,7 @@ async def _ai_review(session, scan: Scan, artifact: Artifact, workdir: str,
         candidates=candidates,
         read_file=read_file,
         emit=emit,
+        checkpoint=checkpoint,
     )
 
 
@@ -112,6 +187,8 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
         if scan is None:
             return
         seq = {"n": 0}
+        stages = _Stages()
+        tokens: dict = {"v": None}
         # Reviewers now run batches concurrently, so emit() can be called from
         # several tasks at once. The SQLAlchemy AsyncSession (one asyncpg
         # connection) can only do one operation at a time — serialize the DB
@@ -120,6 +197,10 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
 
         async def emit(event: dict) -> None:
             event = {"ts": _now().isoformat(), **event}
+            if event.get("type") == "stage":
+                stages.apply(event)
+            elif event.get("type") == "tokens":
+                tokens["v"] = event.get("tokens")
             await events.publish(scan_id, event)
             if event.get("type") not in {"token", "heartbeat"}:  # tokens stay live-only
                 async with emit_lock:
@@ -128,53 +209,105 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
                                            type=event.get("type", "log"), payload=event))
                     await session.commit()
 
+        async def set_stage(name: str, state: str, **extra) -> None:
+            await emit({"type": "stage", "stage": name, "state": state, **extra})
+
+        controller = Controller(scan_id, emit)
+        await control.clear_control(scan_id)  # drop stale flags from a prior run
+
         scan.status = ScanStatus.running
         scan.started_at = _now()
         await session.commit()
         await emit({"type": "status", "status": "running"})
 
         requested = set((scan.config or {}).get("scanners", _DEFAULT_SCANNERS))
+        scfg = await get_scanner_config(session)
+        stages.seed(_planned_stages(requested, scfg))
+        await emit({"type": "stages", "stages": stages.snapshot()})
+
+        async def finalize(status: ScanStatus, summary: dict, needs_review: bool) -> None:
+            final_status = ScanStatus.needs_review if needs_review else status
+            scan.status = final_status
+            scan.summary = {**summary, "stages": stages.finalize(), "tokens": tokens["v"]}
+            scan.finished_at = _now()
+            await session.commit()
+            await emit({"type": "done", "status": final_status.value, "summary": scan.summary})
+
         try:
             artifact = await session.get(Artifact, scan.artifact_id)
+            await controller.checkpoint("ingest")
+            await set_stage("ingest", "running")
             workdir = await _ingest(session, artifact, emit)
+            await set_stage("ingest", "done")
 
-            candidates = await _static_scan(session, scan, artifact, workdir, emit)
+            candidates = await _static_scan(
+                session, scan, artifact, workdir, emit, controller, set_stage, scfg)
 
+            await controller.checkpoint("endpoints")
+            await set_stage("endpoints", "running")
             await emit({"type": "status", "status": "extracting endpoints"})
-            endpoints = await extract_endpoints(workdir)
-            await emit({"type": "log", "message":
-                        f"Extracted {len(endpoints)} endpoints"})
+            try:
+                endpoints = await extract_endpoints(workdir)
+                await emit({"type": "log", "message": f"Extracted {len(endpoints)} endpoints"})
+                await set_stage("endpoints", "done")
+            except StageSkippedSignal:
+                endpoints = []
+                await set_stage("endpoints", "skipped")
 
             if "ai" in requested:
-                result = await _ai_review(
-                    session, scan, artifact, workdir, candidates, emit
-                )
-                await _persist_findings(session, scan, result["findings"])
-                scan.summary = {**result["summary"], "endpoints": endpoints}
-                needs_review = result["summary"].get("needs_review")
+                try:
+                    result = await _ai_review(
+                        session, scan, artifact, workdir, candidates, emit,
+                        checkpoint=controller.checkpoint,
+                    )
+                    await set_stage("persist", "running")
+                    await _persist_findings(session, scan, result["findings"])
+                    await set_stage("persist", "done")
+                    await finalize(ScanStatus.completed,
+                                   {**result["summary"], "endpoints": endpoints},
+                                   bool(result["summary"].get("needs_review")))
+                except StageSkippedSignal:
+                    # User skipped AI mid-flight — finalize with static candidates.
+                    await emit({"type": "log", "message":
+                                "AI review skipped; finalizing with static candidates"})
+                    findings = [_candidate_to_finding(c) for c in candidates]
+                    await set_stage("persist", "running")
+                    await _persist_findings(session, scan, findings)
+                    await set_stage("persist", "done")
+                    await finalize(ScanStatus.completed,
+                                   {**_summary_from_finding_dicts(findings),
+                                    "endpoints": endpoints}, False)
             else:
                 # No AI requested — persist the raw static candidates directly so
                 # "just Semgrep" / "just SonarQube" runs surface their findings.
                 findings = [_candidate_to_finding(c) for c in candidates]
+                await set_stage("persist", "running")
                 await _persist_findings(session, scan, findings)
-                scan.summary = {**_summary_from_finding_dicts(findings),
-                                "endpoints": endpoints}
-                needs_review = False
+                await set_stage("persist", "done")
                 await emit({"type": "log", "message":
                             f"Static-only run: persisted {len(findings)} candidates "
                             f"as findings (no AI review requested)"})
-
-            scan.status = ScanStatus.needs_review if needs_review else ScanStatus.completed
+                await finalize(ScanStatus.completed,
+                               {**_summary_from_finding_dicts(findings),
+                                "endpoints": endpoints}, False)
+        except ScanCanceledSignal:
+            scan.status = ScanStatus.canceled
+            scan.summary = {**(scan.summary or {}), "stages": stages.snapshot(),
+                            "tokens": tokens["v"]}
             scan.finished_at = _now()
             await session.commit()
-            await emit({"type": "done", "status": scan.status.value, "summary": scan.summary})
+            await emit({"type": "canceled", "status": "canceled"})
         except Exception as exc:  # noqa: BLE001
             scan.status = ScanStatus.failed
             scan.error = str(exc)[:2000]
+            scan.summary = {**(scan.summary or {}), "stages": stages.snapshot(),
+                            "tokens": tokens["v"]}
             scan.finished_at = _now()
             await session.commit()
             await emit({"type": "failed", "error": scan.error})
             raise
+        finally:
+            await control.clear_control(scan_id)
 
 
 async def _ingest(session, artifact: Artifact, emit) -> str:
@@ -211,48 +344,79 @@ async def _ingest(session, artifact: Artifact, emit) -> str:
     return workdir
 
 
-async def _static_scan(session, scan: Scan, artifact: Artifact, workdir: str, emit) -> list[dict]:
+async def _static_scan(session, scan: Scan, artifact: Artifact, workdir: str, emit,
+                       controller=None, set_stage=None, scfg=None) -> list[dict]:
     requested = set((scan.config or {}).get("scanners", _DEFAULT_SCANNERS))
-    scfg = await get_scanner_config(session)
+    if scfg is None:
+        scfg = await get_scanner_config(session)
     candidates: list[dict] = []
 
-    if scfg.semgrep_enabled and "semgrep" in requested:
-        await emit({"type": "status", "status": "semgrep"})
+    async def _checkpoint(stage: str) -> bool:
+        """Run the pause/cancel/skip checkpoint. Returns False if the stage was
+        skipped (so the caller can mark it skipped and move on)."""
+        if controller is None:
+            return True
         try:
-            sem = await SemgrepScanner().scan(workdir)
-            candidates.extend(sem)
-            await emit({"type": "log", "message": f"Semgrep: {len(sem)} candidates"})
-        except Exception as exc:  # noqa: BLE001
-            await emit({"type": "log", "message": f"Semgrep error: {exc}"})
+            await controller.checkpoint(stage)
+            return True
+        except StageSkippedSignal:
+            if set_stage:
+                await set_stage(stage, "skipped")
+            return False
+
+    async def _stage(name: str, state: str, **extra) -> None:
+        if set_stage:
+            await set_stage(name, state, **extra)
+
+    if scfg.semgrep_enabled and "semgrep" in requested:
+        if await _checkpoint("semgrep"):
+            await _stage("semgrep", "running")
+            await emit({"type": "status", "status": "semgrep"})
+            try:
+                sem = await SemgrepScanner().scan(workdir)
+                candidates.extend(sem)
+                await emit({"type": "log", "message": f"Semgrep: {len(sem)} candidates"})
+                await _stage("semgrep", "done")
+            except Exception as exc:  # noqa: BLE001
+                await emit({"type": "log", "message": f"Semgrep error: {exc}"})
+                await _stage("semgrep", "failed")
 
     # SonarQube is admin-gated (heavy, needs a server); run when enabled and
     # explicitly requested for this scan.
     if scfg.sonarqube_enabled and "sonarqube" in requested:
-        await emit({"type": "status", "status": "sonarqube"})
-        try:
-            sonar = await SonarScanner(
-                url=scfg.sonarqube_url, token=scfg.sonarqube_token
-            ).scan(workdir)
-            candidates.extend(sonar)
-            await emit({"type": "log", "message": f"SonarQube: {len(sonar)} candidates"})
-        except Exception as exc:  # noqa: BLE001
-            await emit({"type": "log", "message": f"SonarQube error: {exc}"})
+        if await _checkpoint("sonarqube"):
+            await _stage("sonarqube", "running")
+            await emit({"type": "status", "status": "sonarqube"})
+            try:
+                sonar = await SonarScanner(
+                    url=scfg.sonarqube_url, token=scfg.sonarqube_token
+                ).scan(workdir)
+                candidates.extend(sonar)
+                await emit({"type": "log", "message": f"SonarQube: {len(sonar)} candidates"})
+                await _stage("sonarqube", "done")
+            except Exception as exc:  # noqa: BLE001
+                await emit({"type": "log", "message": f"SonarQube error: {exc}"})
+                await _stage("sonarqube", "failed")
 
     if "mcp" in requested:
-        mcp_rows = (await session.execute(
-            select(McpServer).where(
-                McpServer.enabled.is_(True),
-                (McpServer.project_id == scan.project_id) | (McpServer.project_id.is_(None)),
-            )
-        )).scalars().all()
-        for server in mcp_rows:
-            await emit({"type": "status", "status": f"mcp:{server.name}"})
-            try:
-                found = await McpClient(server).scan(workdir)
-                candidates.extend(found)
-                await emit({"type": "log", "message": f"MCP {server.name}: {len(found)} candidates"})
-            except Exception as exc:  # noqa: BLE001
-                await emit({"type": "log", "message": f"MCP {server.name} error: {exc}"})
+        if await _checkpoint("mcp"):
+            await _stage("mcp", "running")
+            mcp_rows = (await session.execute(
+                select(McpServer).where(
+                    McpServer.enabled.is_(True),
+                    (McpServer.project_id == scan.project_id) | (McpServer.project_id.is_(None)),
+                )
+            )).scalars().all()
+            for server in mcp_rows:
+                await emit({"type": "status", "status": f"mcp:{server.name}"})
+                try:
+                    found = await McpClient(server).scan(workdir)
+                    candidates.extend(found)
+                    await emit({"type": "log",
+                                "message": f"MCP {server.name}: {len(found)} candidates"})
+                except Exception as exc:  # noqa: BLE001
+                    await emit({"type": "log", "message": f"MCP {server.name} error: {exc}"})
+            await _stage("mcp", "done")
 
     return candidates
 
@@ -385,10 +549,13 @@ async def rerun_stage(ctx: dict, scan_id: str, stage: str) -> None:
         if scan is None:
             return
         seq = {"n": 0}
+        tokens: dict = {"v": None}
         emit_lock = asyncio.Lock()
 
         async def emit(event: dict) -> None:
             event = {"ts": _now().isoformat(), **event}
+            if event.get("type") == "tokens":
+                tokens["v"] = event.get("tokens")
             await events.publish(scan_id, event)
             if event.get("type") not in {"token", "heartbeat"}:
                 async with emit_lock:
@@ -396,6 +563,9 @@ async def rerun_stage(ctx: dict, scan_id: str, stage: str) -> None:
                     session.add(AgentEvent(scan_id=scan_id, seq=seq["n"],
                                            type=event.get("type", "log"), payload=event))
                     await session.commit()
+
+        controller = Controller(scan_id, emit)
+        await control.clear_control(scan_id)
 
         scan.status = ScanStatus.running
         scan.started_at = _now()
@@ -432,7 +602,8 @@ async def rerun_stage(ctx: dict, scan_id: str, stage: str) -> None:
                 candidates = await _candidates_from_findings(session, scan_id)
                 await emit({"type": "log", "message":
                             f"AI re-run over {len(candidates)} existing static candidates"})
-                result = await _ai_review(session, scan, artifact, workdir, candidates, emit)
+                result = await _ai_review(session, scan, artifact, workdir, candidates, emit,
+                                          checkpoint=controller.checkpoint)
                 # Replace prior AI-authored findings; keep raw static ones.
                 await _delete_findings_by_source(session, scan_id, {"ai", "correlated"})
                 await _persist_findings(session, scan, result["findings"])
@@ -448,12 +619,26 @@ async def rerun_stage(ctx: dict, scan_id: str, stage: str) -> None:
                        "category": f.category} for f in all_findings]
             scan.summary = _summary_from_finding_dicts(
                 fdicts, {**(scan.summary or {})})
+            if tokens["v"]:
+                scan.summary["tokens"] = tokens["v"]
             if any(f.state == FindingState.needs_info for f in all_findings):
                 needs_review = True
             scan.status = ScanStatus.needs_review if needs_review else ScanStatus.completed
             scan.finished_at = _now()
             await session.commit()
             await emit({"type": "done", "status": scan.status.value, "summary": scan.summary})
+        except ScanCanceledSignal:
+            scan.status = ScanStatus.canceled
+            scan.finished_at = _now()
+            await session.commit()
+            await emit({"type": "canceled", "status": "canceled"})
+        except StageSkippedSignal:
+            await emit({"type": "log", "message": "Re-run stage skipped"})
+            scan.status = ScanStatus.completed
+            scan.finished_at = _now()
+            await session.commit()
+            await emit({"type": "done", "status": scan.status.value,
+                        "summary": scan.summary or {}})
         except Exception as exc:  # noqa: BLE001
             scan.status = ScanStatus.failed
             scan.error = str(exc)[:2000]
@@ -461,6 +646,8 @@ async def rerun_stage(ctx: dict, scan_id: str, stage: str) -> None:
             await session.commit()
             await emit({"type": "failed", "error": scan.error})
             raise
+        finally:
+            await control.clear_control(scan_id)
 
 
 def _safe_read(workdir: str, rel: str) -> str | None:

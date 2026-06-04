@@ -72,6 +72,52 @@ def _is_reasoning(model: str | None) -> bool:
 
 
 @dataclass
+class TokenUsage:
+    """Per-model token accounting accumulated over the lifetime of a client.
+
+    One client instance is built per AI review, so this captures the whole
+    run's spend. Keyed by deployment name; the worker persists ``to_dict()``
+    into the scan summary so the UI can show usage per model.
+    """
+
+    by_model: dict[str, dict[str, int]] = field(default_factory=dict)
+
+    def add(self, model: str | None, prompt: int, completion: int) -> None:
+        m = model or "unknown"
+        e = self.by_model.setdefault(
+            m, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
+        )
+        p, c = int(prompt or 0), int(completion or 0)
+        e["prompt_tokens"] += p
+        e["completion_tokens"] += c
+        e["total_tokens"] += p + c
+        e["calls"] += 1
+
+    def to_dict(self) -> dict:
+        return {
+            "by_model": self.by_model,
+            "total_tokens": sum(m["total_tokens"] for m in self.by_model.values()),
+            "prompt_tokens": sum(m["prompt_tokens"] for m in self.by_model.values()),
+            "completion_tokens": sum(m["completion_tokens"] for m in self.by_model.values()),
+            "calls": sum(m["calls"] for m in self.by_model.values()),
+        }
+
+
+def _usage_pair(usage) -> tuple[int, int]:
+    """Normalize Chat Completions (prompt/completion_tokens) and Responses
+    (input/output_tokens) usage objects into (prompt, completion)."""
+    if not usage:
+        return 0, 0
+    p = getattr(usage, "prompt_tokens", None)
+    if p is None:
+        p = getattr(usage, "input_tokens", 0)
+    c = getattr(usage, "completion_tokens", None)
+    if c is None:
+        c = getattr(usage, "output_tokens", 0)
+    return int(p or 0), int(c or 0)
+
+
+@dataclass
 class ModelRole:
     """One model assignment: which deployment, how to call it, how hard to think."""
 
@@ -283,6 +329,7 @@ class InferenceClient(FoundryClient):
 
     def __init__(self, cfg: FoundryConfig) -> None:
         self.cfg = cfg
+        self.usage = TokenUsage()
         self._local = cfg.is_local
         self._azure_style = (cfg.api_style or "v1").lower() == "azure" and not self._local
         if self._azure_style:
@@ -356,10 +403,18 @@ class InferenceClient(FoundryClient):
             async for tok in self._responses_stream(messages, deployment, reasoning_effort):
                 yield tok
         else:
-            stream = await self._client.chat.completions.create(
-                model=deployment, messages=messages, temperature=temperature, stream=True,
-            )
+            # include_usage adds a final usage-only chunk; some local servers
+            # reject the option, so fall back without it.
+            create_kw = dict(model=deployment, messages=messages,
+                             temperature=temperature, stream=True)
+            try:
+                stream = await self._client.chat.completions.create(
+                    **create_kw, stream_options={"include_usage": True})
+            except Exception:  # noqa: BLE001
+                stream = await self._client.chat.completions.create(**create_kw)
             async for chunk in stream:
+                if getattr(chunk, "usage", None):
+                    self.usage.add(deployment, *_usage_pair(chunk.usage))
                 if chunk.choices and (delta := chunk.choices[0].delta.content):
                     yield delta
 
@@ -377,6 +432,7 @@ class InferenceClient(FoundryClient):
             if reasoning_effort and _is_reasoning(deployment):
                 kwargs["reasoning"] = {"effort": reasoning_effort}
             resp = await self._client.responses.create(**kwargs)
+            self.usage.add(deployment, *_usage_pair(getattr(resp, "usage", None)))
             return _parse_json(getattr(resp, "output_text", None))
 
         # Chat Completions — try json_object mode, fall back to plain if unsupported
@@ -385,6 +441,7 @@ class InferenceClient(FoundryClient):
                 model=deployment, messages=messages, temperature=temperature,
                 response_format={"type": "json_object"},
             )
+            self.usage.add(deployment, *_usage_pair(getattr(resp, "usage", None)))
             return _parse_json(resp.choices[0].message.content)
         except Exception as e:
             if self._local and "json" in str(e).lower():
@@ -393,6 +450,7 @@ class InferenceClient(FoundryClient):
                 resp = await self._client.chat.completions.create(
                     model=deployment, messages=messages, temperature=temperature,
                 )
+                self.usage.add(deployment, *_usage_pair(getattr(resp, "usage", None)))
                 return _parse_json(resp.choices[0].message.content)
             raise
 
@@ -408,6 +466,9 @@ class InferenceClient(FoundryClient):
             etype = getattr(event, "type", "")
             if etype == "response.output_text.delta":
                 yield getattr(event, "delta", "")
+            elif etype == "response.completed":
+                resp = getattr(event, "response", None)
+                self.usage.add(deployment, *_usage_pair(getattr(resp, "usage", None)))
 
     async def list_models(self) -> list[str]:
         try:
@@ -427,6 +488,14 @@ class MockFoundryClient(FoundryClient):
     MODELS = ["gpt-5-codex", "gpt-5", "gpt-4o", "gpt-4.1", "o4-mini",
               "llama3.1:70b", "qwen2.5-coder:32b", "deepseek-coder-v2"]
 
+    def __init__(self) -> None:
+        self.usage = TokenUsage()
+
+    @staticmethod
+    def _est(messages: list[dict], output: str) -> tuple[int, int]:
+        prompt = sum(len(str(m.get("content", ""))) for m in messages) // 4
+        return prompt, max(1, len(output) // 4)
+
     async def stream(self, messages, *, model=None, transport="auto",
                      temperature=0.2, reasoning_effort=None):
         text = (
@@ -434,12 +503,18 @@ class MockFoundryClient(FoundryClient):
             "static-analysis candidates first, then hunt for logic flaws the scanners "
             "miss (authz, IDOR, unsafe deserialization, secret handling).\n"
         )
+        self.usage.add(model or "mock", *self._est(messages, text))
         for token in re.findall(r"\S+\s*", text):
             yield token
             await asyncio.sleep(0.005)
 
     async def complete_json(self, messages, *, model=None, transport="auto",
                             temperature=0.1, reasoning_effort=None):
+        result = await self._complete_json(messages, model=model)
+        self.usage.add(model or "mock", *self._est(messages, json.dumps(result)))
+        return result
+
+    async def _complete_json(self, messages, *, model=None):
         exploit = self._extract(messages, _EXPLOIT_RE)
         if exploit is not None:
             return {"findings": self._exploit(exploit.get("findings", []))}

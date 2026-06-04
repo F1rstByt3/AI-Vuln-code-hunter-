@@ -8,14 +8,14 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app import events
+from app import control, events
 from app.api.deps import get_arq, get_or_404
 from app.auth import require_role
 from app.db import get_session
 from fastapi import HTTPException, status as http_status
 
 from app.models import Artifact, Finding, Project, Role, Scan, ScanStatus, Severity
-from app.schemas import FindingOut, ScanCreate, ScanOut, ScanRerun
+from app.schemas import FindingOut, ScanControl, ScanCreate, ScanOut, ScanRerun
 from app.worker import RERUNNABLE_STAGES
 
 router = APIRouter(tags=["scans"])
@@ -89,11 +89,48 @@ async def rerun_scan_stage(
     return scan
 
 
+@router.post("/scans/{scan_id}/control", response_model=ScanOut,
+             dependencies=[Depends(require_role(Role.reviewer))])
+async def control_scan(
+    scan_id: str, body: ScanControl, session: AsyncSession = Depends(get_session)
+):
+    """Cooperative control of a running scan: pause | resume | skip | cancel.
+
+    The worker polls a Redis flag at stage/batch checkpoints and reacts. Pause
+    holds at the next checkpoint; skip abandons the current stage; cancel stops
+    the whole run.
+    """
+    scan = await get_or_404(session, Scan, scan_id)
+    action = body.action
+    if action not in control.CONTROL_ACTIONS:
+        raise HTTPException(
+            http_status.HTTP_400_BAD_REQUEST,
+            f"action must be one of {', '.join(sorted(control.CONTROL_ACTIONS))}",
+        )
+    if scan.status not in (ScanStatus.queued, ScanStatus.running):
+        raise HTTPException(http_status.HTTP_409_CONFLICT, "scan is not running")
+
+    await control.set_control(scan_id, action)
+    await events.publish(scan_id, {"type": "control", "control": action})
+    # A queued (not-yet-started) scan won't reach a checkpoint, so cancel it now.
+    if action == "cancel" and scan.status == ScanStatus.queued:
+        scan.status = ScanStatus.canceled
+        scan.finished_at = datetime.now(timezone.utc)
+        await session.commit()
+        await session.refresh(scan)
+        await events.publish(scan_id, {"type": "canceled"})
+    return scan
+
+
 @router.post("/scans/{scan_id}/cancel", response_model=ScanOut,
              dependencies=[Depends(require_role(Role.reviewer))])
 async def cancel_scan(scan_id: str, session: AsyncSession = Depends(get_session)):
     scan = await get_or_404(session, Scan, scan_id)
     if scan.status in (ScanStatus.queued, ScanStatus.running):
+        # Signal the worker to stop cleanly at its next checkpoint…
+        await control.set_control(scan_id, "cancel")
+        # …and mark it canceled now so the UI updates immediately even if the
+        # worker is between long operations or no longer running.
         scan.status = ScanStatus.canceled
         scan.finished_at = datetime.now(timezone.utc)
         await session.commit()

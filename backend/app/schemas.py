@@ -111,6 +111,10 @@ class ScanRerun(BaseModel):
     stage: str  # semgrep | sonarqube | ai — re-run just this stage
 
 
+class ScanControl(BaseModel):
+    action: str  # pause | resume | skip | cancel
+
+
 class ScanOut(ORMModel):
     project_id: str
     artifact_id: str

@@ -3,12 +3,12 @@ import { useNavigate, useParams } from "react-router-dom";
 import { Button, Card, SeverityBadge, Spinner, StateBadge } from "../components/ui";
 import { useScanEvents } from "../hooks/useScanEvents";
 import { api } from "../lib/api";
-import type { ChatMessage, Endpoint, Finding, Scan } from "../lib/types";
+import type { ChatMessage, Endpoint, Finding, Scan, StageInfo, TokenUsage } from "../lib/types";
 
 export default function ScanPage() {
   const { scanId } = useParams();
   const nav = useNavigate();
-  const { events, status, narration, live } = useScanEvents(scanId);
+  const { events, status, narration, live, stages, tokens, paused } = useScanEvents(scanId);
   const [scan, setScan] = useState<Scan>();
   const [findings, setFindings] = useState<Finding[]>([]);
   const [chat, setChat] = useState<ChatMessage[]>([]);
@@ -51,8 +51,21 @@ export default function ScanPage() {
     await api.rerunStage(scanId, stage).then(setScan).catch((e) => alert(String(e)));
   };
 
+  const control = async (action: "pause" | "resume" | "skip" | "cancel") => {
+    if (!scanId) return;
+    await api.controlScan(scanId, action).then(setScan).catch((e) => alert(String(e)));
+  };
+
   const busy = ["queued", "running"].includes(scan?.status || "");
   const scanners: string[] = (scan?.config?.scanners as string[]) || [];
+
+  // Live stage map wins; fall back to the persisted snapshot for finished scans.
+  const liveStages = Object.values(stages);
+  const stageList: StageInfo[] = (liveStages.length
+    ? liveStages
+    : ((scan?.summary?.stages as StageInfo[]) || [])
+  ).slice().sort((a, b) => (a.order ?? 99) - (b.order ?? 99));
+  const usage: TokenUsage | undefined = tokens || (scan?.summary?.tokens as TokenUsage | undefined);
 
   return (
     <div>
@@ -60,10 +73,19 @@ export default function ScanPage() {
       <div className="flex items-center gap-3 mb-4">
         <h1 className="text-2xl font-bold">Scan</h1>
         <span className="px-2 py-0.5 rounded text-xs border border-border flex items-center gap-1">
-          {live && <Spinner />} {status || scan?.status}
+          {live && !paused && <Spinner />} {paused ? "paused" : (status || scan?.status)}
         </span>
-        {(scan?.status === "running" || scan?.status === "queued") &&
-          <Button variant="danger" onClick={() => api.cancelScan(scanId!).then(refresh)}>Cancel</Button>}
+        {(scan?.status === "running" || scan?.status === "queued") && (
+          <div className="flex gap-1">
+            {paused
+              ? <Button variant="ghost" onClick={() => control("resume")}>▶ Resume</Button>
+              : <Button variant="ghost" onClick={() => control("pause")}>⏸ Pause</Button>}
+            <Button variant="ghost" onClick={() => {
+              if (confirm("Skip the current stage and move on?")) control("skip");
+            }}>⏭ Skip stage</Button>
+            <Button variant="danger" onClick={() => control("cancel").then(refresh)}>Cancel</Button>
+          </div>
+        )}
         {scan?.status && !["queued", "running"].includes(scan.status) && (
           <div className="flex gap-1 ml-auto">
             <ExportBtn scanId={scanId!} format="burp" label="Burp XML" />
@@ -90,6 +112,9 @@ export default function ScanPage() {
 
       <div className="grid grid-cols-3 gap-6">
         <div className="col-span-2 space-y-6">
+          {stageList.length > 0 && <PipelinePanel stages={stageList} paused={paused} />}
+          {usage && <TokenPanel usage={usage} />}
+
           <Card className="p-4">
             <h2 className="font-semibold mb-2 text-sm">Reviewer output {live && "(live)"}</h2>
             <pre className="text-xs whitespace-pre-wrap text-slate-300 max-h-48 overflow-auto">
@@ -189,6 +214,94 @@ function FindingRow({ f, onTriage }: { f: Finding; onTriage: (id: string, s: str
           </div>
         </div>
       )}
+    </Card>
+  );
+}
+
+const STAGE_ICON: Record<string, string> = {
+  pending: "○", running: "◐", done: "●", skipped: "⊘", failed: "✕",
+};
+const STAGE_COLOR: Record<string, string> = {
+  pending: "text-muted", running: "text-sky-400", done: "text-emerald-400",
+  skipped: "text-amber-400", failed: "text-rose-400",
+};
+
+function PipelinePanel({ stages, paused }: { stages: StageInfo[]; paused: boolean }) {
+  return (
+    <Card className="p-4">
+      <h2 className="font-semibold mb-3 text-sm flex items-center gap-2">
+        Pipeline {paused && <span className="text-amber-400 text-xs">⏸ paused</span>}
+      </h2>
+      <div className="space-y-1.5">
+        {stages.map((s) => {
+          const pct = s.total ? Math.round(((s.done || 0) / s.total) * 100) : null;
+          return (
+            <div key={s.stage} className="flex items-center gap-2 text-xs">
+              <span className={`w-4 text-center ${STAGE_COLOR[s.state] || "text-muted"} ${s.state === "running" ? "animate-pulse" : ""}`}>
+                {STAGE_ICON[s.state] || "○"}
+              </span>
+              <span className={`w-40 ${s.state === "pending" ? "text-muted" : "text-slate-200"}`}>
+                {s.label || s.stage}
+              </span>
+              {s.total != null && s.total > 0 ? (
+                <div className="flex-1 flex items-center gap-2">
+                  <div className="flex-1 h-1.5 rounded bg-border overflow-hidden">
+                    <div className="h-full bg-sky-500 transition-all"
+                      style={{ width: `${pct}%` }} />
+                  </div>
+                  <span className="text-muted tabular-nums w-20 text-right">
+                    {s.done || 0}/{s.total}
+                  </span>
+                </div>
+              ) : (
+                <span className="flex-1 text-muted">{s.state}</span>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </Card>
+  );
+}
+
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return String(n);
+}
+
+function TokenPanel({ usage }: { usage: TokenUsage }) {
+  const models = Object.entries(usage.by_model || {})
+    .sort((a, b) => b[1].total_tokens - a[1].total_tokens);
+  return (
+    <Card className="p-4">
+      <h2 className="font-semibold mb-1 text-sm">Token usage</h2>
+      <div className="text-xs text-muted mb-3">
+        {fmtTokens(usage.total_tokens)} total · {fmtTokens(usage.prompt_tokens)} in ·{" "}
+        {fmtTokens(usage.completion_tokens)} out · {usage.calls} calls
+      </div>
+      <table className="w-full text-xs">
+        <thead>
+          <tr className="text-muted border-b border-border">
+            <th className="text-left px-2 py-1">Model</th>
+            <th className="text-right px-2 py-1">Input</th>
+            <th className="text-right px-2 py-1">Output</th>
+            <th className="text-right px-2 py-1">Total</th>
+            <th className="text-right px-2 py-1">Calls</th>
+          </tr>
+        </thead>
+        <tbody>
+          {models.map(([model, t]) => (
+            <tr key={model} className="border-b border-border/50">
+              <td className="px-2 py-0.5 font-mono text-slate-200">{model}</td>
+              <td className="px-2 py-0.5 text-right tabular-nums text-muted">{fmtTokens(t.prompt_tokens)}</td>
+              <td className="px-2 py-0.5 text-right tabular-nums text-muted">{fmtTokens(t.completion_tokens)}</td>
+              <td className="px-2 py-0.5 text-right tabular-nums text-slate-200">{fmtTokens(t.total_tokens)}</td>
+              <td className="px-2 py-0.5 text-right tabular-nums text-muted">{t.calls}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </Card>
   );
 }

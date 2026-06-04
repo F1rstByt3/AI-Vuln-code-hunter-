@@ -67,8 +67,22 @@ export interface Dashboard {
   by_category: Record<string, number>; top_files: { path: string; count: number }[];
   latest_scan?: Scan; endpoints?: Endpoint[];
 }
+export interface StageInfo {
+  stage: string; label?: string; order?: number;
+  state: "pending" | "running" | "done" | "skipped" | "failed";
+  done?: number | null; total?: number | null;
+}
+export interface ModelTokens {
+  prompt_tokens: number; completion_tokens: number; total_tokens: number; calls: number;
+}
+export interface TokenUsage {
+  by_model: Record<string, ModelTokens>;
+  total_tokens: number; prompt_tokens: number; completion_tokens: number; calls: number;
+}
 export interface ScanEvent {
   type: string; ts?: string; status?: string; message?: string; text?: string;
   finding?: Finding; role?: string; content?: string; summary?: Record<string, any>;
   error?: string;
+  stage?: string; state?: string; done?: number; total?: number;
+  stages?: StageInfo[]; tokens?: TokenUsage; control?: string;
 }

@@ -26,10 +26,16 @@ from collections.abc import Awaitable, Callable
 
 from app.ai.foundry import FoundryClient, ModelRole, ReviewRoles
 from app.config import settings
+from app.control import ScanControlSignal
 from app.models import FindingSource, FindingState, Severity
 
 EmitFn = Callable[[dict], Awaitable[None]]
 ReadFileFn = Callable[[str], Awaitable[str | None]]
+CheckpointFn = Callable[[str], Awaitable[None]]
+
+
+async def _noop_checkpoint(_stage: str) -> None:
+    return None
 
 REVIEWER_SYSTEM = """\
 You are a senior application-security reviewer performing a white-box code \
@@ -202,7 +208,13 @@ async def run_review(
     candidates: list[dict],
     read_file: ReadFileFn,
     emit: EmitFn,
+    checkpoint: CheckpointFn | None = None,
 ) -> dict:
+    checkpoint = checkpoint or _noop_checkpoint
+
+    async def stage(name: str, state: str, **extra) -> None:
+        await emit({"type": "stage", "stage": name, "state": state, **extra})
+
     # ---- 1. load ALL source files from disk ----
     await emit({"type": "status", "status": "loading source"})
     all_sources, total_bytes = await _load_all_files(files, read_file, emit)
@@ -232,7 +244,9 @@ async def run_review(
                 f"(token limit {batch_token_limit:,}/batch)"})
 
     # ---- 4. CHAT model narrates the plan (streamed) ----
+    await checkpoint("ai_plan")
     await emit({"type": "status", "status": "planning"})
+    await stage("ai_plan", "running")
     reviewer_names = ", ".join(r.deployment for r in roles.reviewers)
     plan_msgs = [
         {"role": "system", "content": REVIEWER_SYSTEM},
@@ -255,15 +269,21 @@ async def run_review(
         ):
             await emit({"type": "token", "text": token})
     except Exception as exc:  # noqa: BLE001
+        await stage("ai_plan", "failed")
         await emit({"type": "token", "text": f"\n\n[Foundry error: {exc}]\n"})
         raise RuntimeError(
             f"AI model call failed: {exc}. Check Settings — the endpoint, API key, "
             f"and the chat/reviewer/judge deployment names must match your Azure AI "
             f"Foundry project. Clear the endpoint to use mock mode."
         ) from exc
+    await stage("ai_plan", "done")
 
     # ---- 5. REVIEWERS review every batch (map phase) ----
     await emit({"type": "status", "status": "reviewing"})
+    # Total units of review work = batches × reviewers (progress denominator).
+    total_units = max(1, len(batches) * max(1, len(roles.reviewers)))
+    done_units = {"n": 0}
+    await stage("ai_review", "running", done=0, total=total_units)
 
     async def review_batch(
         reviewer: ModelRole, batch_idx: int, batch: dict,
@@ -279,14 +299,26 @@ async def run_review(
         results: list[list[dict]] = [[] for _ in batches]
 
         async def _do(i: int, batch: dict) -> None:
+            # Cooperative control point: pause/skip/cancel before each batch.
+            await checkpoint("ai_review")
             async with sem:
                 bf = await review_batch(reviewer, i, batch)
                 results[i] = bf
+                done_units["n"] += 1
+                await stage("ai_review", "running",
+                            done=done_units["n"], total=total_units)
                 await emit({"type": "log",
                             "message": f"Reviewer {reviewer.deployment}: batch "
                                        f"{i + 1}/{len(batches)} → {len(bf)} findings"})
 
-        await asyncio.gather(*(_do(i, b) for i, b in enumerate(batches)))
+        tasks = [asyncio.create_task(_do(i, b)) for i, b in enumerate(batches)]
+        try:
+            await asyncio.gather(*tasks)
+        except ScanControlSignal:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            raise
         findings = [f for sub in results for f in sub]
         await emit({"type": "log",
                     "message": f"Reviewer {reviewer.deployment}: "
@@ -295,9 +327,11 @@ async def run_review(
 
     reviewer_results = await asyncio.gather(*(run_reviewer(r) for r in roles.reviewers))
     raw_findings = [f for sub in reviewer_results for f in sub]
+    await stage("ai_review", "done", done=total_units, total=total_units)
 
     # ---- 6. JUDGE adjudicates (reduce: dedupe / confirm / dismiss) ----
     if roles.judge and raw_findings:
+        await checkpoint("ai_judge")
         await emit({"type": "status", "status": "judging"})
         await emit({"type": "log", "message": f"Judge {roles.judge.deployment}: "
                                               f"adjudicating {len(raw_findings)} findings"})
@@ -306,8 +340,11 @@ async def run_review(
         # window of real source so the judge can validate in context and drop
         # false positives, which costs tokens.
         judge_batch_size = 60
+        judge_total = (len(raw_findings) + judge_batch_size - 1) // judge_batch_size
+        await stage("ai_judge", "running", done=0, total=judge_total)
         adjudicated: list[dict] = []
         for j_start in range(0, len(raw_findings), judge_batch_size):
+            await checkpoint("ai_judge")
             j_chunk = raw_findings[j_start : j_start + judge_batch_size]
             payload_findings = []
             for f in j_chunk:
@@ -342,6 +379,9 @@ async def run_review(
                 await emit({"type": "log",
                             "message": f"Judge failed on chunk ({exc}); keeping raw"})
                 adjudicated.extend(j_chunk)
+            await stage("ai_judge", "running",
+                        done=j_start // judge_batch_size + 1, total=judge_total)
+        await stage("ai_judge", "done", done=judge_total, total=judge_total)
         judged_by = roles.judge.deployment
     else:
         adjudicated = raw_findings
@@ -349,8 +389,9 @@ async def run_review(
 
     # ---- 7. EXPLOIT analyst writes PoC / where-to-look / risk / fix ----
     if roles.exploit and adjudicated:
+        await checkpoint("ai_exploit")
         adjudicated = await _run_exploit_phase(
-            client, roles.exploit, adjudicated, read_file, emit,
+            client, roles.exploit, adjudicated, read_file, emit, stage, checkpoint,
         )
 
     findings = [_normalize(f, judged_by) for f in adjudicated]
@@ -359,7 +400,12 @@ async def run_review(
         await emit({"type": "finding", "finding": f})
 
     summary = _summarize(findings, roles)
+    usage = getattr(client, "usage", None)
+    if usage is not None:
+        summary["tokens"] = usage.to_dict()
     await emit({"type": "status", "status": "summarizing", "summary": summary})
+    if summary.get("tokens"):
+        await emit({"type": "tokens", "tokens": summary["tokens"]})
     return {"findings": findings, "summary": summary}
 
 
@@ -522,6 +568,8 @@ async def _run_exploit_phase(
     findings: list[dict],
     read_file: ReadFileFn,
     emit: EmitFn,
+    stage: Callable[..., Awaitable[None]] | None = None,
+    checkpoint: CheckpointFn | None = None,
 ) -> list[dict]:
     """Enrich every non-dismissed finding with exploitation guidance.
 
@@ -541,7 +589,12 @@ async def _run_exploit_phase(
     # grounded in the actual code, not just the one-line snippet.
     enriched_by_id: dict[int, dict] = {}
     batch_size = 25
+    exploit_total = (len(targets) + batch_size - 1) // batch_size
+    if stage:
+        await stage("ai_exploit", "running", done=0, total=exploit_total)
     for start in range(0, len(targets), batch_size):
+        if checkpoint:
+            await checkpoint("ai_exploit")
         chunk = targets[start : start + batch_size]
         payload_findings = []
         for f in chunk:
@@ -579,7 +632,12 @@ async def _run_exploit_phase(
         for offset, enrich in enumerate(produced):
             if offset < len(chunk) and isinstance(enrich, dict):
                 enriched_by_id[id(chunk[offset])] = enrich
+        if stage:
+            await stage("ai_exploit", "running",
+                        done=start // batch_size + 1, total=exploit_total)
 
+    if stage:
+        await stage("ai_exploit", "done", done=exploit_total, total=exploit_total)
     out: list[dict] = []
     enriched_count = 0
     for f in findings:
