@@ -126,6 +126,57 @@ _CHARS_PER_TOKEN = 3.0  # conservative for code
 # good balance: it caps a 100-batch reviewer run at ~25 serial rounds.
 _BATCH_CONCURRENCY = 4
 
+# Known context windows (tokens) for common model families. Used to auto-size
+# batches when AI_BATCH_TOKENS is left at its default. The batch budget =
+# context_window - output_reserve - prompt_overhead.  Reasoning models need a
+# bigger output reserve because their hidden chain-of-thought eats context.
+_MODEL_CONTEXT: list[tuple[str, int]] = [
+    # (substring to match in lowercase deployment name, context tokens)
+    ("gpt-5",        272_000),
+    ("gpt-4.1",    1_000_000),
+    ("gpt-4o",       128_000),
+    ("codex",        272_000),
+    ("o4-mini",      200_000),
+    ("o3",           200_000),
+    ("o1",           200_000),
+]
+_DEFAULT_CONTEXT = 128_000
+
+# Reasoning models reserve more context for their hidden chain-of-thought.
+_OUTPUT_RESERVE_REASONING = 80_000
+_OUTPUT_RESERVE_NORMAL = 16_000
+
+
+def _context_window_for(deployment: str) -> int:
+    d = (deployment or "").lower()
+    for hint, ctx in _MODEL_CONTEXT:
+        if hint in d:
+            return ctx
+    return _DEFAULT_CONTEXT
+
+
+def _compute_batch_budget(roles: ReviewRoles) -> int:
+    """Derive the input-token budget per batch from the model context window.
+
+    Takes the *smallest* reviewer context (since all reviewers see every batch)
+    and subtracts the output/reasoning reserve + prompt overhead.  If the user
+    set AI_BATCH_TOKENS to something other than the legacy defaults (80K/150K),
+    respect that as an explicit override.
+    """
+    explicit = settings.ai_batch_tokens
+    if explicit not in (80_000, 150_000):
+        return explicit
+
+    from app.ai.foundry import _is_reasoning
+    smallest_ctx = min(
+        (_context_window_for(r.deployment) for r in roles.reviewers),
+        default=_DEFAULT_CONTEXT,
+    )
+    any_reasoning = any(_is_reasoning(r.deployment) for r in roles.reviewers)
+    reserve = _OUTPUT_RESERVE_REASONING if any_reasoning else _OUTPUT_RESERVE_NORMAL
+    budget = smallest_ctx - reserve - _PROMPT_OVERHEAD_TOKENS
+    return max(budget, 20_000)
+
 
 def _estimate_tokens(text: str) -> int:
     return int(len(text) / _CHARS_PER_TOKEN)
@@ -156,7 +207,7 @@ async def run_review(
             orphan_candidates.append(cand)
 
     # ---- 3. batch files into chunks sized for the model context ----
-    batch_token_limit = settings.ai_batch_tokens
+    batch_token_limit = _compute_batch_budget(roles)
     batches = _build_batches(all_sources, candidates_by_file, batch_token_limit)
     if orphan_candidates:
         if batches:
