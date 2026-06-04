@@ -10,6 +10,7 @@ Every step emits an event that is (a) published to Redis for live SSE and
 
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import datetime, timezone
 
@@ -53,15 +54,21 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
         if scan is None:
             return
         seq = {"n": 0}
+        # Reviewers now run batches concurrently, so emit() can be called from
+        # several tasks at once. The SQLAlchemy AsyncSession (one asyncpg
+        # connection) can only do one operation at a time — serialize the DB
+        # write to avoid "another operation is in progress" crashes.
+        emit_lock = asyncio.Lock()
 
         async def emit(event: dict) -> None:
             event = {"ts": _now().isoformat(), **event}
             await events.publish(scan_id, event)
             if event.get("type") not in {"token", "heartbeat"}:  # tokens stay live-only
-                seq["n"] += 1
-                session.add(AgentEvent(scan_id=scan_id, seq=seq["n"],
-                                       type=event.get("type", "log"), payload=event))
-                await session.commit()
+                async with emit_lock:
+                    seq["n"] += 1
+                    session.add(AgentEvent(scan_id=scan_id, seq=seq["n"],
+                                           type=event.get("type", "log"), payload=event))
+                    await session.commit()
 
         scan.status = ScanStatus.running
         scan.started_at = _now()

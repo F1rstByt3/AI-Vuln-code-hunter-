@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl unzip default-jre-headless \
+    git curl unzip default-jre-headless nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # SonarScanner CLI (optional; only used when SONARQUBE_ENABLED=true). The Java

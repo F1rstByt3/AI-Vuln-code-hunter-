@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import shutil
 import uuid
 
 import httpx
@@ -99,6 +100,12 @@ class SonarScanner:
             "-Dsonar.security.hotspots.report=true",
             "-Dsonar.issue.ignore.allfile=",
         ]
+        # The JS/TS analyzer needs Node. Its bundled Node binary can fail on
+        # ARM64; point it at the system Node we install in the image so JS/TS
+        # analysis doesn't abort the whole scan.
+        node = shutil.which("node")
+        if node:
+            cmd.append(f"-Dsonar.nodejs.executable={node}")
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=workdir,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
