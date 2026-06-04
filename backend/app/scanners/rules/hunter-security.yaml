@@ -1,0 +1,1163 @@
+rules:
+  # ===========================================================================
+  # 1. INJECTION
+  # ===========================================================================
+
+  - id: hunter.injection.sql-string-concat-python
+    languages: [python]
+    severity: ERROR
+    message: >
+      SQL query built via string concatenation/f-string with variable input.
+      This is a SQL injection vector. Use parameterized queries instead.
+    metadata:
+      cwe: "CWE-89"
+      owasp: "A03:2021"
+      category: injection
+      confidence: high
+    pattern-either:
+      - pattern: |
+          $CURSOR.execute(f"...{$X}...")
+      - pattern: |
+          $CURSOR.execute("..." + $X + "...")
+      - pattern: |
+          $CURSOR.execute("..." % $X)
+      - pattern: |
+          $CURSOR.execute("...".format($X))
+      - pattern: |
+          $CURSOR.executemany(f"...{$X}...")
+      - pattern: |
+          $DB.raw(f"...{$X}...")
+
+  - id: hunter.injection.sql-string-concat-java
+    languages: [java]
+    severity: ERROR
+    message: >
+      SQL query built via string concatenation. Use PreparedStatement with
+      parameter binding to prevent SQL injection.
+    metadata:
+      cwe: "CWE-89"
+      owasp: "A03:2021"
+      category: injection
+      confidence: high
+    pattern-either:
+      - pattern: |
+          $STMT.executeQuery("..." + $X + "...");
+      - pattern: |
+          $STMT.execute("..." + $X + "...");
+      - pattern: |
+          $CONN.createStatement().executeQuery("..." + $X + "...");
+
+  - id: hunter.injection.sql-string-concat-js
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >
+      SQL query built with template literal or concatenation. Use
+      parameterized queries to prevent SQL injection.
+    metadata:
+      cwe: "CWE-89"
+      owasp: "A03:2021"
+      category: injection
+      confidence: high
+    pattern-either:
+      - pattern: |
+          $DB.query(`...${$X}...`)
+      - pattern: |
+          $DB.query("..." + $X + "...")
+      - pattern: |
+          $POOL.query(`...${$X}...`)
+      - pattern: |
+          $CONN.execute(`...${$X}...`)
+
+  - id: hunter.injection.nosql-operator-injection
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >
+      User input passed directly as a MongoDB query object. Attackers can
+      inject operators like $gt, $ne, $regex to bypass authentication or
+      extract data. Validate and sanitize input, or use explicit field matching.
+    metadata:
+      cwe: "CWE-943"
+      owasp: "A03:2021"
+      category: injection
+      confidence: medium
+    pattern-either:
+      - pattern: |
+          $COLLECTION.find($REQ.body)
+      - pattern: |
+          $COLLECTION.findOne($REQ.body)
+      - pattern: |
+          $COLLECTION.find({..., $KEY: $REQ.body.$FIELD})
+      - pattern: |
+          $COLLECTION.findOne({..., $KEY: $REQ.query.$FIELD})
+      - pattern: |
+          $MODEL.find($REQ.body)
+
+  - id: hunter.injection.command-injection-python
+    languages: [python]
+    severity: ERROR
+    message: >
+      OS command built with user-controlled input. Use subprocess with a
+      list of args (no shell=True) and validate input strictly.
+    metadata:
+      cwe: "CWE-78"
+      owasp: "A03:2021"
+      category: injection
+      confidence: high
+    pattern-either:
+      - pattern: os.system(f"...{$X}...")
+      - pattern: os.system("..." + $X + "...")
+      - pattern: os.popen(f"...{$X}...")
+      - pattern: subprocess.call(f"...{$X}...", shell=True, ...)
+      - pattern: subprocess.run(f"...{$X}...", shell=True, ...)
+      - pattern: subprocess.Popen(f"...{$X}...", shell=True, ...)
+      - pattern: subprocess.check_output(f"...{$X}...", shell=True, ...)
+
+  - id: hunter.injection.command-injection-js
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >
+      OS command execution with user-controlled input. Use execFile with
+      argument arrays instead of exec with string interpolation.
+    metadata:
+      cwe: "CWE-78"
+      owasp: "A03:2021"
+      category: injection
+      confidence: high
+    pattern-either:
+      - pattern: child_process.exec(`...${$X}...`)
+      - pattern: child_process.exec("..." + $X + "...")
+      - pattern: require("child_process").exec(`...${$X}...`)
+      - pattern: exec(`...${$X}...`)
+      - pattern: $CP.exec(`...${$X}...`)
+
+  - id: hunter.injection.ssti-python
+    languages: [python]
+    severity: ERROR
+    message: >
+      User input rendered directly in a template string. This enables
+      server-side template injection (SSTI) — attackers can achieve RCE
+      via Jinja2/Mako template syntax like {{config.__class__.__init__}}.
+    metadata:
+      cwe: "CWE-1336"
+      owasp: "A03:2021"
+      category: injection
+      confidence: high
+    pattern-either:
+      - pattern: |
+          from jinja2 import ...
+          ...
+          Template($USER_INPUT).render(...)
+      - pattern: |
+          $TEMPLATE = Template($REQ. ...)
+      - pattern: |
+          render_template_string($REQ. ...)
+      - pattern: |
+          Template($X).render(...)
+
+  - id: hunter.injection.ssti-js
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >
+      User input passed to template engine render without sanitization.
+      This can enable server-side template injection.
+    metadata:
+      cwe: "CWE-1336"
+      owasp: "A03:2021"
+      category: injection
+      confidence: medium
+    pattern-either:
+      - pattern: |
+          $EJS.render($REQ.body.$FIELD, ...)
+      - pattern: |
+          $PUG.render($REQ.body.$FIELD, ...)
+      - pattern: |
+          $NUNJUCKS.renderString($REQ.body.$FIELD, ...)
+
+  - id: hunter.injection.log-injection
+    languages: [python, javascript, typescript, java]
+    severity: WARNING
+    message: >
+      User input logged without sanitization. Attackers can inject fake
+      log entries or CRLF sequences to corrupt log integrity, bypass
+      monitoring, or exploit log viewers.
+    metadata:
+      cwe: "CWE-117"
+      owasp: "A09:2021"
+      category: injection
+      confidence: medium
+    pattern-either:
+      - pattern: |
+          logger.info(... + $REQ. ... + ...)
+      - pattern: |
+          logger.info(f"...{$REQ. ...}...")
+      - pattern: |
+          console.log(... + $REQ. ... + ...)
+      - pattern: |
+          $LOG.info("..." + $REQ. ... + "...")
+
+  - id: hunter.injection.xpath-injection
+    languages: [python, java]
+    severity: ERROR
+    message: >
+      XPath query built with string concatenation. Use parameterized XPath
+      or validate/escape input to prevent XPath injection.
+    metadata:
+      cwe: "CWE-643"
+      owasp: "A03:2021"
+      category: injection
+      confidence: high
+    pattern-either:
+      - pattern: |
+          $X.xpath(f"...{$INPUT}...")
+      - pattern: |
+          $X.xpath("..." + $INPUT + "...")
+
+  # ===========================================================================
+  # 2. SSRF & NETWORK
+  # ===========================================================================
+
+  - id: hunter.ssrf.python-requests
+    languages: [python]
+    severity: ERROR
+    message: >
+      HTTP request made with a user-controlled URL. Validate the URL against
+      an allowlist and block internal/metadata IPs to prevent SSRF.
+    metadata:
+      cwe: "CWE-918"
+      owasp: "A10:2021"
+      category: ssrf
+      confidence: medium
+    pattern-either:
+      - pattern: requests.get($REQ. ..., ...)
+      - pattern: requests.post($REQ. ..., ...)
+      - pattern: requests.get($URL, ...)
+      - pattern: httpx.get($REQ. ..., ...)
+      - pattern: aiohttp.request(..., $REQ. ..., ...)
+      - pattern: urllib.request.urlopen($REQ. ...)
+
+  - id: hunter.ssrf.js-fetch
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >
+      HTTP request made with a user-controlled URL. This is an SSRF vector —
+      validate against an allowlist and block internal network ranges.
+    metadata:
+      cwe: "CWE-918"
+      owasp: "A10:2021"
+      category: ssrf
+      confidence: medium
+    pattern-either:
+      - pattern: fetch($REQ.body.$URL, ...)
+      - pattern: fetch($REQ.query.$URL, ...)
+      - pattern: axios.get($REQ.body.$URL, ...)
+      - pattern: axios($REQ.body.$URL, ...)
+      - pattern: $HTTP.get($REQ.body.$URL, ...)
+
+  - id: hunter.ssrf.cloud-metadata
+    languages: [python, javascript, typescript, java, go, ruby]
+    severity: ERROR
+    message: >
+      Cloud metadata endpoint (169.254.169.254) referenced in code. If this
+      URL can be influenced by user input, it enables credential theft via SSRF.
+      Use IMDSv2 (token-required) and validate all URLs.
+    metadata:
+      cwe: "CWE-918"
+      owasp: "A10:2021"
+      category: ssrf
+      confidence: high
+    pattern-either:
+      - pattern: |
+          "169.254.169.254"
+      - pattern: |
+          "http://169.254.169.254"
+
+  # ===========================================================================
+  # 3. AUTHENTICATION & SECRETS
+  # ===========================================================================
+
+  - id: hunter.auth.jwt-none-algorithm
+    languages: [python, javascript, typescript]
+    severity: ERROR
+    message: >
+      JWT decoded without verifying the algorithm. An attacker can set
+      alg:none to bypass signature verification entirely.
+    metadata:
+      cwe: "CWE-347"
+      owasp: "A02:2021"
+      category: authentication
+      confidence: high
+    pattern-either:
+      - pattern: jwt.decode($TOKEN, ..., algorithms=["none"], ...)
+      - pattern: jwt.decode($TOKEN, ..., options={"verify_signature": False}, ...)
+      - pattern: jwt.decode($TOKEN, ..., {algorithms: ["none"]})
+      - pattern: jwt.verify($TOKEN, "", ...)
+
+  - id: hunter.auth.jwt-no-expiry-check
+    languages: [python]
+    severity: WARNING
+    message: >
+      JWT decoded without verifying expiration. Stolen tokens can be
+      replayed indefinitely. Ensure verify_exp is not disabled.
+    metadata:
+      cwe: "CWE-613"
+      owasp: "A02:2021"
+      category: authentication
+      confidence: high
+    patterns:
+      - pattern: jwt.decode($TOKEN, ..., options={..., "verify_exp": False, ...}, ...)
+
+  - id: hunter.auth.hardcoded-aws-key
+    languages: [python, javascript, typescript, java, go, ruby, php]
+    severity: ERROR
+    message: >
+      AWS access key ID hardcoded in source code. Rotate this key immediately
+      and use IAM roles or environment variables instead.
+    metadata:
+      cwe: "CWE-798"
+      owasp: "A07:2021"
+      category: secrets
+      confidence: high
+    pattern-regex: "(?:AKIA|ABIA|ACCA|ASIA)[0-9A-Z]{16}"
+
+  - id: hunter.auth.hardcoded-private-key
+    languages: [python, javascript, typescript, java, go, ruby, php]
+    severity: ERROR
+    message: >
+      Private key material hardcoded in source. This should be loaded from
+      a secrets manager or environment variable, never committed to code.
+    metadata:
+      cwe: "CWE-321"
+      owasp: "A02:2021"
+      category: secrets
+      confidence: high
+    pattern-regex: "-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
+
+  - id: hunter.auth.hardcoded-password-assignment
+    languages: [python, javascript, typescript, java, go, ruby]
+    severity: ERROR
+    message: >
+      Password or secret appears to be hardcoded as a string literal.
+      Use environment variables or a secrets manager.
+    metadata:
+      cwe: "CWE-798"
+      owasp: "A07:2021"
+      category: secrets
+      confidence: medium
+    pattern-either:
+      - pattern: $PASSWORD = "..."
+      - pattern: $SECRET = "..."
+      - pattern: $API_KEY = "..."
+      - pattern: $TOKEN = "..."
+    metavariable-regex:
+      metavariable: $PASSWORD
+      regex: "(?i)(password|passwd|secret|api_key|apikey|token|auth_token)"
+
+  - id: hunter.auth.weak-password-hash
+    languages: [python]
+    severity: ERROR
+    message: >
+      Password hashed with MD5 or SHA1. These are fast hashes vulnerable
+      to brute-force/rainbow-table attacks. Use bcrypt, scrypt, or argon2.
+    metadata:
+      cwe: "CWE-916"
+      owasp: "A02:2021"
+      category: authentication
+      confidence: high
+    pattern-either:
+      - pattern: hashlib.md5($PASSWORD).hexdigest()
+      - pattern: hashlib.sha1($PASSWORD).hexdigest()
+      - pattern: hashlib.md5($PASSWORD.encode(...)).hexdigest()
+      - pattern: hashlib.sha1($PASSWORD.encode(...)).hexdigest()
+
+  - id: hunter.auth.generic-api-key-pattern
+    languages: [python, javascript, typescript, java, go, ruby, php]
+    severity: WARNING
+    message: >
+      Potential API key or token hardcoded in source code. Review and
+      move to environment variables or a secrets manager.
+    metadata:
+      cwe: "CWE-798"
+      owasp: "A07:2021"
+      category: secrets
+      confidence: medium
+    pattern-regex: "(?:api[_-]?key|api[_-]?secret|access[_-]?token|auth[_-]?token|bearer)\\s*[=:]\\s*['\"][a-zA-Z0-9_\\-]{20,}['\"]"
+
+  # ===========================================================================
+  # 4. DESERIALIZATION
+  # ===========================================================================
+
+  - id: hunter.deser.python-pickle
+    languages: [python]
+    severity: ERROR
+    message: >
+      Pickle deserialization of untrusted data enables arbitrary code
+      execution. An attacker can craft a pickle payload that runs any
+      Python code on load. Use JSON or a safe serialization format.
+    metadata:
+      cwe: "CWE-502"
+      owasp: "A08:2021"
+      category: deserialization
+      confidence: high
+    pattern-either:
+      - pattern: pickle.loads(...)
+      - pattern: pickle.load(...)
+      - pattern: cPickle.loads(...)
+      - pattern: cPickle.load(...)
+      - pattern: shelve.open(...)
+      - pattern: marshal.loads(...)
+
+  - id: hunter.deser.python-yaml-unsafe
+    languages: [python]
+    severity: ERROR
+    message: >
+      yaml.load() without SafeLoader allows arbitrary Python object
+      instantiation. Use yaml.safe_load() or yaml.load(data, Loader=SafeLoader).
+    metadata:
+      cwe: "CWE-502"
+      owasp: "A08:2021"
+      category: deserialization
+      confidence: high
+    patterns:
+      - pattern: yaml.load($DATA)
+      - pattern-not: yaml.load($DATA, Loader=yaml.SafeLoader)
+      - pattern-not: yaml.load($DATA, Loader=SafeLoader)
+
+  - id: hunter.deser.java-objectinputstream
+    languages: [java]
+    severity: ERROR
+    message: >
+      Java ObjectInputStream deserialization of untrusted data can lead to
+      remote code execution via gadget chains (Commons Collections, etc.).
+      Use allowlist-based deserialization or a safe format like JSON.
+    metadata:
+      cwe: "CWE-502"
+      owasp: "A08:2021"
+      category: deserialization
+      confidence: high
+    pattern-either:
+      - pattern: new ObjectInputStream(...).readObject()
+      - pattern: |
+          ObjectInputStream $OIS = new ObjectInputStream(...);
+          ...
+          $OIS.readObject();
+      - pattern: new java.beans.XMLDecoder(...)
+
+  - id: hunter.deser.php-unserialize
+    languages: [php]
+    severity: ERROR
+    message: >
+      PHP unserialize() with user-controlled input enables object injection
+      attacks. Use json_decode() or validate input strictly.
+    metadata:
+      cwe: "CWE-502"
+      owasp: "A08:2021"
+      category: deserialization
+      confidence: high
+    pattern-either:
+      - pattern: unserialize($_GET[...])
+      - pattern: unserialize($_POST[...])
+      - pattern: unserialize($_REQUEST[...])
+      - pattern: unserialize($REQ->...)
+
+  - id: hunter.deser.js-node-serialize
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >
+      node-serialize is known to be vulnerable to RCE via crafted payloads.
+      Remove this dependency and use JSON.parse() instead.
+    metadata:
+      cwe: "CWE-502"
+      owasp: "A08:2021"
+      category: deserialization
+      confidence: high
+    pattern-either:
+      - pattern: require("node-serialize").unserialize(...)
+      - pattern: $SERIALIZE.unserialize(...)
+
+  # ===========================================================================
+  # 5. CRYPTOGRAPHY
+  # ===========================================================================
+
+  - id: hunter.crypto.ecb-mode
+    languages: [python, java]
+    severity: ERROR
+    message: >
+      ECB mode does not provide semantic security — identical plaintext
+      blocks produce identical ciphertext. Use CBC, GCM, or another
+      authenticated encryption mode.
+    metadata:
+      cwe: "CWE-327"
+      owasp: "A02:2021"
+      category: cryptography
+      confidence: high
+    pattern-either:
+      - pattern: AES.new($KEY, AES.MODE_ECB)
+      - pattern: Cipher.getInstance("AES/ECB/...")
+      - pattern: Cipher.getInstance("DES/ECB/...")
+
+  - id: hunter.crypto.weak-algorithm
+    languages: [python, java, javascript, typescript]
+    severity: WARNING
+    message: >
+      Weak or deprecated cryptographic algorithm. DES, 3DES, RC4 are
+      broken. Use AES-256-GCM or ChaCha20-Poly1305.
+    metadata:
+      cwe: "CWE-327"
+      owasp: "A02:2021"
+      category: cryptography
+      confidence: high
+    pattern-either:
+      - pattern: DES.new(...)
+      - pattern: DES3.new(...)
+      - pattern: ARC4.new(...)
+      - pattern: Cipher.getInstance("DES")
+      - pattern: Cipher.getInstance("DESede")
+      - pattern: Cipher.getInstance("RC4")
+      - pattern: crypto.createCipher("des", ...)
+      - pattern: crypto.createCipher("rc4", ...)
+
+  - id: hunter.crypto.hardcoded-iv
+    languages: [python, java]
+    severity: ERROR
+    message: >
+      Static/hardcoded IV or nonce. IVs must be unique and unpredictable
+      per encryption operation. Reusing an IV breaks confidentiality.
+    metadata:
+      cwe: "CWE-329"
+      owasp: "A02:2021"
+      category: cryptography
+      confidence: medium
+    pattern-either:
+      - pattern: |
+          $IV = b"..."
+          ...
+          AES.new($KEY, ..., iv=$IV)
+      - pattern: |
+          $IV = "..."
+          ...
+          new IvParameterSpec($IV.getBytes())
+
+  - id: hunter.crypto.no-cert-verify-python
+    languages: [python]
+    severity: ERROR
+    message: >
+      TLS certificate verification disabled. This enables man-in-the-middle
+      attacks. Remove verify=False and use proper CA certificates.
+    metadata:
+      cwe: "CWE-295"
+      owasp: "A07:2021"
+      category: cryptography
+      confidence: high
+    pattern-either:
+      - pattern: requests.get(..., verify=False, ...)
+      - pattern: requests.post(..., verify=False, ...)
+      - pattern: requests.put(..., verify=False, ...)
+      - pattern: requests.delete(..., verify=False, ...)
+      - pattern: httpx.AsyncClient(..., verify=False, ...)
+      - pattern: httpx.Client(..., verify=False, ...)
+      - pattern: urllib3.disable_warnings(...)
+
+  - id: hunter.crypto.no-cert-verify-js
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >
+      TLS certificate verification disabled via NODE_TLS_REJECT_UNAUTHORIZED.
+      This enables MITM attacks in production.
+    metadata:
+      cwe: "CWE-295"
+      owasp: "A07:2021"
+      category: cryptography
+      confidence: high
+    pattern-either:
+      - pattern: process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"
+      - pattern: process.env["NODE_TLS_REJECT_UNAUTHORIZED"] = "0"
+
+  - id: hunter.crypto.insecure-random
+    languages: [python, javascript, typescript]
+    severity: WARNING
+    message: >
+      Predictable random used for security-sensitive value (token, key,
+      secret). Use secrets module (Python) or crypto.randomBytes (Node).
+    metadata:
+      cwe: "CWE-330"
+      owasp: "A02:2021"
+      category: cryptography
+      confidence: medium
+    pattern-either:
+      - pattern: random.random()
+      - pattern: random.randint(...)
+      - pattern: Math.random()
+
+  # ===========================================================================
+  # 6. ACCESS CONTROL
+  # ===========================================================================
+
+  - id: hunter.access.mass-assignment-express
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >
+      Request body spread directly into a database operation. Attackers can
+      inject unexpected fields (role, isAdmin, etc.) to escalate privileges.
+      Explicitly pick allowed fields.
+    metadata:
+      cwe: "CWE-915"
+      owasp: "A01:2021"
+      category: access-control
+      confidence: medium
+    pattern-either:
+      - pattern: |
+          $MODEL.create({...$REQ.body})
+      - pattern: |
+          $MODEL.create($REQ.body)
+      - pattern: |
+          $MODEL.update({...$REQ.body})
+      - pattern: |
+          $MODEL.findByIdAndUpdate(..., $REQ.body, ...)
+      - pattern: |
+          new $MODEL($REQ.body)
+
+  - id: hunter.access.cors-wildcard-credentials
+    languages: [python, javascript, typescript, java]
+    severity: ERROR
+    message: >
+      CORS configured with wildcard origin (*) and credentials. This
+      allows any website to make authenticated requests to your API,
+      enabling credential theft. Use explicit origin allowlists.
+    metadata:
+      cwe: "CWE-942"
+      owasp: "A05:2021"
+      category: access-control
+      confidence: high
+    pattern-either:
+      - pattern: |
+          Access-Control-Allow-Origin: *
+      - pattern: |
+          "Access-Control-Allow-Origin", "*"
+      - pattern: |
+          allow_origins=["*"]
+      - pattern: |
+          origin: "*"
+      - pattern: |
+          cors({origin: "*", credentials: true})
+
+  - id: hunter.access.graphql-introspection
+    languages: [python, javascript, typescript, java]
+    severity: WARNING
+    message: >
+      GraphQL introspection appears enabled. In production this exposes
+      your entire API schema to attackers. Disable introspection in
+      production environments.
+    metadata:
+      cwe: "CWE-200"
+      owasp: "A01:2021"
+      category: access-control
+      confidence: medium
+    pattern-either:
+      - pattern: introspection=True
+      - pattern: introspection: true
+
+  - id: hunter.access.django-mass-assignment
+    languages: [python]
+    severity: WARNING
+    message: >
+      Django model created/updated with unfiltered request data. Use a
+      serializer or form with explicit fields to prevent mass assignment.
+    metadata:
+      cwe: "CWE-915"
+      owasp: "A01:2021"
+      category: access-control
+      confidence: medium
+    pattern-either:
+      - pattern: $MODEL.objects.create(**request.data)
+      - pattern: $MODEL.objects.create(**request.POST)
+      - pattern: $MODEL(**request.data)
+
+  # ===========================================================================
+  # 7. FILE & PATH
+  # ===========================================================================
+
+  - id: hunter.file.path-traversal-python
+    languages: [python]
+    severity: ERROR
+    message: >
+      User input used in file path without sanitization. An attacker
+      can use ../ sequences to read/write arbitrary files. Validate
+      the resolved path stays within the intended directory.
+    metadata:
+      cwe: "CWE-22"
+      owasp: "A01:2021"
+      category: path-traversal
+      confidence: high
+    pattern-either:
+      - pattern: open(os.path.join($BASE, $REQ. ...), ...)
+      - pattern: open(f"...{$REQ. ...}...", ...)
+      - pattern: open($DIR + $REQ. ..., ...)
+      - pattern: Path($BASE) / $REQ. ...
+      - patterns:
+          - pattern: open($FILENAME, ...)
+          - pattern-not: open("...", ...)
+
+  - id: hunter.file.path-traversal-js
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >
+      User input in file path without traversal protection. Validate
+      that path.resolve() stays within the base directory.
+    metadata:
+      cwe: "CWE-22"
+      owasp: "A01:2021"
+      category: path-traversal
+      confidence: high
+    pattern-either:
+      - pattern: fs.readFileSync(path.join($BASE, $REQ.params.$FILE))
+      - pattern: fs.readFile(path.join($BASE, $REQ.params.$FILE), ...)
+      - pattern: fs.readFileSync(`...${$REQ.params.$FILE}...`)
+      - pattern: fs.createReadStream(path.join($BASE, $REQ.query.$FILE))
+
+  - id: hunter.file.unrestricted-upload
+    languages: [python, javascript, typescript]
+    severity: WARNING
+    message: >
+      File upload without extension or content-type validation. Attackers
+      can upload web shells (.php, .jsp, .aspx) or executable content.
+      Validate file type, extension, and store outside the web root.
+    metadata:
+      cwe: "CWE-434"
+      owasp: "A04:2021"
+      category: file-upload
+      confidence: medium
+    pattern-either:
+      - pattern: |
+          $FILE = request.files[...]
+          ...
+          $FILE.save(...)
+      - pattern: |
+          $FILE.mv($PATH)
+      - pattern: |
+          fs.writeFileSync($PATH, $REQ.file.buffer)
+
+  - id: hunter.file.zip-slip
+    languages: [python]
+    severity: ERROR
+    message: >
+      Archive extraction without path validation (Zip Slip). A crafted
+      archive with ../../ entries can overwrite arbitrary files. Verify
+      each member's resolved path stays within the target directory.
+    metadata:
+      cwe: "CWE-22"
+      owasp: "A01:2021"
+      category: path-traversal
+      confidence: high
+    pattern-either:
+      - pattern: $ZF.extractall(...)
+      - pattern: $TF.extractall(...)
+    pattern-not:
+      - pattern: |
+          ... os.path.realpath(...) ...
+
+  # ===========================================================================
+  # 8. MODERN / EMERGING
+  # ===========================================================================
+
+  - id: hunter.modern.prototype-pollution
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >
+      Potential prototype pollution via __proto__ or constructor.prototype
+      property access with user input. This can lead to DoS or RCE in
+      certain frameworks. Sanitize keys or use Map instead of plain objects.
+    metadata:
+      cwe: "CWE-1321"
+      owasp: "A03:2021"
+      category: prototype-pollution
+      confidence: high
+    pattern-either:
+      - pattern: $OBJ["__proto__"] = ...
+      - pattern: $OBJ.__proto__ = ...
+      - pattern: $OBJ["constructor"]["prototype"] = ...
+      - pattern: |
+          $OBJ[$KEY] = $VALUE
+    metavariable-regex:
+      metavariable: $KEY
+      regex: ".*__proto__.*|.*constructor.*"
+
+  - id: hunter.modern.eval-user-input
+    languages: [javascript, typescript, python]
+    severity: ERROR
+    message: >
+      eval() or Function() called with user-controlled input. This
+      enables arbitrary code execution. Use safe alternatives (JSON.parse,
+      ast.literal_eval, sandboxed evaluation).
+    metadata:
+      cwe: "CWE-95"
+      owasp: "A03:2021"
+      category: code-injection
+      confidence: high
+    pattern-either:
+      - pattern: eval($REQ. ...)
+      - pattern: eval($REQ.body.$FIELD)
+      - pattern: new Function($REQ. ...)
+      - pattern: exec($REQ. ...)
+      - pattern: eval(request. ...)
+
+  - id: hunter.modern.postmessage-no-origin
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >
+      postMessage event handler without origin validation. Any page can
+      send messages to this window. Always verify event.origin against
+      an allowlist before processing the data.
+    metadata:
+      cwe: "CWE-346"
+      owasp: "A07:2021"
+      category: client-side
+      confidence: medium
+    patterns:
+      - pattern: |
+          window.addEventListener("message", function($EVENT) { ... })
+      - pattern-not: |
+          window.addEventListener("message", function($EVENT) { ... $EVENT.origin ... })
+
+  - id: hunter.modern.open-redirect
+    languages: [python, javascript, typescript]
+    severity: WARNING
+    message: >
+      Redirect target taken from user input without validation. Attackers
+      can redirect users to phishing sites. Validate the URL against an
+      allowlist of trusted domains.
+    metadata:
+      cwe: "CWE-601"
+      owasp: "A01:2021"
+      category: open-redirect
+      confidence: medium
+    pattern-either:
+      - pattern: redirect($REQ.query.$URL)
+      - pattern: redirect(request.args.get(...))
+      - pattern: res.redirect($REQ.query.$URL)
+      - pattern: HttpResponseRedirect(request.GET.get(...))
+      - pattern: return redirect(request.args[...])
+
+  - id: hunter.modern.llm-prompt-injection
+    languages: [python, javascript, typescript]
+    severity: WARNING
+    message: >
+      User input concatenated directly into an LLM system/prompt message.
+      This enables prompt injection — attackers can override instructions,
+      exfiltrate data, or trigger unintended actions. Separate user content
+      from system instructions.
+    metadata:
+      cwe: "CWE-77"
+      owasp: "A03:2021"
+      category: prompt-injection
+      confidence: medium
+    pattern-either:
+      - pattern: |
+          {"role": "system", "content": f"...{$USER_INPUT}..."}
+      - pattern: |
+          {"role": "system", "content": "..." + $USER_INPUT + "..."}
+      - pattern: |
+          $MESSAGES.append({"role": "system", "content": ... + $REQ. ... + ...})
+
+  - id: hunter.modern.unsafe-regex
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >
+      Regular expression with user-controlled input and potential
+      catastrophic backtracking (ReDoS). Use a regex timeout or
+      validate/escape the input before compilation.
+    metadata:
+      cwe: "CWE-1333"
+      owasp: "A03:2021"
+      category: dos
+      confidence: medium
+    pattern-either:
+      - pattern: new RegExp($REQ. ...)
+      - pattern: new RegExp($REQ.body.$FIELD)
+      - pattern: new RegExp($REQ.query.$FIELD)
+
+  - id: hunter.modern.websocket-no-origin
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >
+      WebSocket server without origin validation. Any website can open
+      a WebSocket connection and make authenticated requests. Validate
+      the Origin header against trusted domains.
+    metadata:
+      cwe: "CWE-346"
+      owasp: "A07:2021"
+      category: websocket
+      confidence: medium
+    pattern-either:
+      - pattern: |
+          new $WS.Server({..., verifyClient: false, ...})
+      - pattern: |
+          new WebSocketServer({...})
+    pattern-not:
+      - pattern: |
+          new $WS.Server({..., verifyClient: $FN, ...})
+
+  # ===========================================================================
+  # 9. CONFIGURATION & COOKIES
+  # ===========================================================================
+
+  - id: hunter.config.debug-mode-django
+    languages: [python]
+    severity: ERROR
+    message: >
+      Django DEBUG=True in what appears to be a settings file. Debug mode
+      exposes detailed error pages, SQL queries, and environment variables
+      to attackers. Ensure DEBUG=False in production.
+    metadata:
+      cwe: "CWE-215"
+      owasp: "A05:2021"
+      category: configuration
+      confidence: high
+    patterns:
+      - pattern: DEBUG = True
+      - metavariable-regex:
+          metavariable: $FILE
+          regex: ".*settings.*\\.py"
+
+  - id: hunter.config.debug-mode-flask
+    languages: [python]
+    severity: ERROR
+    message: >
+      Flask app running with debug=True. This enables the Werkzeug
+      debugger which allows arbitrary code execution if exposed.
+    metadata:
+      cwe: "CWE-215"
+      owasp: "A05:2021"
+      category: configuration
+      confidence: high
+    pattern-either:
+      - pattern: $APP.run(..., debug=True, ...)
+      - pattern: $APP.config["DEBUG"] = True
+
+  - id: hunter.config.insecure-cookie
+    languages: [python, javascript, typescript]
+    severity: WARNING
+    message: >
+      Cookie set without security flags. Set HttpOnly (prevents XSS
+      theft), Secure (HTTPS only), and SameSite=Strict/Lax (prevents CSRF).
+    metadata:
+      cwe: "CWE-614"
+      owasp: "A05:2021"
+      category: configuration
+      confidence: medium
+    pattern-either:
+      - pattern: |
+          response.set_cookie(..., httponly=False, ...)
+      - pattern: |
+          response.set_cookie(..., secure=False, ...)
+      - pattern: |
+          res.cookie($NAME, $VALUE, {httpOnly: false, ...})
+      - pattern: |
+          res.cookie($NAME, $VALUE, {secure: false, ...})
+
+  - id: hunter.config.sensitive-data-in-url
+    languages: [python, javascript, typescript, java]
+    severity: WARNING
+    message: >
+      Sensitive data (token, password, key) passed as a URL query parameter.
+      URLs are logged in server access logs, browser history, and referrer
+      headers. Use POST bodies or headers for sensitive values.
+    metadata:
+      cwe: "CWE-598"
+      owasp: "A04:2021"
+      category: configuration
+      confidence: medium
+    pattern-regex: "\\?(?:.*&)?(?:password|token|secret|api_key|apikey|access_token)="
+
+  - id: hunter.config.verbose-errors
+    languages: [python, javascript, typescript]
+    severity: WARNING
+    message: >
+      Detailed error information sent to clients. Stack traces expose
+      internal paths, library versions, and logic. Return generic error
+      messages to users and log details server-side only.
+    metadata:
+      cwe: "CWE-209"
+      owasp: "A04:2021"
+      category: configuration
+      confidence: medium
+    pattern-either:
+      - pattern: |
+          return $RESPONSE(..., traceback.format_exc(), ...)
+      - pattern: |
+          res.status(500).send($ERR.stack)
+      - pattern: |
+          res.status(500).json({..., stack: $ERR.stack, ...})
+
+  # ===========================================================================
+  # 10. CLOUD & INFRASTRUCTURE
+  # ===========================================================================
+
+  - id: hunter.cloud.s3-public-acl
+    languages: [python, javascript, typescript]
+    severity: ERROR
+    message: >
+      S3 bucket or object created with public ACL. This exposes data
+      to the internet. Use private ACLs and pre-signed URLs for access.
+    metadata:
+      cwe: "CWE-732"
+      owasp: "A01:2021"
+      category: cloud
+      confidence: high
+    pattern-either:
+      - pattern: ACL="public-read"
+      - pattern: ACL="public-read-write"
+      - pattern: ACL='public-read'
+      - pattern: ACL='public-read-write'
+
+  - id: hunter.cloud.docker-socket-mount
+    languages: [yaml]
+    severity: ERROR
+    message: >
+      Docker socket mounted into container. This gives the container
+      full control over the Docker daemon — equivalent to root access
+      on the host. Use Docker-in-Docker or rootless alternatives.
+    metadata:
+      cwe: "CWE-250"
+      owasp: "A05:2021"
+      category: infrastructure
+      confidence: high
+    pattern-regex: "/var/run/docker\\.sock"
+
+  - id: hunter.cloud.terraform-open-sg
+    languages: [hcl, terraform]
+    severity: ERROR
+    message: >
+      Security group allows unrestricted inbound access (0.0.0.0/0).
+      Restrict to specific IP ranges and ports needed.
+    metadata:
+      cwe: "CWE-284"
+      owasp: "A05:2021"
+      category: infrastructure
+      confidence: high
+    pattern-either:
+      - pattern: |
+          cidr_blocks = ["0.0.0.0/0"]
+      - pattern: |
+          ingress {
+            ...
+            cidr_blocks = ["0.0.0.0/0"]
+            ...
+          }
+
+  - id: hunter.cloud.k8s-secrets-in-env
+    languages: [yaml]
+    severity: WARNING
+    message: >
+      Kubernetes secret value appears hardcoded in a manifest. Use
+      Kubernetes Secrets objects or external secret managers (Vault,
+      AWS Secrets Manager) referenced via secretKeyRef.
+    metadata:
+      cwe: "CWE-798"
+      owasp: "A07:2021"
+      category: infrastructure
+      confidence: medium
+    pattern-either:
+      - pattern: |
+          env:
+            - name: $NAME
+              value: $VALUE
+    metavariable-regex:
+      metavariable: $NAME
+      regex: "(?i).*(PASSWORD|SECRET|TOKEN|API_KEY|PRIVATE_KEY).*"
+
+  # ===========================================================================
+  # 11. RACE CONDITIONS & BUSINESS LOGIC
+  # ===========================================================================
+
+  - id: hunter.race.toctou-python
+    languages: [python]
+    severity: WARNING
+    message: >
+      Time-of-check/time-of-use (TOCTOU) race condition. The file state
+      may change between the existence check and the file operation.
+      Use atomic operations or file locking.
+    metadata:
+      cwe: "CWE-367"
+      owasp: "A04:2021"
+      category: race-condition
+      confidence: medium
+    pattern-either:
+      - pattern: |
+          if os.path.exists($PATH):
+              ...
+              open($PATH, ...)
+      - pattern: |
+          if os.path.isfile($PATH):
+              ...
+              open($PATH, ...)
+
+  - id: hunter.race.toctou-js
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >
+      TOCTOU race condition — file checked then used separately. Use
+      atomic operations (open with O_CREAT|O_EXCL, or try/catch on the
+      operation directly).
+    metadata:
+      cwe: "CWE-367"
+      owasp: "A04:2021"
+      category: race-condition
+      confidence: medium
+    pattern-either:
+      - pattern: |
+          if (fs.existsSync($PATH)) {
+              ...
+              fs.readFileSync($PATH)
+          }
+      - pattern: |
+          fs.access($PATH, ..., function(...) {
+              ...
+              fs.readFile($PATH, ...)
+          })
+
+  # ===========================================================================
+  # 12. XXE
+  # ===========================================================================
+
+  - id: hunter.xxe.python-xml
+    languages: [python]
+    severity: ERROR
+    message: >
+      XML parser used without disabling external entity processing.
+      This enables XXE attacks — file reading, SSRF, DoS. Use
+      defusedxml or disable DTD/entity processing.
+    metadata:
+      cwe: "CWE-611"
+      owasp: "A05:2021"
+      category: xxe
+      confidence: high
+    pattern-either:
+      - pattern: xml.etree.ElementTree.parse(...)
+      - pattern: xml.etree.ElementTree.fromstring(...)
+      - pattern: lxml.etree.parse(...)
+      - pattern: xml.dom.minidom.parse(...)
+      - pattern: xml.sax.parse(...)
+
+  - id: hunter.xxe.java-xml
+    languages: [java]
+    severity: ERROR
+    message: >
+      XML parser without external entity restrictions. Configure
+      XMLConstants.FEATURE_SECURE_PROCESSING and disable DOCTYPE
+      declarations to prevent XXE.
+    metadata:
+      cwe: "CWE-611"
+      owasp: "A05:2021"
+      category: xxe
+      confidence: high
+    patterns:
+      - pattern: |
+          DocumentBuilderFactory $DBF = DocumentBuilderFactory.newInstance();
+          ...
+          $DBF.newDocumentBuilder().parse(...)
+      - pattern-not: |
+          DocumentBuilderFactory $DBF = DocumentBuilderFactory.newInstance();
+          ...
+          $DBF.setFeature(...);
+          ...
+          $DBF.newDocumentBuilder().parse(...)

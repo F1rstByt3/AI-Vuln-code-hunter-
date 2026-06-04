@@ -1,29 +1,40 @@
 """Semgrep adapter — runs Semgrep over the extracted code and normalises results
-into Candidate dicts. This is the broad, high-recall sweep over the whole tree."""
+into Candidate dicts. Runs both the standard ruleset AND our custom hunter rules
+for deeper security coverage."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import os
+from pathlib import Path
 
 from app.config import settings
 from app.scanners.base import Candidate
 
 _SEV_MAP = {"ERROR": "high", "WARNING": "medium", "INFO": "low"}
 _EXCLUDES = ["node_modules", "vendor", ".git", "dist", "build", "*.min.js", "*.lock"]
+_RULES_DIR = str(Path(__file__).parent / "rules")
 
 
 class SemgrepScanner:
     name = "semgrep"
 
     async def scan(self, workdir: str) -> list[Candidate]:
-        cmd = [
-            "semgrep", "scan",
-            "--config", settings.semgrep_ruleset,
+        configs = [settings.semgrep_ruleset]
+        if os.path.isdir(_RULES_DIR) and os.listdir(_RULES_DIR):
+            configs.append(_RULES_DIR)
+
+        cmd = ["semgrep", "scan"]
+        for cfg in configs:
+            cmd += ["--config", cfg]
+        cmd += [
             "--json", "--quiet", "--no-git-ignore",
             "--max-target-bytes", str(settings.max_file_bytes_for_ai * 5),
             "--timeout", "120",
+            "--severity", "INFO",
+            "--severity", "WARNING",
+            "--severity", "ERROR",
         ]
         for ex in _EXCLUDES:
             cmd += ["--exclude", ex]
