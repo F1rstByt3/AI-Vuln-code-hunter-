@@ -47,6 +47,8 @@ export const api = {
     req<Scan>(`/projects/${projectId}/scans`, { method: "POST", body: JSON.stringify(b) }),
   getScan: (id: string) => req<Scan>(`/scans/${id}`),
   cancelScan: (id: string) => req<Scan>(`/scans/${id}/cancel`, { method: "POST" }),
+  rerunStage: (id: string, stage: string) =>
+    req<Scan>(`/scans/${id}/rerun`, { method: "POST", body: JSON.stringify({ stage }) }),
   listFindings: (scanId: string) => req<Finding[]>(`/scans/${scanId}/findings`),
   triageFinding: (id: string, b: { state: string; triage_note?: string }) =>
     req<Finding>(`/findings/${id}/triage`, { method: "POST", body: JSON.stringify(b) }),

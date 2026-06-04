@@ -46,6 +46,14 @@ export default function ScanPage() {
     refresh();
   };
 
+  const rerun = async (stage: string) => {
+    if (!scanId) return;
+    await api.rerunStage(scanId, stage).then(setScan).catch((e) => alert(String(e)));
+  };
+
+  const busy = ["queued", "running"].includes(scan?.status || "");
+  const scanners: string[] = (scan?.config?.scanners as string[]) || [];
+
   return (
     <div>
       <button onClick={() => nav(-1)} className="text-sm text-muted hover:text-slate-200 mb-2">← Back</button>
@@ -65,6 +73,20 @@ export default function ScanPage() {
           </div>
         )}
       </div>
+
+      {scan && !busy && (
+        <div className="flex items-center gap-2 mb-4 text-sm">
+          <span className="text-muted">Re-run stage:</span>
+          {(scanners.includes("semgrep") || scanners.length === 0) && (
+            <Button variant="ghost" onClick={() => rerun("semgrep")}>↻ Semgrep</Button>
+          )}
+          {scanners.includes("sonarqube") && (
+            <Button variant="ghost" onClick={() => rerun("sonarqube")}>↻ SonarQube</Button>
+          )}
+          <Button variant="ghost" onClick={() => rerun("ai")}>↻ AI review</Button>
+          <span className="text-[11px] text-muted">replaces just that stage's findings</span>
+        </div>
+      )}
 
       <div className="grid grid-cols-3 gap-6">
         <div className="col-span-2 space-y-6">

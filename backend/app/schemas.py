@@ -101,10 +101,14 @@ class UploadComplete(BaseModel):
 # ---- Scan ----
 class ScanCreate(BaseModel):
     artifact_id: str
-    scanners: list[str] = Field(default_factory=lambda: ["semgrep", "ai"])
+    scanners: list[str] = Field(default_factory=lambda: ["semgrep", "mcp", "ai"])
     instructions: str | None = None  # free-form steer for the agent
     model: str | None = None         # Foundry deployment override (else app default)
     file_paths: list[str] | None = None  # scope scan to these files/folders
+
+
+class ScanRerun(BaseModel):
+    stage: str  # semgrep | sonarqube | ai — re-run just this stage
 
 
 class ScanOut(ORMModel):

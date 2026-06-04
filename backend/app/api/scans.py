@@ -12,8 +12,11 @@ from app import events
 from app.api.deps import get_arq, get_or_404
 from app.auth import require_role
 from app.db import get_session
+from fastapi import HTTPException, status as http_status
+
 from app.models import Artifact, Finding, Project, Role, Scan, ScanStatus, Severity
-from app.schemas import FindingOut, ScanCreate, ScanOut
+from app.schemas import FindingOut, ScanCreate, ScanOut, ScanRerun
+from app.worker import RERUNNABLE_STAGES
 
 router = APIRouter(tags=["scans"])
 
@@ -59,6 +62,31 @@ async def create_scan(
 @router.get("/scans/{scan_id}", response_model=ScanOut)
 async def get_scan(scan_id: str, session: AsyncSession = Depends(get_session)):
     return await get_or_404(session, Scan, scan_id)
+
+
+@router.post("/scans/{scan_id}/rerun", response_model=ScanOut,
+             dependencies=[Depends(require_role(Role.reviewer))])
+async def rerun_scan_stage(
+    scan_id: str, body: ScanRerun, session: AsyncSession = Depends(get_session)
+):
+    """Re-run a single pipeline stage (semgrep | sonarqube | ai) on this scan,
+    replacing just that stage's findings."""
+    scan = await get_or_404(session, Scan, scan_id)
+    if body.stage not in RERUNNABLE_STAGES:
+        raise HTTPException(
+            http_status.HTTP_400_BAD_REQUEST,
+            f"stage must be one of {', '.join(RERUNNABLE_STAGES)}",
+        )
+    if scan.status in (ScanStatus.queued, ScanStatus.running):
+        raise HTTPException(http_status.HTTP_409_CONFLICT, "scan is already running")
+    scan.status = ScanStatus.queued
+    scan.error = None
+    await session.commit()
+    await session.refresh(scan)
+
+    arq = await get_arq()
+    await arq.enqueue_job("rerun_stage", scan.id, body.stage)
+    return scan
 
 
 @router.post("/scans/{scan_id}/cancel", response_model=ScanOut,

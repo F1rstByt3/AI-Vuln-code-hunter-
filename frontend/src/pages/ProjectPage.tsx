@@ -23,6 +23,9 @@ export default function ProjectPage() {
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
   const [loadingFiles, setLoadingFiles] = useState(false);
   const [instructions, setInstructions] = useState("");
+  const [useSemgrep, setUseSemgrep] = useState(true);
+  const [useSonar, setUseSonar] = useState(false);
+  const [useAI, setUseAI] = useState(true);
   const [err, setErr] = useState("");
 
   const reload = async () => {
@@ -69,8 +72,14 @@ export default function ProjectPage() {
 
   const startScan = async () => {
     if (!projectId || !artifactId) return;
+    const scanners: string[] = ["mcp"];  // configured MCP agents always contribute
+    if (useSemgrep) scanners.push("semgrep");
+    if (useSonar) scanners.push("sonarqube");
+    if (useAI) scanners.push("ai");
+    if (scanners.length === 1) { setErr("Select at least one scanner"); return; }
+    setErr("");
     const scan = await api.createScan(projectId, {
-      artifact_id: artifactId, scanners: ["semgrep", "ai"], instructions,
+      artifact_id: artifactId, scanners, instructions,
       model: model.trim() || undefined,
       file_paths: selectedPaths.length > 0 ? selectedPaths : undefined,
     });
@@ -112,6 +121,29 @@ export default function ProjectPage() {
 
         <Card className="p-4">
           <h2 className="font-semibold mb-3">Start a review</h2>
+          <div className="mb-3">
+            <span className="text-sm text-muted">Scanners</span>
+            <div className="flex flex-wrap gap-3 mt-1">
+              <label className="flex items-center gap-1.5 text-sm">
+                <input type="checkbox" checked={useSemgrep} onChange={(e) => setUseSemgrep(e.target.checked)} />
+                Semgrep
+              </label>
+              <label className="flex items-center gap-1.5 text-sm">
+                <input type="checkbox" checked={useSonar} onChange={(e) => setUseSonar(e.target.checked)} />
+                SonarQube
+              </label>
+              <label className="flex items-center gap-1.5 text-sm">
+                <input type="checkbox" checked={useAI} onChange={(e) => setUseAI(e.target.checked)} />
+                AI review
+              </label>
+            </div>
+            <div className="text-[11px] text-muted mt-1">
+              {useAI
+                ? "AI review triages scanner candidates and hunts for more (reviewers → judge → exploit analyst)."
+                : "Static-only: scanner findings are saved directly, no AI triage."}
+              {" "}SonarQube requires it to be enabled in Settings.
+            </div>
+          </div>
           <label className="text-sm text-muted">Reviewer model override (optional)
             <Input value={model} onChange={(e) => setModel(e.target.value)}
               placeholder="Leave blank to use Settings roles" list="project-models-list"
