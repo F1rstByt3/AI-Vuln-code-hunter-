@@ -15,6 +15,7 @@ import os
 from datetime import datetime, timezone
 
 from arq.connections import RedisSettings
+from sqlalchemy import delete as sql_delete
 from sqlalchemy import select
 
 from app import control, events
@@ -34,6 +35,7 @@ from app.models import (
     FindingState,
     McpServer,
     Scan,
+    ScanCheckpoint,
     ScanStatus,
     Severity,
 )
@@ -133,10 +135,85 @@ class _Stages:
         return sorted(self.state.values(), key=lambda s: s["order"])
 
 
+class _CheckpointStore:
+    """Durable, resumable store for completed AI work units (one row per unit).
+
+    Writes go through their own short-lived sessions guarded by a lock so the
+    concurrent reviewer tasks don't trip over each other (or the worker's main
+    session). Each commit is independent, so a crash leaves every finished unit
+    safely on disk for the next resume."""
+
+    def __init__(self, scan_id: str) -> None:
+        self.scan_id = scan_id
+        self._lock = asyncio.Lock()
+
+    async def load(self, phase: str) -> dict[str, list[dict]]:
+        async with SessionLocal() as s:
+            rows = (await s.execute(
+                select(ScanCheckpoint).where(
+                    ScanCheckpoint.scan_id == self.scan_id,
+                    ScanCheckpoint.phase == phase,
+                )
+            )).scalars().all()
+            return {r.chunk_key: (r.payload or {}).get("items", []) for r in rows}
+
+    async def save(self, phase: str, key: str, items: list[dict]) -> None:
+        async with self._lock, SessionLocal() as s:
+            await s.execute(sql_delete(ScanCheckpoint).where(
+                ScanCheckpoint.scan_id == self.scan_id,
+                ScanCheckpoint.phase == phase,
+                ScanCheckpoint.chunk_key == key,
+            ))
+            s.add(ScanCheckpoint(scan_id=self.scan_id, phase=phase,
+                                 chunk_key=key, payload={"items": items}))
+            await s.commit()
+
+    async def load_inputs(self) -> dict | None:
+        async with SessionLocal() as s:
+            row = (await s.execute(
+                select(ScanCheckpoint).where(
+                    ScanCheckpoint.scan_id == self.scan_id,
+                    ScanCheckpoint.phase == "inputs",
+                )
+            )).scalars().first()
+            return (row.payload if row else None) or None
+
+    async def save_inputs(self, files: list[dict], candidates: list[dict]) -> None:
+        async with self._lock, SessionLocal() as s:
+            await s.execute(sql_delete(ScanCheckpoint).where(
+                ScanCheckpoint.scan_id == self.scan_id,
+                ScanCheckpoint.phase == "inputs",
+            ))
+            s.add(ScanCheckpoint(scan_id=self.scan_id, phase="inputs",
+                                 chunk_key="v1",
+                                 payload={"files": files, "candidates": candidates}))
+            await s.commit()
+
+    async def clear(self) -> None:
+        async with self._lock, SessionLocal() as s:
+            await s.execute(sql_delete(ScanCheckpoint).where(
+                ScanCheckpoint.scan_id == self.scan_id))
+            await s.commit()
+
+    async def has_any(self) -> bool:
+        async with SessionLocal() as s:
+            row = (await s.execute(
+                select(ScanCheckpoint.id).where(
+                    ScanCheckpoint.scan_id == self.scan_id).limit(1)
+            )).first()
+            return row is not None
+
+
 async def _ai_review(session, scan: Scan, artifact: Artifact, workdir: str,
                      candidates: list[dict], emit, checkpoint=None,
-                     endpoints: list[dict] | None = None) -> dict:
-    """Run the AI reviewer/judge/exploit pipeline. Returns run_review's result."""
+                     endpoints: list[dict] | None = None,
+                     store: "_CheckpointStore | None" = None) -> dict:
+    """Run the AI reviewer/judge/exploit pipeline. Returns run_review's result.
+
+    When *store* is supplied, the reviewer/judge/exploit units are checkpointed
+    so a later resume skips completed work. The first run freezes the exact
+    (files, candidates) inputs so a resume rebuilds byte-identical batches —
+    keeping checkpoint keys (batch indices) valid across restarts."""
     async def read_file(rel: str) -> str | None:
         return _safe_read(workdir, rel)
 
@@ -150,6 +227,29 @@ async def _ai_review(session, scan: Scan, artifact: Artifact, workdir: str,
     await emit({"type": "log", "message": (
         f"AI pipeline [{mode}] — chat={roles.chat.deployment} "
         f"reviewers=[{reviewers}] judge={judge}")})
+
+    # Resume path: if we already froze this scan's inputs, reuse them verbatim
+    # so batching (and therefore every checkpoint key) is identical. Skips the
+    # file query, scoping, and targeted-review filtering entirely.
+    frozen = await store.load_inputs() if store else None
+    if frozen and frozen.get("files"):
+        files = frozen["files"]
+        candidates = frozen.get("candidates") or []
+        await emit({"type": "log", "message":
+                    f"Resuming AI review with frozen inputs: {len(files)} files, "
+                    f"{len(candidates)} static candidates"})
+        return await run_review(
+            client=client,
+            roles=roles,
+            instructions=(scan.config or {}).get("instructions"),
+            files=files,
+            candidates=candidates,
+            read_file=read_file,
+            emit=emit,
+            checkpoint=checkpoint,
+            load_chunks=store.load if store else None,
+            save_chunk=store.save if store else None,
+        )
 
     artifact_files = (await session.execute(
         select(ArtifactFile).where(
@@ -187,6 +287,10 @@ async def _ai_review(session, scan: Scan, artifact: Artifact, workdir: str,
     files = [{"path": f.path, "language": f.language, "size": f.size_bytes}
              for f in artifact_files]
 
+    # Freeze inputs so a future resume rebuilds identical batches.
+    if store:
+        await store.save_inputs(files, candidates)
+
     return await run_review(
         client=client,
         roles=roles,
@@ -196,6 +300,8 @@ async def _ai_review(session, scan: Scan, artifact: Artifact, workdir: str,
         read_file=read_file,
         emit=emit,
         checkpoint=checkpoint,
+        load_chunks=store.load if store else None,
+        save_chunk=store.save if store else None,
     )
 
 
@@ -231,7 +337,9 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
             await emit({"type": "stage", "stage": name, "state": state, **extra})
 
         controller = Controller(scan_id, emit)
+        store = _CheckpointStore(scan_id)
         await control.clear_control(scan_id)  # drop stale flags from a prior run
+        await store.clear()  # fresh run: discard any stale checkpoints
 
         scan.status = ScanStatus.running
         scan.started_at = _now()
@@ -249,6 +357,7 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
             scan.summary = {**summary, "stages": stages.finalize(), "tokens": tokens["v"]}
             scan.finished_at = _now()
             await session.commit()
+            await store.clear()  # clean finish — no resume needed
             await emit({"type": "done", "status": final_status.value, "summary": scan.summary})
 
         try:
@@ -277,6 +386,7 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
                     result = await _ai_review(
                         session, scan, artifact, workdir, candidates, emit,
                         checkpoint=controller.checkpoint, endpoints=endpoints,
+                        store=store,
                     )
                     await set_stage("persist", "running")
                     await _persist_findings(session, scan, result["findings"])
@@ -559,9 +669,19 @@ async def _ensure_workdir(session, artifact: Artifact, emit) -> str:
     return await _ingest(session, artifact, emit)
 
 
-async def rerun_stage(ctx: dict, scan_id: str, stage: str) -> None:
+async def resume_scan(ctx: dict, scan_id: str) -> None:
+    """Resume an interrupted scan's AI pipeline, skipping completed work units.
+
+    Re-enters the reviewer/judge/exploit pipeline but reuses the durable
+    checkpoints from the prior run, so an AI run that died (crash, Docker stop,
+    timeout) at batch 657 continues from there instead of re-spending."""
+    await rerun_stage(ctx, scan_id, "ai", resume=True)
+
+
+async def rerun_stage(ctx: dict, scan_id: str, stage: str, resume: bool = False) -> None:
     """Re-run a single pipeline stage on an existing scan, replacing just that
-    stage's findings. Triggered by the per-stage UI buttons."""
+    stage's findings. Triggered by the per-stage UI buttons. When *resume* is
+    set (AI stage only), prior checkpoints are kept so completed work is skipped."""
     async with SessionLocal() as session:
         scan = await session.get(Scan, scan_id)
         if scan is None:
@@ -583,14 +703,16 @@ async def rerun_stage(ctx: dict, scan_id: str, stage: str) -> None:
                     await session.commit()
 
         controller = Controller(scan_id, emit)
+        store = _CheckpointStore(scan_id)
         await control.clear_control(scan_id)
 
         scan.status = ScanStatus.running
         scan.started_at = _now()
         scan.error = None
         await session.commit()
-        await emit({"type": "status", "status": f"re-running {stage}"})
-        await emit({"type": "log", "message": f"Re-running stage: {stage}"})
+        verb = "resuming" if resume else "re-running"
+        await emit({"type": "status", "status": f"{verb} {stage}"})
+        await emit({"type": "log", "message": f"{verb.capitalize()} stage: {stage}"})
 
         try:
             artifact = await session.get(Artifact, scan.artifact_id)
@@ -617,15 +739,20 @@ async def rerun_stage(ctx: dict, scan_id: str, stage: str) -> None:
                 await emit({"type": "log", "message": f"SonarQube re-run: {len(sonar)} findings"})
 
             elif stage == "ai":
+                if not resume:
+                    await store.clear()  # fresh redo: drop any old checkpoints
                 candidates = await _candidates_from_findings(session, scan_id)
                 await emit({"type": "log", "message":
-                            f"AI re-run over {len(candidates)} existing static candidates"})
+                            f"AI {'resume' if resume else 're-run'} over "
+                            f"{len(candidates)} existing static candidates"})
                 result = await _ai_review(session, scan, artifact, workdir, candidates, emit,
                                           checkpoint=controller.checkpoint,
-                                          endpoints=(scan.summary or {}).get("endpoints"))
+                                          endpoints=(scan.summary or {}).get("endpoints"),
+                                          store=store)
                 # Replace prior AI-authored findings; keep raw static ones.
                 await _delete_findings_by_source(session, scan_id, {"ai", "correlated"})
                 await _persist_findings(session, scan, result["findings"])
+                await store.clear()  # completed — no resume needed
                 needs_review = bool(result["summary"].get("needs_review"))
             else:
                 raise ValueError(f"unknown stage: {stage}")
@@ -689,7 +816,7 @@ async def _startup(ctx: dict) -> None:
 
 
 class WorkerSettings:
-    functions = [run_scan, rerun_stage]
+    functions = [run_scan, rerun_stage, resume_scan]
     on_startup = _startup
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
     max_jobs = 4

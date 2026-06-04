@@ -32,9 +32,21 @@ from app.models import FindingSource, FindingState, Severity
 EmitFn = Callable[[dict], Awaitable[None]]
 ReadFileFn = Callable[[str], Awaitable[str | None]]
 CheckpointFn = Callable[[str], Awaitable[None]]
+# Resumable checkpointing: load all completed units for a phase (key -> findings)
+# and persist one finished unit. Defaults are no-ops (no durable resume).
+LoadChunksFn = Callable[[str], Awaitable[dict[str, list[dict]]]]
+SaveChunkFn = Callable[[str, str, list[dict]], Awaitable[None]]
 
 
 async def _noop_checkpoint(_stage: str) -> None:
+    return None
+
+
+async def _noop_load(_phase: str) -> dict[str, list[dict]]:
+    return {}
+
+
+async def _noop_save(_phase: str, _key: str, _findings: list[dict]) -> None:
     return None
 
 REVIEWER_SYSTEM = """\
@@ -209,8 +221,12 @@ async def run_review(
     read_file: ReadFileFn,
     emit: EmitFn,
     checkpoint: CheckpointFn | None = None,
+    load_chunks: LoadChunksFn | None = None,
+    save_chunk: SaveChunkFn | None = None,
 ) -> dict:
     checkpoint = checkpoint or _noop_checkpoint
+    load_chunks = load_chunks or _noop_load
+    save_chunk = save_chunk or _noop_save
 
     async def stage(name: str, state: str, **extra) -> None:
         await emit({"type": "stage", "stage": name, "state": state, **extra})
@@ -284,7 +300,14 @@ async def run_review(
     # Total units of review work = batches × reviewers (progress denominator).
     total_units = max(1, len(batches) * max(1, len(roles.reviewers)))
     done_units = {"n": 0}
-    await stage("ai_review", "running", done=0, total=total_units)
+    # Resume: reload any reviewer batches already completed in a prior run so we
+    # skip them (no re-spend). Keyed by "<reviewer>#<batch_idx>".
+    reviewed_done = await load_chunks("review")
+    if reviewed_done:
+        await emit({"type": "log", "message":
+                    f"Resuming: {len(reviewed_done)} reviewer batches already "
+                    f"done — skipping them"})
+    await stage("ai_review", "running", done=len(reviewed_done), total=total_units)
 
     async def review_batch(
         reviewer: ModelRole, batch_idx: int, batch: dict,
@@ -300,11 +323,20 @@ async def run_review(
         results: list[list[dict]] = [[] for _ in batches]
 
         async def _do(i: int, batch: dict) -> None:
+            key = f"{reviewer.deployment}#{i}"
+            cached = reviewed_done.get(key)
+            if cached is not None:
+                results[i] = cached
+                done_units["n"] += 1
+                await stage("ai_review", "running",
+                            done=done_units["n"], total=total_units)
+                return
             # Cooperative control point: pause/skip/cancel before each batch.
             await checkpoint("ai_review")
             async with sem:
                 bf = await review_batch(reviewer, i, batch)
                 results[i] = bf
+                await save_chunk("review", key, bf)
                 done_units["n"] += 1
                 await stage("ai_review", "running",
                             done=done_units["n"], total=total_units)
@@ -344,9 +376,14 @@ async def run_review(
         # retry — salvaging adjudication instead of dumping raw findings.
         judge_batch_size = 30
         judge_total = (len(raw_findings) + judge_batch_size - 1) // judge_batch_size
-        await stage("ai_judge", "running", done=0, total=judge_total)
+        # Resume: skip judge chunks already adjudicated in a prior run.
+        judged_done = await load_chunks("judge")
+        if judged_done:
+            await emit({"type": "log", "message":
+                        f"Resuming: {len(judged_done)} judge chunks already done"})
+        await stage("ai_judge", "running", done=len(judged_done), total=judge_total)
         adjudicated: list[dict] = []
-        done_chunks = {"n": 0}
+        done_chunks = {"n": len(judged_done)}
 
         async def _adjudicate(chunk: list[dict], depth: int = 0) -> list[dict]:
             payload_findings = []
@@ -392,9 +429,16 @@ async def run_review(
                 return chunk
 
         for j_start in range(0, len(raw_findings), judge_batch_size):
+            key = str(j_start)
+            cached = judged_done.get(key)
+            if cached is not None:
+                adjudicated.extend(cached)
+                continue
             await checkpoint("ai_judge")
             j_chunk = raw_findings[j_start : j_start + judge_batch_size]
-            adjudicated.extend(await _adjudicate(j_chunk))
+            judged_chunk = await _adjudicate(j_chunk)
+            await save_chunk("judge", key, judged_chunk)
+            adjudicated.extend(judged_chunk)
             done_chunks["n"] += 1
             await stage("ai_judge", "running", done=done_chunks["n"], total=judge_total)
         await stage("ai_judge", "done", done=judge_total, total=judge_total)
@@ -408,6 +452,7 @@ async def run_review(
         await checkpoint("ai_exploit")
         adjudicated = await _run_exploit_phase(
             client, roles.exploit, adjudicated, read_file, emit, stage, checkpoint,
+            load_chunks, save_chunk,
         )
 
     findings = [_normalize(f, judged_by) for f in adjudicated]
@@ -587,6 +632,8 @@ async def _run_exploit_phase(
     emit: EmitFn,
     stage: Callable[..., Awaitable[None]] | None = None,
     checkpoint: CheckpointFn | None = None,
+    load_chunks: LoadChunksFn | None = None,
+    save_chunk: SaveChunkFn | None = None,
 ) -> list[dict]:
     """Enrich every non-dismissed finding with exploitation guidance.
 
@@ -617,15 +664,29 @@ async def _run_exploit_phase(
 
     # Give the model a window of real source around each finding so the PoC is
     # grounded in the actual code, not just the one-line snippet.
+    load_chunks = load_chunks or _noop_load
+    save_chunk = save_chunk or _noop_save
     enriched_by_id: dict[int, dict] = {}
     batch_size = 25
     exploit_total = (len(targets) + batch_size - 1) // batch_size
+    # Resume: reload exploit batches already written in a prior run.
+    exploit_done = await load_chunks("exploit")
+    if exploit_done:
+        await emit({"type": "log", "message":
+                    f"Resuming: {len(exploit_done)} exploit batches already done"})
     if stage:
-        await stage("ai_exploit", "running", done=0, total=exploit_total)
+        await stage("ai_exploit", "running", done=len(exploit_done), total=exploit_total)
     for start in range(0, len(targets), batch_size):
+        chunk = targets[start : start + batch_size]
+        key = str(start)
+        cached = exploit_done.get(key)
+        if cached is not None:
+            for offset, enrich in enumerate(cached):
+                if offset < len(chunk) and isinstance(enrich, dict):
+                    enriched_by_id[id(chunk[offset])] = enrich
+            continue
         if checkpoint:
             await checkpoint("ai_exploit")
-        chunk = targets[start : start + batch_size]
         payload_findings = []
         for f in chunk:
             entry = _slim(f)
@@ -659,6 +720,7 @@ async def _run_exploit_phase(
                                    f"{start // batch_size + 1} ({exc}); keeping findings"})
             produced = []
 
+        await save_chunk("exploit", key, produced)
         # Merge by position within the chunk (model preserves order).
         for offset, enrich in enumerate(produced):
             if offset < len(chunk) and isinstance(enrich, dict):

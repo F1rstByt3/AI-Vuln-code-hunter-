@@ -9,7 +9,10 @@ from __future__ import annotations
 import enum
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, Enum, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import (
+    JSON, Boolean, DateTime, Enum, Float, ForeignKey, Integer, String, Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -250,3 +253,25 @@ class AgentEvent(Base):
     type: Mapped[str] = mapped_column(String(30))  # status|log|token|finding|tool_call|question
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
     scan: Mapped[Scan] = relationship(back_populates="events")
+
+
+class ScanCheckpoint(Base):
+    """Durable, resumable checkpoint of completed AI-pipeline work units.
+
+    Each row holds the result of one finished unit — a reviewer batch, a judge
+    chunk, an exploit batch, or the pipeline's frozen inputs — keyed by
+    (scan_id, phase, chunk_key). On resume the worker reloads these and skips
+    any unit already present, so a crash/restart at batch 657 picks up where it
+    left off instead of paying for the whole reviewer phase again. Cleared on a
+    clean finish (and at the start of a fresh run)."""
+
+    __tablename__ = "scan_checkpoints"
+    __table_args__ = (
+        UniqueConstraint("scan_id", "phase", "chunk_key", name="uq_checkpoint_unit"),
+    )
+    scan_id: Mapped[str] = mapped_column(
+        ForeignKey("scans.id", ondelete="CASCADE"), index=True
+    )
+    phase: Mapped[str] = mapped_column(String(20))   # inputs | review | judge | exploit
+    chunk_key: Mapped[str] = mapped_column(String(200))
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)

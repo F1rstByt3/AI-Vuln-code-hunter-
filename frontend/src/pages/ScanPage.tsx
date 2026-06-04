@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { Button, Card, SeverityBadge, Spinner, StateBadge } from "../components/ui";
 import { useScanEvents } from "../hooks/useScanEvents";
@@ -14,11 +14,13 @@ export default function ScanPage() {
   const [chat, setChat] = useState<ChatMessage[]>([]);
   const [msg, setMsg] = useState("");
   const [sending, setSending] = useState(false);
+  const [resumeInfo, setResumeInfo] = useState<{ resumable: boolean; completed: Record<string, number> }>();
 
   const refresh = () => {
     if (!scanId) return;
     api.getScan(scanId).then(setScan).catch(() => {});
     api.listFindings(scanId).then(setFindings).catch(() => {});
+    api.scanResumable(scanId).then(setResumeInfo).catch(() => {});
   };
   useEffect(() => { refresh(); api.listChat(scanId!).then(setChat).catch(() => {}); }, [scanId]);
 
@@ -54,6 +56,11 @@ export default function ScanPage() {
   const control = async (action: "pause" | "resume" | "skip" | "cancel") => {
     if (!scanId) return;
     await api.controlScan(scanId, action).then(setScan).catch((e) => alert(String(e)));
+  };
+
+  const resume = async () => {
+    if (!scanId) return;
+    await api.resumeScan(scanId).then(setScan).catch((e) => alert(String(e)));
   };
 
   const busy = ["queued", "running"].includes(scan?.status || "");
@@ -110,6 +117,20 @@ export default function ScanPage() {
         </div>
       )}
 
+      {resumeInfo?.resumable && (
+        <div className="flex items-center gap-3 mb-4 p-3 rounded border border-amber-500/40 bg-amber-500/10 text-sm">
+          <span className="text-amber-300">⏸ This scan was interrupted with saved progress.</span>
+          <span className="flex-1 text-[11px] text-muted">
+            {[
+              resumeInfo.completed.review && `${resumeInfo.completed.review} reviewer batches`,
+              resumeInfo.completed.judge && `${resumeInfo.completed.judge} judge chunks`,
+              resumeInfo.completed.exploit && `${resumeInfo.completed.exploit} exploit batches`,
+            ].filter(Boolean).join(" · ")} already done
+          </span>
+          <Button variant="primary" onClick={resume}>▶ Resume from checkpoint</Button>
+        </div>
+      )}
+
       <div className="grid grid-cols-3 gap-6">
         <div className="col-span-2 space-y-6">
           {stageList.length > 0 && <PipelinePanel stages={stageList} paused={paused} />}
@@ -129,13 +150,7 @@ export default function ScanPage() {
             </div>
           </Card>
 
-          <div>
-            <h2 className="font-semibold mb-2">Findings ({findings.length})</h2>
-            <div className="space-y-2">
-              {findings.map((f) => <FindingRow key={f.id} f={f} onTriage={triage} />)}
-              {findings.length === 0 && <div className="text-muted text-sm">No findings yet.</div>}
-            </div>
-          </div>
+          <FindingsPanel findings={findings} onTriage={triage} />
 
           {scan?.summary?.endpoints?.length > 0 && (
             <EndpointsPanel endpoints={scan.summary.endpoints} />
@@ -145,6 +160,94 @@ export default function ScanPage() {
         <ChatPanel chat={chat} msg={msg} setMsg={setMsg} send={send} sending={sending} />
       </div>
     </div>
+  );
+}
+
+const SEV_RANK: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
+
+// Group findings the way Burp groups issues: by issue type (CWE → category →
+// normalized title), so 50 instances of the same SQLi collapse under one header.
+function groupKeyOf(f: Finding): string {
+  const base = f.cwe || f.category || f.title || "other";
+  return String(base).trim().toLowerCase();
+}
+function groupLabelOf(f: Finding): string {
+  return f.category || f.title || f.cwe || "Other";
+}
+
+function FindingsPanel({ findings, onTriage }: {
+  findings: Finding[]; onTriage: (id: string, s: string) => void;
+}) {
+  const [grouped, setGrouped] = useState(true);
+  const groups = useMemo(() => {
+    const m = new Map<string, Finding[]>();
+    for (const f of findings) {
+      const k = groupKeyOf(f);
+      const arr = m.get(k); if (arr) arr.push(f); else m.set(k, [f]);
+    }
+    // Most-severe group first; ties broken by instance count.
+    return [...m.entries()].sort((a, b) => {
+      const sa = Math.min(...a[1].map((f) => SEV_RANK[f.severity] ?? 9));
+      const sb = Math.min(...b[1].map((f) => SEV_RANK[f.severity] ?? 9));
+      return sa - sb || b[1].length - a[1].length;
+    });
+  }, [findings]);
+
+  return (
+    <div>
+      <div className="flex items-center mb-2">
+        <h2 className="font-semibold">Findings ({findings.length})</h2>
+        {findings.length > 0 && (
+          <span className="ml-2 text-xs text-muted">· {groups.length} issue types</span>
+        )}
+        <label className="ml-auto text-xs text-muted flex items-center gap-1.5 cursor-pointer select-none">
+          <input type="checkbox" checked={grouped} onChange={(e) => setGrouped(e.target.checked)} />
+          Group by type
+        </label>
+      </div>
+      {findings.length === 0 && <div className="text-muted text-sm">No findings yet.</div>}
+      <div className="space-y-2">
+        {grouped
+          ? groups.map(([key, items]) => (
+              <FindingGroup key={key} items={items} onTriage={onTriage} />
+            ))
+          : findings.map((f) => <FindingRow key={f.id} f={f} onTriage={onTriage} />)}
+      </div>
+    </div>
+  );
+}
+
+function FindingGroup({ items, onTriage }: {
+  items: Finding[]; onTriage: (id: string, s: string) => void;
+}) {
+  // A single instance needs no group chrome — render the row directly.
+  if (items.length === 1) return <FindingRow f={items[0]} onTriage={onTriage} />;
+  const [open, setOpen] = useState(false);
+  const top = items.reduce((a, b) =>
+    (SEV_RANK[a.severity] ?? 9) <= (SEV_RANK[b.severity] ?? 9) ? a : b);
+  const cwe = items.find((f) => f.cwe)?.cwe;
+  const confirmed = items.filter((f) => f.state === "confirmed").length;
+  return (
+    <Card className="p-0 overflow-hidden">
+      <div className="flex items-center gap-3 p-3 cursor-pointer hover:bg-border/30"
+        onClick={() => setOpen((o) => !o)}>
+        <span className="w-3 text-muted">{open ? "▾" : "▸"}</span>
+        <SeverityBadge severity={top.severity} />
+        <span className="flex-1 font-medium text-sm">{groupLabelOf(top)}</span>
+        {cwe && <span className="text-[11px] text-muted">{cwe}</span>}
+        {confirmed > 0 && (
+          <span className="text-[11px] text-emerald-400">{confirmed} confirmed</span>
+        )}
+        <span className="text-xs px-2 py-0.5 rounded-full bg-border/60 text-slate-200">
+          {items.length} instances
+        </span>
+      </div>
+      {open && (
+        <div className="px-3 pb-3 pt-2 space-y-2 border-t border-border">
+          {items.map((f) => <FindingRow key={f.id} f={f} onTriage={onTriage} />)}
+        </div>
+      )}
+    </Card>
   );
 }
 

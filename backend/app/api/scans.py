@@ -14,7 +14,11 @@ from app.auth import require_role
 from app.db import get_session
 from fastapi import HTTPException, status as http_status
 
-from app.models import Artifact, Finding, Project, Role, Scan, ScanStatus, Severity
+from sqlalchemy import func
+
+from app.models import (
+    Artifact, Finding, Project, Role, Scan, ScanCheckpoint, ScanStatus, Severity,
+)
 from app.schemas import FindingOut, ScanControl, ScanCreate, ScanOut, ScanRerun
 from app.worker import RERUNNABLE_STAGES
 
@@ -87,6 +91,46 @@ async def rerun_scan_stage(
 
     arq = await get_arq()
     await arq.enqueue_job("rerun_stage", scan.id, body.stage)
+    return scan
+
+
+@router.get("/scans/{scan_id}/resumable")
+async def scan_resumable(scan_id: str, session: AsyncSession = Depends(get_session)):
+    """Report whether an interrupted scan has durable checkpoints to resume from,
+    with a per-phase count of completed work units (reviewer batches, judge
+    chunks, exploit batches)."""
+    await get_or_404(session, Scan, scan_id)
+    rows = (await session.execute(
+        select(ScanCheckpoint.phase, func.count())
+        .where(ScanCheckpoint.scan_id == scan_id)
+        .group_by(ScanCheckpoint.phase)
+    )).all()
+    completed = {phase: int(n) for phase, n in rows}
+    work = {k: v for k, v in completed.items() if k != "inputs"}
+    return {"resumable": bool(work), "completed": completed}
+
+
+@router.post("/scans/{scan_id}/resume", response_model=ScanOut,
+             dependencies=[Depends(require_role(Role.reviewer))])
+async def resume_scan_endpoint(scan_id: str, session: AsyncSession = Depends(get_session)):
+    """Resume an interrupted scan's AI pipeline, skipping work units already
+    checkpointed to the DB (so a crash/Docker-stop mid-review doesn't re-spend)."""
+    scan = await get_or_404(session, Scan, scan_id)
+    has_ckpt = (await session.execute(
+        select(ScanCheckpoint.id).where(ScanCheckpoint.scan_id == scan_id).limit(1)
+    )).first() is not None
+    if not has_ckpt:
+        raise HTTPException(
+            http_status.HTTP_400_BAD_REQUEST,
+            "nothing to resume — no checkpoints saved for this scan",
+        )
+    scan.status = ScanStatus.queued
+    scan.error = None
+    await session.commit()
+    await session.refresh(scan)
+
+    arq = await get_arq()
+    await arq.enqueue_job("resume_scan", scan.id)
     return scan
 
 
