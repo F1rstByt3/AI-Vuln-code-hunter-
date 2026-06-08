@@ -142,15 +142,21 @@ services:
       SONAR_JDBC_URL: jdbc:postgresql://sonar-db:5432/sonar
       SONAR_JDBC_USERNAME: sonar
       SONAR_JDBC_PASSWORD: sonar
-      # Elasticsearch needs to resolve the container hostname
       SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"
+      SONAR_WEB_JAVAOPTS: "-Xmx1g"
+      SONAR_CE_JAVAOPTS: "-Xmx2g"
+      SONAR_SEARCH_JAVAOPTS: "-Xmx2g"
     ports: ["9090:9000"]
     volumes:
       - sonar_data:/opt/sonarqube/data
       - sonar_extensions:/opt/sonarqube/extensions
       - sonar_logs:/opt/sonarqube/logs
-    # SonarQube needs a higher mmap limit; on Linux hosts you may need:
-    #   sudo sysctl -w vm.max_map_count=262144
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/api/system/status | grep -q UP"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+      start_period: 120s
     depends_on:
       sonar-db: { condition: service_healthy }
 

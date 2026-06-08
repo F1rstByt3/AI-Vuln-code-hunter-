@@ -74,6 +74,7 @@ class SonarScanner:
         if not self.host or not self.token:
             return []
 
+        await self._wait_ready()
         project_key = f"hunter-{uuid.uuid4().hex[:12]}"
         await self._run_scanner(workdir, project_key)
         # The CE task analyses asynchronously; wait for it before querying issues.
@@ -84,8 +85,22 @@ class SonarScanner:
         await self._ensure_security_profile(project_key)
         return await self._fetch_issues(project_key)
 
+    async def _wait_ready(self, timeout_s: int = 180) -> None:
+        """Block until SonarQube reports UP, so we don't scan a half-booted server."""
+        deadline = asyncio.get_event_loop().time() + timeout_s
+        async with self._client() as client:
+            while asyncio.get_event_loop().time() < deadline:
+                try:
+                    resp = await client.get("/api/system/status", timeout=10)
+                    if resp.status_code == 200 and resp.json().get("status") == "UP":
+                        return
+                except Exception:
+                    pass
+                await asyncio.sleep(5)
+        logger.warning("SonarQube did not become ready in %ds; attempting scan anyway", timeout_s)
+
     # -- phase 1: upload + analyse -----------------------------------------
-    async def _run_scanner(self, workdir: str, project_key: str) -> None:
+    async def _run_scanner(self, workdir: str, project_key: str, retries: int = 2) -> None:
         cmd = [
             "sonar-scanner",
             f"-Dsonar.host.url={self.host}",
@@ -95,25 +110,29 @@ class SonarScanner:
             "-Dsonar.sources=.",
             "-Dsonar.scm.disabled=true",
             "-Dsonar.exclusions=**/node_modules/**,**/vendor/**,**/dist/**,**/build/**,**/*.min.js",
-            # Enable security hotspot reporting and ensure no files are
-            # silently excluded from security analysis.
             "-Dsonar.security.hotspots.report=true",
             "-Dsonar.issue.ignore.allfile=",
         ]
-        # The JS/TS analyzer needs Node. Its bundled Node binary can fail on
-        # ARM64; point it at the system Node we install in the image so JS/TS
-        # analysis doesn't abort the whole scan.
         node = shutil.which("node")
         if node:
             cmd.append(f"-Dsonar.nodejs.executable={node}")
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, cwd=workdir,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        _stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            tail = (stderr or b"").decode("utf-8", "replace")[-500:]
-            raise RuntimeError(f"sonar-scanner failed (rc={proc.returncode}): {tail}")
+        last_err = ""
+        for attempt in range(1 + retries):
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, cwd=workdir,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            _stdout, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                return
+            last_err = (stderr or b"").decode("utf-8", "replace")[-500:]
+            if attempt < retries:
+                wait = 10 * (attempt + 1)
+                logger.warning("sonar-scanner failed (rc=%d, attempt %d/%d); "
+                               "retrying in %ds", proc.returncode, attempt + 1,
+                               1 + retries, wait)
+                await asyncio.sleep(wait)
+        raise RuntimeError(f"sonar-scanner failed (rc={proc.returncode}): {last_err}")
 
     async def _await_analysis(self, project_key: str, timeout_s: int = 300) -> None:
         """Poll the most recent CE task for this project until it completes."""
