@@ -669,22 +669,29 @@ async def _run_exploit_phase(
     enriched_by_id: dict[int, dict] = {}
     batch_size = 25
     exploit_total = (len(targets) + batch_size - 1) // batch_size
-    # Resume: reload exploit batches already written in a prior run.
     exploit_done = await load_chunks("exploit")
     if exploit_done:
         await emit({"type": "log", "message":
                     f"Resuming: {len(exploit_done)} exploit batches already done"})
+    done_batches = {"n": len(exploit_done)}
     if stage:
-        await stage("ai_exploit", "running", done=len(exploit_done), total=exploit_total)
+        await stage("ai_exploit", "running", done=done_batches["n"], total=exploit_total)
+
+    # Build list of (start_index, chunk) tuples for all batches.
+    all_chunks: list[tuple[int, list[dict]]] = []
     for start in range(0, len(targets), batch_size):
-        chunk = targets[start : start + batch_size]
+        all_chunks.append((start, targets[start : start + batch_size]))
+
+    sem = asyncio.Semaphore(settings.ai_batch_concurrency or _BATCH_CONCURRENCY)
+
+    async def _do_exploit_batch(start: int, chunk: list[dict]) -> None:
         key = str(start)
         cached = exploit_done.get(key)
         if cached is not None:
             for offset, enrich in enumerate(cached):
                 if offset < len(chunk) and isinstance(enrich, dict):
                     enriched_by_id[id(chunk[offset])] = enrich
-            continue
+            return
         if checkpoint:
             await checkpoint("ai_exploit")
         payload_findings = []
@@ -706,28 +713,46 @@ async def _run_exploit_phase(
                 + json.dumps({"findings": payload_findings}) + "<<END>>"
             )},
         ]
-        try:
-            result = await client.complete_json(
-                msgs, model=exploit.deployment,
-                transport=exploit.effective_transport(),
-                reasoning_effort=exploit.reasoning_effort,
-                cache_key="hunter-exploit",
-            )
-            produced = result.get("findings", []) or []
-        except Exception as exc:  # noqa: BLE001
-            await emit({"type": "log",
-                        "message": f"Exploit analyst failed on batch "
-                                   f"{start // batch_size + 1} ({exc}); keeping findings"})
-            produced = []
+        async with sem:
+            try:
+                result = await asyncio.wait_for(
+                    client.complete_json(
+                        msgs, model=exploit.deployment,
+                        transport=exploit.effective_transport(),
+                        reasoning_effort=exploit.reasoning_effort,
+                        cache_key="hunter-exploit",
+                    ),
+                    timeout=300,
+                )
+                produced = result.get("findings", []) or []
+            except asyncio.TimeoutError:
+                await emit({"type": "log",
+                            "message": f"Exploit batch {start // batch_size + 1} "
+                                       f"timed out (300s); skipping"})
+                produced = []
+            except Exception as exc:  # noqa: BLE001
+                await emit({"type": "log",
+                            "message": f"Exploit analyst failed on batch "
+                                       f"{start // batch_size + 1} ({exc}); keeping findings"})
+                produced = []
 
         await save_chunk("exploit", key, produced)
-        # Merge by position within the chunk (model preserves order).
         for offset, enrich in enumerate(produced):
             if offset < len(chunk) and isinstance(enrich, dict):
                 enriched_by_id[id(chunk[offset])] = enrich
+        done_batches["n"] += 1
         if stage:
             await stage("ai_exploit", "running",
-                        done=start // batch_size + 1, total=exploit_total)
+                        done=done_batches["n"], total=exploit_total)
+
+    tasks = [asyncio.create_task(_do_exploit_batch(s, c)) for s, c in all_chunks]
+    try:
+        await asyncio.gather(*tasks)
+    except ScanControlSignal:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        raise
 
     if stage:
         await stage("ai_exploit", "done", done=exploit_total, total=exploit_total)
