@@ -197,6 +197,11 @@ class SonarScanner:
                     logger.warning("SonarQube issues API rejected all type "
                                    "combinations; skipping issues")
                     break
+            if resp.status_code == 400 and page > 1:
+                logger.info("SonarQube issues API returned 400 at page %d "
+                            "(10K cap); stopping pagination with %d issues",
+                            page, len(candidates))
+                break
             resp.raise_for_status()
             data = resp.json()
             for issue in data.get("issues", []):
