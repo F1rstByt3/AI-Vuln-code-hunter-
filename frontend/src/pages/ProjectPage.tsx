@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import JSZip from "jszip";
 import FileTree from "../components/FileTree";
 import { Button, Card, Input, Spinner } from "../components/ui";
 import { api } from "../lib/api";
@@ -50,6 +51,8 @@ export default function ProjectPage() {
       .finally(() => setLoadingFiles(false));
   }, [artifactId]);
 
+  const folderRef = useRef<HTMLInputElement>(null);
+
   const onUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files?.length || !projectId) return;
@@ -58,8 +61,32 @@ export default function ProjectPage() {
       for (let i = 0; i < total; i++) {
         const file = files[i];
         setProgress(`Uploading ${file.name} (${i + 1}/${total})…`);
-        await api.uploadFile(projectId, file, () => {});
+        await api.uploadFile(projectId, file, (pct) =>
+          setProgress(`Uploading ${file.name} (${i + 1}/${total})… ${pct}%`));
       }
+      await reload();
+    } catch (e) { setErr(String(e)); }
+    finally { setProgress(null); e.target.value = ""; }
+  };
+
+  const onFolderUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files?.length || !projectId) return;
+    try {
+      setProgress(`Zipping ${files.length} files from folder…`);
+      const zip = new JSZip();
+      for (let i = 0; i < files.length; i++) {
+        const f = files[i];
+        const path = (f as any).webkitRelativePath || f.name;
+        zip.file(path, f);
+      }
+      const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE" });
+      const firstPath = (files[0] as any).webkitRelativePath || "";
+      const folderName = firstPath.split("/")[0] || "folder";
+      const zipFile = new File([blob], `${folderName}.zip`, { type: "application/zip" });
+      setProgress(`Uploading ${zipFile.name} (${(zipFile.size / 1024 / 1024).toFixed(1)} MB)…`);
+      await api.uploadFile(projectId, zipFile, (pct) =>
+        setProgress(`Uploading ${zipFile.name}… ${pct}%`));
       await reload();
     } catch (e) { setErr(String(e)); }
     finally { setProgress(null); e.target.value = ""; }
@@ -100,11 +127,22 @@ export default function ProjectPage() {
       <div className="grid grid-cols-2 gap-6 mt-6">
         <Card className="p-4">
           <h2 className="font-semibold mb-3">Code (artifacts)</h2>
-          <label className="block mb-3">
-            <span className="text-sm text-muted">Upload archives / files (resumable, 10GB+)</span>
-            <input type="file" multiple onChange={onUpload} className="block mt-1 text-sm" />
+          <div className="mb-3">
+            <span className="text-sm text-muted block mb-1">Upload archives / files (resumable, 10GB+)</span>
+            <div className="flex gap-2 items-center">
+              <label className="px-3 py-1.5 rounded-md text-sm font-medium bg-emerald-600 hover:bg-emerald-700 cursor-pointer transition">
+                Files
+                <input type="file" multiple onChange={onUpload} className="hidden" />
+              </label>
+              <label className="px-3 py-1.5 rounded-md text-sm font-medium bg-border hover:bg-border/80 cursor-pointer transition">
+                Folder
+                <input ref={folderRef} type="file" onChange={onFolderUpload} className="hidden"
+                  {...{ webkitdirectory: "", directory: "" } as any} />
+              </label>
+              <span className="text-[11px] text-muted">zip, tar.gz, or select a folder</span>
+            </div>
             {progress !== null && <div className="text-xs text-emerald-400 mt-1">{progress}</div>}
-          </label>
+          </div>
           <div className="flex gap-2 mb-4">
             <Input placeholder="git url#ref" value={gitUrl} onChange={(e) => setGitUrl(e.target.value)} />
             <Button variant="ghost" onClick={addGit}>Link git</Button>

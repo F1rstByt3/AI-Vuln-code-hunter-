@@ -71,6 +71,24 @@ _LANG_BY_EXT = {
 _ARCHIVE_EXTS = (".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2")
 
 
+def _is_archive(path: str) -> bool:
+    """Detect archives by extension AND by content (magic bytes)."""
+    if path.lower().endswith(_ARCHIVE_EXTS):
+        return True
+    try:
+        with open(path, "rb") as f:
+            header = f.read(8)
+        if header[:4] == b"PK\x03\x04":
+            return True
+        if header[:6] in (b"7z\xbc\xaf\x27\x1c",):
+            return True
+        if tarfile.is_tarfile(path):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 @dataclass
 class FileEntry:
     path: str
@@ -115,7 +133,7 @@ async def materialize(artifact, storage: ObjectStorage) -> str:
 
     dest = os.path.join(workdir, "src")
     os.makedirs(dest, exist_ok=True)
-    if raw_name.lower().endswith(_ARCHIVE_EXTS):
+    if _is_archive(raw_path):
         _safe_extract(raw_path, dest)
     else:
         os.replace(raw_path, os.path.join(dest, raw_name))
