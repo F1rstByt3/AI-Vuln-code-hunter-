@@ -1615,9 +1615,9 @@ rules:
   - id: hunter.modern.prototype-pollution-dynamic
     patterns:
       - pattern: $OBJ[$KEY1][$KEY2] = $VAL
-      - metavariable-pattern:
+      - metavariable-regex:
           metavariable: $KEY1
-          pattern-not: "..."
+          regex: "^(?!\").*"
     message: >
       Dynamic nested property assignment with potentially user-controlled keys.
       If the keys come from user input, an attacker can set __proto__
