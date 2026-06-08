@@ -158,24 +158,81 @@ class SonarScanner:
     # -- phase 2: pull issues ----------------------------------------------
     async def _fetch_issues(self, project_key: str) -> list[Candidate]:
         candidates: list[Candidate] = []
-        page = 1
         async with self._client() as client:
+            # Fetch standard issues (VULNERABILITY, BUG, CODE_SMELL).
+            # Newer SonarQube versions don't accept SECURITY_HOTSPOT here.
+            candidates.extend(await self._fetch_paged_issues(client, project_key))
+            # Fetch security hotspots via the dedicated endpoint.
+            candidates.extend(await self._fetch_hotspots(client, project_key))
+        return candidates
+
+    async def _fetch_paged_issues(
+        self, client: httpx.AsyncClient, project_key: str,
+    ) -> list[Candidate]:
+        candidates: list[Candidate] = []
+        page = 1
+        # Try the newer issue types first; fall back to legacy if 400.
+        types_options = [
+            "VULNERABILITY,BUG,CODE_SMELL",
+            "VULNERABILITY,BUG",
+            "VULNERABILITY",
+        ]
+        chosen_types = types_options[0]
+        while True:
+            resp = await client.get("/api/issues/search", params={
+                "componentKeys": project_key,
+                "resolved": "false",
+                "types": chosen_types,
+                "ps": 500,
+                "p": page,
+            })
+            if resp.status_code == 400 and page == 1 and types_options:
+                types_options.pop(0)
+                if types_options:
+                    chosen_types = types_options[0]
+                    logger.warning("SonarQube issues API rejected types=%s; "
+                                   "trying %s", chosen_types, types_options[0])
+                    continue
+                else:
+                    logger.warning("SonarQube issues API rejected all type "
+                                   "combinations; skipping issues")
+                    break
+            resp.raise_for_status()
+            data = resp.json()
+            for issue in data.get("issues", []):
+                candidates.append(self._to_candidate(issue, project_key))
+            total = data.get("total", 0)
+            if page * 500 >= total or not data.get("issues"):
+                break
+            page += 1
+        return candidates
+
+    async def _fetch_hotspots(
+        self, client: httpx.AsyncClient, project_key: str,
+    ) -> list[Candidate]:
+        """Fetch security hotspots via the dedicated /api/hotspots/search endpoint."""
+        candidates: list[Candidate] = []
+        page = 1
+        try:
             while True:
-                resp = await client.get("/api/issues/search", params={
-                    "componentKeys": project_key,
-                    "resolved": "false",
-                    "types": "VULNERABILITY,BUG,CODE_SMELL,SECURITY_HOTSPOT",
+                resp = await client.get("/api/hotspots/search", params={
+                    "projectKey": project_key,
                     "ps": 500,
                     "p": page,
                 })
+                if resp.status_code == 404:
+                    break
                 resp.raise_for_status()
                 data = resp.json()
-                for issue in data.get("issues", []):
-                    candidates.append(self._to_candidate(issue, project_key))
-                total = data.get("total", 0)
-                if page * 500 >= total or not data.get("issues"):
+                for hotspot in data.get("hotspots", []):
+                    candidates.append(self._hotspot_to_candidate(hotspot, project_key))
+                paging = data.get("paging", {})
+                total = paging.get("total", 0)
+                if page * 500 >= total or not data.get("hotspots"):
                     break
                 page += 1
+        except Exception as exc:
+            logger.warning("Failed to fetch hotspots for %s: %s", project_key, exc)
         return candidates
 
     # -- security quality-profile management ---------------------------------
@@ -347,6 +404,27 @@ class SonarScanner:
                 exc_info=True,
             )
             return None
+
+    def _hotspot_to_candidate(self, hotspot: dict, project_key: str) -> Candidate:
+        component = hotspot.get("component", "")
+        rel = component.split(":", 1)[1] if ":" in component else component
+        vuln_prob = hotspot.get("vulnerabilityProbability", "MEDIUM")
+        sev_map = {"HIGH": "high", "MEDIUM": "medium", "LOW": "low"}
+        line = hotspot.get("line")
+        return Candidate(
+            source="sonarqube",
+            rule=hotspot.get("ruleKey", hotspot.get("key", "")),
+            title=(hotspot.get("message") or "Security Hotspot")[:200],
+            message=hotspot.get("message", ""),
+            severity=sev_map.get(vuln_prob, "medium"),
+            cwe=None,
+            owasp=None,
+            category="security_hotspot",
+            file_path=rel,
+            line_start=line,
+            line_end=line,
+            code_snippet=None,
+        )
 
     def _to_candidate(self, issue: dict, project_key: str) -> Candidate:
         sev = _SEV_MAP.get(issue.get("severity", "MAJOR"), "medium")

@@ -6,11 +6,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 
 from app.config import settings
 from app.scanners.base import Candidate
+
+logger = logging.getLogger(__name__)
 
 _SEV_MAP = {"ERROR": "high", "WARNING": "medium", "INFO": "low"}
 _EXCLUDES = ["node_modules", "vendor", ".git", "dist", "build", "*.min.js", "*.lock"]
@@ -46,14 +49,27 @@ class SemgrepScanner:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _stderr = await proc.communicate()
+        stdout, stderr = await proc.communicate()
+        stderr_text = (stderr or b"").decode("utf-8", "replace").strip()
+        if stderr_text:
+            logger.info("semgrep stderr (rc=%d): %s", proc.returncode,
+                        stderr_text[-1000:])
         if not stdout:
+            logger.warning("semgrep returned no stdout (rc=%d)", proc.returncode)
             return []
         try:
             data = json.loads(stdout)
         except json.JSONDecodeError:
+            logger.warning("semgrep returned invalid JSON (rc=%d)", proc.returncode)
             return []
-        return [self._to_candidate(r, workdir) for r in data.get("results", [])]
+        results = data.get("results", [])
+        errors = data.get("errors", [])
+        if errors:
+            logger.warning("semgrep reported %d errors: %s", len(errors),
+                           json.dumps(errors[:3])[:500])
+        logger.info("semgrep: %d results, %d errors, rc=%d",
+                    len(results), len(errors), proc.returncode)
+        return [self._to_candidate(r, workdir) for r in results]
 
     def _to_candidate(self, r: dict, workdir: str) -> Candidate:
         extra = r.get("extra", {})
