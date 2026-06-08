@@ -11,6 +11,7 @@ Built for big inputs:
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import tarfile
 import zipfile
@@ -18,6 +19,8 @@ from dataclasses import dataclass, field
 
 from app.config import settings
 from app.storage import ObjectStorage
+
+logger = logging.getLogger(__name__)
 
 WORKROOT = os.environ.get("SCAN_WORKDIR", "/scan-workdir")
 
@@ -133,8 +136,17 @@ async def materialize(artifact, storage: ObjectStorage) -> str:
 
     dest = os.path.join(workdir, "src")
     os.makedirs(dest, exist_ok=True)
-    if _is_archive(raw_path):
+    raw_size = os.path.getsize(raw_path)
+    is_arch = _is_archive(raw_path)
+    logger.info("materialize: raw=%s size=%d archive=%s dest=%s",
+                raw_name, raw_size, is_arch, dest)
+    if is_arch:
         _safe_extract(raw_path, dest)
+        extracted = sum(1 for _, _, fs in os.walk(dest) for _ in fs)
+        logger.info("materialize: extracted %d files into %s", extracted, dest)
+        if extracted == 0:
+            logger.warning("materialize: archive extracted 0 files! "
+                           "raw_path=%s raw_size=%d", raw_path, raw_size)
     else:
         os.replace(raw_path, os.path.join(dest, raw_name))
     return dest

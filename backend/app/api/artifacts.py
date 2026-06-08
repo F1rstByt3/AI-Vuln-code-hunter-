@@ -78,6 +78,7 @@ async def init_upload(
         raise HTTPException(413, "file exceeds max upload size")
     artifact = Artifact(
         project_id=project_id, kind=ArtifactKind.upload, label=body.filename,
+        size_bytes=body.size_bytes,
         meta={"filename": body.filename, "declared_size": body.size_bytes},
     )
     artifact.storage_key = f"artifacts/{project_id}/{artifact.id}/{body.filename}"

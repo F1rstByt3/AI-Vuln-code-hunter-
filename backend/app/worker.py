@@ -445,7 +445,14 @@ async def _ingest(session, artifact: Artifact, emit) -> str:
 
     storage = get_storage()
     workdir = await materialize(artifact, storage)
+    await emit({"type": "log", "message":
+                f"Materialized to {workdir} "
+                f"(kind={artifact.kind.value}, "
+                f"file={artifact.meta.get('filename', '?')})"})
     result = index_files(workdir)
+    if not result.files:
+        await emit({"type": "log", "message":
+                    f"WARNING: index_files found 0 files in {workdir}"})
 
     # delete old file index (explicit query — no lazy loading in async)
     old_files = (await session.execute(

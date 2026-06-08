@@ -152,7 +152,12 @@ export default function ProjectPage() {
               <label key={a.id} className="flex items-center gap-2 px-2 py-1 rounded hover:bg-border text-sm">
                 <input type="radio" name="artifact" checked={artifactId === a.id} onChange={() => setArtifactId(a.id)} />
                 <span className="flex-1 truncate">{a.label || a.source_ref || a.id}</span>
-                <span className="text-xs text-muted">{a.kind} · {a.analyzable_count || 0} files</span>
+                <span className="text-xs text-muted">
+                  {a.kind}
+                  {a.status === "pending" ? " · ready to scan" :
+                   a.status === "ingesting" ? " · indexing…" :
+                   ` · ${a.analyzable_count || 0} files`}
+                </span>
               </label>
             ))}
             {artifacts.length === 0 && <div className="text-muted text-sm">No code yet.</div>}
