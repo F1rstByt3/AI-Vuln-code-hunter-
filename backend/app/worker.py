@@ -405,27 +405,7 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
                     """Persist AI findings to the DB as they arrive."""
                     async with emit_lock:
                         for f in batch:
-                            session.add(Finding(
-                                scan_id=scan.id,
-                                title=f["title"],
-                                description=f.get("description", ""),
-                                severity=Severity(f["severity"]),
-                                confidence=f.get("confidence", 0.5),
-                                source=FindingSource(f.get("source", "ai")),
-                                state=FindingState(f.get("state", "proposed")),
-                                cwe=f.get("cwe"),
-                                owasp=f.get("owasp"),
-                                category=f.get("category"),
-                                file_path=f.get("file_path"),
-                                line_start=f.get("line_start"),
-                                line_end=f.get("line_end"),
-                                code_snippet=f.get("code_snippet"),
-                                remediation=f.get("recommendation") or f.get("remediation"),
-                                human_question=f.get("human_question"),
-                                triage_note=f.get("triage_note"),
-                                triaged_by=f.get("triaged_by"),
-                                raw=f,
-                            ))
+                            session.add(_finding_from_dict(scan.id, f))
                         await session.commit()
 
                 try:
@@ -461,6 +441,7 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
                                    [_candidate_to_finding(c) for c in candidates]),
                                 "endpoints": endpoints}, False)
         except ScanCanceledSignal:
+            await session.rollback()
             scan.status = ScanStatus.canceled
             scan.summary = {**(scan.summary or {}), "stages": stages.snapshot(),
                             "tokens": tokens["v"]}
@@ -468,6 +449,7 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
             await session.commit()
             await emit({"type": "canceled", "status": "canceled"})
         except Exception as exc:  # noqa: BLE001
+            await session.rollback()
             scan.status = ScanStatus.failed
             scan.error = str(exc)[:2000]
             scan.summary = {**(scan.summary or {}), "stages": stages.snapshot(),
@@ -614,31 +596,39 @@ def _dedup_candidates(candidates: list[dict]) -> list[dict]:
     return list(seen.values())
 
 
+def _trunc(val: str | None, maxlen: int) -> str | None:
+    if val and len(val) > maxlen:
+        return val[:maxlen]
+    return val
+
+
+def _finding_from_dict(scan_id: str, f: dict) -> Finding:
+    return Finding(
+        scan_id=scan_id,
+        title=_trunc(f.get("title") or "Untitled finding", 300),
+        description=f.get("description", ""),
+        severity=Severity(f.get("severity", "medium")),
+        confidence=f.get("confidence", 0.5),
+        source=FindingSource(f.get("source", "ai")),
+        state=FindingState(f.get("state", "proposed")),
+        cwe=_trunc(f.get("cwe"), 200),
+        owasp=_trunc(f.get("owasp"), 200),
+        category=_trunc(f.get("category"), 200),
+        file_path=_trunc(f.get("file_path"), 1024),
+        line_start=f.get("line_start"),
+        line_end=f.get("line_end"),
+        code_snippet=f.get("code_snippet"),
+        remediation=f.get("recommendation") or f.get("remediation"),
+        human_question=f.get("human_question"),
+        triage_note=f.get("triage_note"),
+        triaged_by=f.get("triaged_by"),
+        raw=f,
+    )
+
+
 async def _persist_findings(session, scan: Scan, findings: list[dict]) -> None:
     for f in findings:
-        session.add(Finding(
-            scan_id=scan.id,
-            title=f["title"],
-            description=f.get("description", ""),
-            severity=Severity(f["severity"]),
-            confidence=f.get("confidence", 0.5),
-            source=FindingSource(f.get("source", "ai")),
-            state=FindingState(f.get("state", "proposed")),
-            cwe=f.get("cwe"),
-            owasp=f.get("owasp"),
-            category=f.get("category"),
-            file_path=f.get("file_path"),
-            line_start=f.get("line_start"),
-            line_end=f.get("line_end"),
-            code_snippet=f.get("code_snippet"),
-            # Prefer the exploit analyst's specific recommendation; fall back to
-            # the reviewer's terser remediation. Full PoC/risk live in raw.
-            remediation=f.get("recommendation") or f.get("remediation"),
-            human_question=f.get("human_question"),
-            triage_note=f.get("triage_note"),
-            triaged_by=f.get("triaged_by"),
-            raw=f,
-        ))
+        session.add(_finding_from_dict(scan.id, f))
     await session.commit()
 
 
@@ -816,27 +806,7 @@ async def rerun_stage(ctx: dict, scan_id: str, stage: str, resume: bool = False)
                 async def _on_findings_rerun(_phase: str, batch: list[dict]) -> None:
                     async with emit_lock:
                         for f in batch:
-                            session.add(Finding(
-                                scan_id=scan.id,
-                                title=f["title"],
-                                description=f.get("description", ""),
-                                severity=Severity(f["severity"]),
-                                confidence=f.get("confidence", 0.5),
-                                source=FindingSource(f.get("source", "ai")),
-                                state=FindingState(f.get("state", "proposed")),
-                                cwe=f.get("cwe"),
-                                owasp=f.get("owasp"),
-                                category=f.get("category"),
-                                file_path=f.get("file_path"),
-                                line_start=f.get("line_start"),
-                                line_end=f.get("line_end"),
-                                code_snippet=f.get("code_snippet"),
-                                remediation=f.get("recommendation") or f.get("remediation"),
-                                human_question=f.get("human_question"),
-                                triage_note=f.get("triage_note"),
-                                triaged_by=f.get("triaged_by"),
-                                raw=f,
-                            ))
+                            session.add(_finding_from_dict(scan.id, f))
                         await session.commit()
 
                 result = await _ai_review(session, scan, artifact, workdir, candidates, emit,

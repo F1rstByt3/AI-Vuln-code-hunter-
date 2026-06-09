@@ -189,9 +189,9 @@ class Finding(Base):
         Enum(FindingState), default=FindingState.proposed, index=True
     )
 
-    cwe: Mapped[str | None] = mapped_column(String(40))     # e.g. CWE-89
-    owasp: Mapped[str | None] = mapped_column(String(40))   # e.g. A03:2021
-    category: Mapped[str | None] = mapped_column(String(120))
+    cwe: Mapped[str | None] = mapped_column(String(200))
+    owasp: Mapped[str | None] = mapped_column(String(200))
+    category: Mapped[str | None] = mapped_column(String(200))
 
     file_path: Mapped[str | None] = mapped_column(String(1024))
     line_start: Mapped[int | None] = mapped_column(Integer)

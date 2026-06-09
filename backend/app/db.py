@@ -6,7 +6,7 @@ import uuid
 from collections.abc import AsyncGenerator
 from datetime import datetime
 
-from sqlalchemy import DateTime, func
+from sqlalchemy import DateTime, func, text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -38,3 +38,8 @@ async def init_models() -> None:
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Widen columns that were too narrow in earlier schema versions.
+        for col in ("cwe", "owasp", "category"):
+            await conn.execute(
+                sa_text(f"ALTER TABLE findings ALTER COLUMN {col} TYPE varchar(200)")
+            )
