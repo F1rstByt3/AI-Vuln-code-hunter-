@@ -30,6 +30,12 @@ export interface Finding {
     risk?: string; recommendation?: string; exploited_by?: string;
   } & Record<string, any>;
 }
+export interface FindingCode {
+  file_path?: string; line_start?: number; line_end?: number;
+  available: boolean; start_line: number;
+  lines: { n: number; text: string }[];
+  snippet?: string;
+}
 export interface McpServer {
   id: string; project_id?: string; name: string; kind: string; transport: string;
   url?: string; enabled: boolean;

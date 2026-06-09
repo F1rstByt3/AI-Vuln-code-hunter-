@@ -3,7 +3,7 @@ import { useNavigate, useParams } from "react-router-dom";
 import { Button, Card, SeverityBadge, Spinner, StateBadge } from "../components/ui";
 import { useScanEvents } from "../hooks/useScanEvents";
 import { api } from "../lib/api";
-import type { ChatMessage, Endpoint, Finding, Scan, StageInfo, TokenUsage } from "../lib/types";
+import type { ChatMessage, Endpoint, Finding, FindingCode, Scan, StageInfo, TokenUsage } from "../lib/types";
 
 export default function ScanPage() {
   const { scanId } = useParams();
@@ -184,13 +184,41 @@ function groupLabelOf(f: Finding): string {
   return f.category || f.title || f.cwe || "Other";
 }
 
+// Map a finding's raw source to one of the three buckets we surface as tabs.
+type SourceBucket = "all" | "semgrep" | "sonarqube" | "ai";
+function bucketOf(f: Finding): Exclude<SourceBucket, "all"> {
+  if (f.source === "semgrep") return "semgrep";
+  if (f.source === "sonarqube") return "sonarqube";
+  return "ai"; // "ai" + "correlated"
+}
+
+const SOURCE_TABS: { key: SourceBucket; label: string }[] = [
+  { key: "all", label: "All" },
+  { key: "semgrep", label: "Semgrep" },
+  { key: "sonarqube", label: "SonarQube" },
+  { key: "ai", label: "AI" },
+];
+
 function FindingsPanel({ findings, onTriage }: {
   findings: Finding[]; onTriage: (id: string, s: string) => void;
 }) {
   const [grouped, setGrouped] = useState(true);
+  const [tab, setTab] = useState<SourceBucket>("all");
+
+  const counts = useMemo(() => {
+    const c = { all: findings.length, semgrep: 0, sonarqube: 0, ai: 0 };
+    for (const f of findings) c[bucketOf(f)]++;
+    return c as Record<SourceBucket, number>;
+  }, [findings]);
+
+  const visible = useMemo(
+    () => (tab === "all" ? findings : findings.filter((f) => bucketOf(f) === tab)),
+    [findings, tab],
+  );
+
   const groups = useMemo(() => {
     const m = new Map<string, Finding[]>();
-    for (const f of findings) {
+    for (const f of visible) {
       const k = groupKeyOf(f);
       const arr = m.get(k); if (arr) arr.push(f); else m.set(k, [f]);
     }
@@ -200,13 +228,13 @@ function FindingsPanel({ findings, onTriage }: {
       const sb = Math.min(...b[1].map((f) => SEV_RANK[f.severity] ?? 9));
       return sa - sb || b[1].length - a[1].length;
     });
-  }, [findings]);
+  }, [visible]);
 
   return (
     <div>
       <div className="flex items-center mb-2">
         <h2 className="font-semibold">Findings ({findings.length})</h2>
-        {findings.length > 0 && (
+        {visible.length > 0 && (
           <span className="ml-2 text-xs text-muted">· {groups.length} issue types</span>
         )}
         <label className="ml-auto text-xs text-muted flex items-center gap-1.5 cursor-pointer select-none">
@@ -214,13 +242,32 @@ function FindingsPanel({ findings, onTriage }: {
           Group by type
         </label>
       </div>
-      {findings.length === 0 && <div className="text-muted text-sm">No findings yet.</div>}
+      {/* Source split: Semgrep / SonarQube / AI (with a combined "All"). */}
+      <div className="flex gap-1 mb-3 border-b border-border">
+        {SOURCE_TABS.map((t) => (
+          <button key={t.key} onClick={() => setTab(t.key)}
+            className={`px-3 py-1.5 text-xs -mb-px border-b-2 transition-colors ${
+              tab === t.key
+                ? "border-accent text-slate-100 font-medium"
+                : "border-transparent text-muted hover:text-slate-300"}`}>
+            {t.label}
+            <span className="ml-1.5 px-1.5 py-0.5 rounded-full bg-border/60 tabular-nums">
+              {counts[t.key]}
+            </span>
+          </button>
+        ))}
+      </div>
+      {visible.length === 0 && (
+        <div className="text-muted text-sm">
+          {findings.length === 0 ? "No findings yet." : "No findings from this source."}
+        </div>
+      )}
       <div className="space-y-2">
         {grouped
           ? groups.map(([key, items]) => (
               <FindingGroup key={key} items={items} onTriage={onTriage} />
             ))
-          : findings.map((f) => <FindingRow key={f.id} f={f} onTriage={onTriage} />)}
+          : visible.map((f) => <FindingRow key={f.id} f={f} onTriage={onTriage} />)}
       </div>
     </div>
   );
@@ -260,13 +307,41 @@ function FindingGroup({ items, onTriage }: {
   );
 }
 
+const SOURCE_STYLE: Record<string, string> = {
+  semgrep: "bg-violet-500/20 text-violet-300",
+  sonarqube: "bg-cyan-500/20 text-cyan-300",
+  ai: "bg-emerald-500/20 text-emerald-300",
+  correlated: "bg-amber-500/20 text-amber-300",
+};
+
 function FindingRow({ f, onTriage }: { f: Finding; onTriage: (id: string, s: string) => void }) {
   const [open, setOpen] = useState(false);
+  const [code, setCode] = useState<FindingCode | null>(null);
+  const [showCode, setShowCode] = useState(false);
+  const [analysis, setAnalysis] = useState<string | undefined>(f.raw?.ai_analysis);
+  const [analyzing, setAnalyzing] = useState(false);
+
+  const toggleCode = async () => {
+    setShowCode((s) => !s);
+    if (!code && f.file_path) {
+      try { setCode(await api.getFindingCode(f.id)); } catch { /* ignore */ }
+    }
+  };
+  const runAnalysis = async () => {
+    setAnalyzing(true);
+    try { setAnalysis((await api.analyzeFinding(f.id)).analysis); }
+    catch (e) { setAnalysis(`Analysis failed: ${String(e)}`); }
+    finally { setAnalyzing(false); }
+  };
+
   return (
     <Card className="p-3">
       <div className="flex items-center gap-3 cursor-pointer" onClick={() => setOpen((o) => !o)}>
         <SeverityBadge severity={f.severity} />
         <span className="flex-1 font-medium text-sm">{f.title}</span>
+        <span className={`text-[10px] uppercase px-1.5 py-0.5 rounded ${SOURCE_STYLE[f.source] || "bg-border/60 text-slate-300"}`}>
+          {f.source}
+        </span>
         {f.cwe && <span className="text-[11px] text-muted">{f.cwe}</span>}
         <StateBadge state={f.state} />
       </div>
@@ -280,7 +355,32 @@ function FindingRow({ f, onTriage }: { f: Finding; onTriage: (id: string, s: str
         <div className="mt-3 text-sm space-y-2">
           <p className="text-slate-300">{f.description}</p>
           {f.triage_note && <p className="text-xs text-amber-300/90">⚖ {f.triage_note}</p>}
-          {f.code_snippet && <pre className="text-xs bg-bg border border-border rounded p-2 overflow-auto">{f.code_snippet}</pre>}
+
+          {/* Code view + AI analysis controls */}
+          <div className="flex gap-2">
+            {f.file_path && (
+              <Button variant="ghost" onClick={toggleCode}>
+                {showCode ? "Hide code" : "View code"}
+              </Button>
+            )}
+            <Button variant="ghost" onClick={runAnalysis} disabled={analyzing}>
+              {analyzing ? "Analyzing…" : analysis ? "↻ Re-analyze" : "✨ AI analysis"}
+            </Button>
+          </div>
+
+          {showCode && (
+            <CodeView code={code} highlight={f.line_start} snippet={f.code_snippet} />
+          )}
+          {!showCode && f.code_snippet && (
+            <pre className="text-xs bg-bg border border-border rounded p-2 overflow-auto">{f.code_snippet}</pre>
+          )}
+
+          {analysis && (
+            <div className="text-xs p-3 rounded border border-emerald-500/30 bg-emerald-500/5">
+              <div className="text-emerald-400 font-medium mb-1">✨ AI analysis</div>
+              <div className="text-slate-200 whitespace-pre-wrap leading-relaxed">{analysis}</div>
+            </div>
+          )}
 
           {f.raw?.where_to_look && (
             <div className="text-xs">
@@ -327,6 +427,46 @@ function FindingRow({ f, onTriage }: { f: Finding; onTriage: (id: string, s: str
         </div>
       )}
     </Card>
+  );
+}
+
+// Inline source viewer with line numbers; highlights the flagged line.
+function CodeView({ code, highlight, snippet }: {
+  code: FindingCode | null; highlight?: number; snippet?: string;
+}) {
+  if (!code) {
+    return <div className="text-xs text-muted py-2">Loading code…</div>;
+  }
+  if (!code.available) {
+    return (
+      <div className="text-xs">
+        <div className="text-muted mb-1">
+          Source not on disk (workdir recycled) — showing stored snippet.
+        </div>
+        {snippet
+          ? <pre className="bg-bg border border-border rounded p-2 overflow-auto">{snippet}</pre>
+          : <div className="text-muted">No snippet available.</div>}
+      </div>
+    );
+  }
+  return (
+    <div className="text-xs bg-bg border border-border rounded overflow-auto max-h-96">
+      <table className="w-full border-collapse font-mono">
+        <tbody>
+          {code.lines.map((ln) => {
+            const hot = highlight != null && ln.n === highlight;
+            return (
+              <tr key={ln.n} className={hot ? "bg-rose-500/15" : ""}>
+                <td className={`select-none text-right pr-3 pl-2 py-0.5 align-top tabular-nums ${hot ? "text-rose-300" : "text-muted/60"}`}>
+                  {ln.n}
+                </td>
+                <td className="whitespace-pre pr-3 py-0.5 text-slate-200">{ln.text || " "}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
   );
 }
 

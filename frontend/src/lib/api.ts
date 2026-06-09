@@ -1,6 +1,6 @@
 import type {
   Artifact, ArtifactFile, ChatMessage, Client, Dashboard, Finding,
-  FoundrySettings, McpServer, Project, Scan, ScannerSettings,
+  FindingCode, FoundrySettings, McpServer, Project, Scan, ScannerSettings,
 } from "./types";
 
 const BASE = (import.meta as any).env?.VITE_API_BASE_URL || "http://localhost:8000";
@@ -57,6 +57,10 @@ export const api = {
   listFindings: (scanId: string) => req<Finding[]>(`/scans/${scanId}/findings`),
   triageFinding: (id: string, b: { state: string; triage_note?: string }) =>
     req<Finding>(`/findings/${id}/triage`, { method: "POST", body: JSON.stringify(b) }),
+  analyzeFinding: (id: string) =>
+    req<{ analysis: string; by: string }>(`/findings/${id}/analyze`, { method: "POST" }),
+  getFindingCode: (id: string) =>
+    req<FindingCode>(`/findings/${id}/code`),
 
   // chat
   listChat: (scanId: string) => req<ChatMessage[]>(`/scans/${scanId}/chat`),
