@@ -207,7 +207,8 @@ class _CheckpointStore:
 async def _ai_review(session, scan: Scan, artifact: Artifact, workdir: str,
                      candidates: list[dict], emit, checkpoint=None,
                      endpoints: list[dict] | None = None,
-                     store: "_CheckpointStore | None" = None) -> dict:
+                     store: "_CheckpointStore | None" = None,
+                     on_findings=None) -> dict:
     """Run the AI reviewer/judge/exploit pipeline. Returns run_review's result.
 
     When *store* is supplied, the reviewer/judge/exploit units are checkpointed
@@ -249,6 +250,7 @@ async def _ai_review(session, scan: Scan, artifact: Artifact, workdir: str,
             checkpoint=checkpoint,
             load_chunks=store.load if store else None,
             save_chunk=store.save if store else None,
+            on_findings=on_findings,
         )
 
     artifact_files = (await session.execute(
@@ -302,6 +304,7 @@ async def _ai_review(session, scan: Scan, artifact: Artifact, workdir: str,
         checkpoint=checkpoint,
         load_chunks=store.load if store else None,
         save_chunk=store.save if store else None,
+        on_findings=on_findings,
     )
 
 
@@ -370,6 +373,16 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
             candidates = await _static_scan(
                 session, scan, artifact, workdir, emit, controller, set_stage, scfg)
 
+            # Persist static findings immediately so they appear in the UI
+            # while the rest of the pipeline runs.
+            if candidates:
+                static_findings = [_candidate_to_finding(c) for c in candidates]
+                await _persist_findings(session, scan, static_findings)
+                await emit({"type": "log", "message":
+                            f"Persisted {len(static_findings)} static findings"})
+                await emit({"type": "finding", "finding": {"_bulk": True,
+                            "count": len(static_findings)}})
+
             await controller.checkpoint("endpoints")
             await set_stage("endpoints", "running")
             await emit({"type": "status", "status": "extracting endpoints"})
@@ -387,41 +400,65 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
                 if len(candidates) < before_dedup:
                     await emit({"type": "log", "message":
                                 f"Deduplicated {before_dedup} → {len(candidates)} candidates"})
+
+                async def _on_findings(phase: str, batch: list[dict]) -> None:
+                    """Persist AI findings to the DB as they arrive."""
+                    async with emit_lock:
+                        for f in batch:
+                            session.add(Finding(
+                                scan_id=scan.id,
+                                title=f["title"],
+                                description=f.get("description", ""),
+                                severity=Severity(f["severity"]),
+                                confidence=f.get("confidence", 0.5),
+                                source=FindingSource(f.get("source", "ai")),
+                                state=FindingState(f.get("state", "proposed")),
+                                cwe=f.get("cwe"),
+                                owasp=f.get("owasp"),
+                                category=f.get("category"),
+                                file_path=f.get("file_path"),
+                                line_start=f.get("line_start"),
+                                line_end=f.get("line_end"),
+                                code_snippet=f.get("code_snippet"),
+                                remediation=f.get("recommendation") or f.get("remediation"),
+                                human_question=f.get("human_question"),
+                                triage_note=f.get("triage_note"),
+                                triaged_by=f.get("triaged_by"),
+                                raw=f,
+                            ))
+                        await session.commit()
+
                 try:
                     result = await _ai_review(
                         session, scan, artifact, workdir, candidates, emit,
                         checkpoint=controller.checkpoint, endpoints=endpoints,
-                        store=store,
+                        store=store, on_findings=_on_findings,
                     )
-                    await set_stage("persist", "running")
+                    # Replace incremental AI findings with the final canonical set
+                    # (judge may have updated severity/state, exploit added PoCs).
+                    await _delete_findings_by_source(session, scan.id, {"ai", "correlated"})
                     await _persist_findings(session, scan, result["findings"])
+                    await emit({"type": "finding", "finding": {"_final": True}})
                     await set_stage("persist", "done")
                     await finalize(ScanStatus.completed,
                                    {**result["summary"], "endpoints": endpoints},
                                    bool(result["summary"].get("needs_review")))
                 except StageSkippedSignal:
-                    # User skipped AI mid-flight — finalize with static candidates.
                     await emit({"type": "log", "message":
-                                "AI review skipped; finalizing with static candidates"})
-                    findings = [_candidate_to_finding(c) for c in candidates]
-                    await set_stage("persist", "running")
-                    await _persist_findings(session, scan, findings)
+                                "AI review skipped; finalizing with static findings"})
                     await set_stage("persist", "done")
                     await finalize(ScanStatus.completed,
-                                   {**_summary_from_finding_dicts(findings),
+                                   {**_summary_from_finding_dicts(
+                                       [_candidate_to_finding(c) for c in candidates]),
                                     "endpoints": endpoints}, False)
             else:
-                # No AI requested — persist the raw static candidates directly so
-                # "just Semgrep" / "just SonarQube" runs surface their findings.
-                findings = [_candidate_to_finding(c) for c in candidates]
-                await set_stage("persist", "running")
-                await _persist_findings(session, scan, findings)
                 await set_stage("persist", "done")
                 await emit({"type": "log", "message":
-                            f"Static-only run: persisted {len(findings)} candidates "
+                            f"Static-only run: persisted {len(candidates)} candidates "
                             f"as findings (no AI review requested)"})
                 await finalize(ScanStatus.completed,
-                               {**_summary_from_finding_dicts(findings),
+                               {**_summary_from_finding_dicts(
+                                   [_candidate_to_finding(c) for c in candidates]),
                                 "endpoints": endpoints}, False)
         except ScanCanceledSignal:
             scan.status = ScanStatus.canceled
@@ -773,13 +810,39 @@ async def rerun_stage(ctx: dict, scan_id: str, stage: str, resume: bool = False)
                 await emit({"type": "log", "message":
                             f"AI {'resume' if resume else 're-run'} over "
                             f"{len(candidates)} existing static candidates"})
+                # Delete prior AI findings upfront so incremental ones appear cleanly.
+                await _delete_findings_by_source(session, scan_id, {"ai", "correlated"})
+
+                async def _on_findings_rerun(_phase: str, batch: list[dict]) -> None:
+                    async with emit_lock:
+                        for f in batch:
+                            session.add(Finding(
+                                scan_id=scan.id,
+                                title=f["title"],
+                                description=f.get("description", ""),
+                                severity=Severity(f["severity"]),
+                                confidence=f.get("confidence", 0.5),
+                                source=FindingSource(f.get("source", "ai")),
+                                state=FindingState(f.get("state", "proposed")),
+                                cwe=f.get("cwe"),
+                                owasp=f.get("owasp"),
+                                category=f.get("category"),
+                                file_path=f.get("file_path"),
+                                line_start=f.get("line_start"),
+                                line_end=f.get("line_end"),
+                                code_snippet=f.get("code_snippet"),
+                                remediation=f.get("recommendation") or f.get("remediation"),
+                                human_question=f.get("human_question"),
+                                triage_note=f.get("triage_note"),
+                                triaged_by=f.get("triaged_by"),
+                                raw=f,
+                            ))
+                        await session.commit()
+
                 result = await _ai_review(session, scan, artifact, workdir, candidates, emit,
                                           checkpoint=controller.checkpoint,
                                           endpoints=(scan.summary or {}).get("endpoints"),
-                                          store=store)
-                # Replace prior AI-authored findings; keep raw static ones.
-                await _delete_findings_by_source(session, scan_id, {"ai", "correlated"})
-                await _persist_findings(session, scan, result["findings"])
+                                          store=store, on_findings=_on_findings_rerun)
                 await store.clear()  # completed — no resume needed
                 needs_review = bool(result["summary"].get("needs_review"))
             else:

@@ -36,6 +36,9 @@ CheckpointFn = Callable[[str], Awaitable[None]]
 # and persist one finished unit. Defaults are no-ops (no durable resume).
 LoadChunksFn = Callable[[str], Awaitable[dict[str, list[dict]]]]
 SaveChunkFn = Callable[[str, str, list[dict]], Awaitable[None]]
+# Incremental finding persistence: called with (phase, findings_batch) whenever
+# a batch of findings is ready. The worker uses this to write to DB in real time.
+OnFindingsFn = Callable[[str, list[dict]], Awaitable[None]]
 
 
 async def _noop_checkpoint(_stage: str) -> None:
@@ -44,6 +47,10 @@ async def _noop_checkpoint(_stage: str) -> None:
 
 async def _noop_load(_phase: str) -> dict[str, list[dict]]:
     return {}
+
+
+async def _noop_on_findings(_phase: str, _findings: list[dict]) -> None:
+    return None
 
 
 async def _noop_save(_phase: str, _key: str, _findings: list[dict]) -> None:
@@ -223,10 +230,12 @@ async def run_review(
     checkpoint: CheckpointFn | None = None,
     load_chunks: LoadChunksFn | None = None,
     save_chunk: SaveChunkFn | None = None,
+    on_findings: OnFindingsFn | None = None,
 ) -> dict:
     checkpoint = checkpoint or _noop_checkpoint
     load_chunks = load_chunks or _noop_load
     save_chunk = save_chunk or _noop_save
+    on_findings = on_findings or _noop_on_findings
 
     async def stage(name: str, state: str, **extra) -> None:
         await emit({"type": "stage", "stage": name, "state": state, **extra})
@@ -337,6 +346,13 @@ async def run_review(
                 bf = await review_batch(reviewer, i, batch)
                 results[i] = bf
                 await save_chunk("review", key, bf)
+                if bf:
+                    normalized = [_normalize(f, None) for f in bf]
+                    normalized = [f for f in normalized if f]
+                    if normalized:
+                        await on_findings("review", normalized)
+                        for f in normalized:
+                            await emit({"type": "finding", "finding": f})
                 done_units["n"] += 1
                 await stage("ai_review", "running",
                             done=done_units["n"], total=total_units)
@@ -438,6 +454,13 @@ async def run_review(
             j_chunk = raw_findings[j_start : j_start + judge_batch_size]
             judged_chunk = await _adjudicate(j_chunk)
             await save_chunk("judge", key, judged_chunk)
+            if judged_chunk:
+                normalized = [_normalize(f, roles.judge.deployment) for f in judged_chunk]
+                normalized = [f for f in normalized if f]
+                if normalized:
+                    await on_findings("judge", normalized)
+                    for f in normalized:
+                        await emit({"type": "finding", "finding": f})
             adjudicated.extend(judged_chunk)
             done_chunks["n"] += 1
             await stage("ai_judge", "running", done=done_chunks["n"], total=judge_total)
@@ -452,13 +475,11 @@ async def run_review(
         await checkpoint("ai_exploit")
         adjudicated = await _run_exploit_phase(
             client, roles.exploit, adjudicated, read_file, emit, stage, checkpoint,
-            load_chunks, save_chunk,
+            load_chunks, save_chunk, on_findings,
         )
 
     findings = [_normalize(f, judged_by) for f in adjudicated]
     findings = [f for f in findings if f]
-    for f in findings:
-        await emit({"type": "finding", "finding": f})
 
     summary = _summarize(findings, roles)
     usage = getattr(client, "usage", None)
@@ -634,6 +655,7 @@ async def _run_exploit_phase(
     checkpoint: CheckpointFn | None = None,
     load_chunks: LoadChunksFn | None = None,
     save_chunk: SaveChunkFn | None = None,
+    on_findings: OnFindingsFn | None = None,
 ) -> list[dict]:
     """Enrich every non-dismissed finding with exploitation guidance.
 
@@ -666,6 +688,7 @@ async def _run_exploit_phase(
     # grounded in the actual code, not just the one-line snippet.
     load_chunks = load_chunks or _noop_load
     save_chunk = save_chunk or _noop_save
+    on_findings = on_findings or _noop_on_findings
     enriched_by_id: dict[int, dict] = {}
     batch_size = 25
     exploit_total = (len(targets) + batch_size - 1) // batch_size
@@ -737,9 +760,23 @@ async def _run_exploit_phase(
                 produced = []
 
         await save_chunk("exploit", key, produced)
+        exploited_batch: list[dict] = []
         for offset, enrich in enumerate(produced):
             if offset < len(chunk) and isinstance(enrich, dict):
                 enriched_by_id[id(chunk[offset])] = enrich
+                merged = dict(chunk[offset])
+                for ek in _EXPLOIT_KEYS:
+                    ev = enrich.get(ek)
+                    if ev:
+                        merged[ek] = ev
+                merged["exploited_by"] = exploit.deployment
+                normalized = _normalize(merged, None)
+                if normalized:
+                    exploited_batch.append(normalized)
+        if exploited_batch:
+            await on_findings("exploit", exploited_batch)
+            for f in exploited_batch:
+                await emit({"type": "finding", "finding": f})
         done_batches["n"] += 1
         if stage:
             await stage("ai_exploit", "running",
