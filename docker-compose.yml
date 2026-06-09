@@ -1,0 +1,182 @@
+# V1 — local dev stack. One command: docker compose up --build
+#
+# No .env file needed — all defaults are inlined. To connect to Azure AI Foundry,
+# set FOUNDRY_ENDPOINT and FOUNDRY_API_KEY in a .env file (copy .env.example).
+# Auth is disabled for local use.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: hunter
+      POSTGRES_PASSWORD: hunter
+      POSTGRES_DB: hunter
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hunter"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: hunter
+      MINIO_ROOT_PASSWORD: hunter-secret
+    ports: ["9000:9000", "9001:9001"]
+    volumes: ["miniodata:/data"]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio: { condition: service_started }
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 hunter hunter-secret; do sleep 1; done;
+      mc mb -p local/hunter-artifacts || true;
+      exit 0;"
+
+  api:
+    build: ./backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PYTHONPATH: /app
+      ENVIRONMENT: dev
+      AUTH_DISABLED: "true"
+      DATABASE_URL: postgresql+asyncpg://hunter:hunter@db:5432/hunter
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_BACKEND: s3
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: hunter
+      S3_SECRET_KEY: hunter-secret
+      S3_BUCKET: hunter-artifacts
+      SEMGREP_ENABLED: "true"
+      SEMGREP_RULESET: auto
+      # SonarQube off unless you opt in (set SONARQUBE_ENABLED=true + token in .env
+      # and start the optional service: docker compose --profile sonar up).
+      SONARQUBE_URL: http://sonarqube:9000
+    ports: ["8000:8000"]
+    extra_hosts: ["host.docker.internal:host-gateway"]  # reach Ollama/local models on host
+    volumes:
+      - ./backend:/app
+      - scanwork:/scan-workdir
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      minio-init: { condition: service_completed_successfully }
+
+  worker:
+    build: ./backend
+    command: arq app.worker.WorkerSettings
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PYTHONPATH: /app
+      ENVIRONMENT: dev
+      AUTH_DISABLED: "true"
+      DATABASE_URL: postgresql+asyncpg://hunter:hunter@db:5432/hunter
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_BACKEND: s3
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: hunter
+      S3_SECRET_KEY: hunter-secret
+      S3_BUCKET: hunter-artifacts
+      SEMGREP_ENABLED: "true"
+      SEMGREP_RULESET: auto
+      # SonarQube off unless you opt in (set SONARQUBE_ENABLED=true + token in .env
+      # and start the optional service: docker compose --profile sonar up).
+      SONARQUBE_URL: http://sonarqube:9000
+    extra_hosts: ["host.docker.internal:host-gateway"]  # reach Ollama/local models on host
+    volumes:
+      - ./backend:/app
+      - scanwork:/scan-workdir
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      minio-init: { condition: service_completed_successfully }
+
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    ports: ["5173:5173"]
+    volumes:
+      - ./frontend/src:/web/src
+      - ./frontend/index.html:/web/index.html
+    depends_on:
+      - api
+
+  # ---------------------------------------------------------------------------
+  # SonarQube — optional, heavy (~2GB RAM). Off by default; start on demand with:
+  #   docker compose --profile sonar up
+  # Then create a token in the SonarQube UI (http://localhost:9090, admin/admin)
+  # and set SONARQUBE_ENABLED=true + SONARQUBE_TOKEN=... in your .env.
+  # ---------------------------------------------------------------------------
+  sonarqube:
+    image: sonarqube:community
+    profiles: ["sonar"]
+    hostname: sonarqube
+    environment:
+      SONAR_JDBC_URL: jdbc:postgresql://sonar-db:5432/sonar
+      SONAR_JDBC_USERNAME: sonar
+      SONAR_JDBC_PASSWORD: sonar
+      SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"
+      SONAR_WEB_JAVAOPTS: "-Xmx1g"
+      SONAR_CE_JAVAOPTS: "-Xmx2g"
+      SONAR_SEARCH_JAVAOPTS: "-Xmx2g"
+    ports: ["9090:9000"]
+    volumes:
+      - sonar_data:/opt/sonarqube/data
+      - sonar_extensions:/opt/sonarqube/extensions
+      - sonar_logs:/opt/sonarqube/logs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/api/system/status | grep -q UP"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+      start_period: 120s
+    depends_on:
+      sonar-db: { condition: service_healthy }
+
+  sonar-db:
+    image: postgres:16-alpine
+    profiles: ["sonar"]
+    environment:
+      POSTGRES_USER: sonar
+      POSTGRES_PASSWORD: sonar
+      POSTGRES_DB: sonar
+    volumes: ["sonar_pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sonar"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
+  miniodata:
+  scanwork:
+  sonar_data:
+  sonar_extensions:
+  sonar_logs:
+  sonar_pgdata:
