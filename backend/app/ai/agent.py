@@ -56,6 +56,46 @@ async def _noop_on_findings(_phase: str, _findings: list[dict]) -> None:
 async def _noop_save(_phase: str, _key: str, _findings: list[dict]) -> None:
     return None
 
+
+async def _gather_with_control(coros, checkpoint, stage: str):
+    """Run *coros* concurrently while a watchdog polls the control key.
+
+    The watchdog calls ``checkpoint`` every ~1.5s so a cancel/skip pressed
+    mid-flight interrupts the in-flight batches instead of waiting for the
+    whole gather to finish (batches that already passed their per-batch
+    checkpoint would otherwise run to completion). Re-raises the control
+    signal after cancelling outstanding work."""
+    tasks = [asyncio.ensure_future(c) for c in coros]
+    work = asyncio.ensure_future(asyncio.gather(*tasks))
+    stop = asyncio.Event()
+
+    async def _watchdog():
+        while True:
+            await checkpoint(stage)  # raises on cancel/skip, blocks while paused
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=1.5)
+                return
+            except asyncio.TimeoutError:
+                continue
+
+    wd = asyncio.ensure_future(_watchdog())
+    try:
+        done, _ = await asyncio.wait({work, wd}, return_when=asyncio.FIRST_COMPLETED)
+        if wd in done and wd.exception() is not None:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            work.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise wd.exception()
+        return await work
+    finally:
+        stop.set()
+        if not wd.done():
+            wd.cancel()
+        await asyncio.gather(wd, return_exceptions=True)
+
+
 REVIEWER_SYSTEM = """\
 You are a senior application-security reviewer performing a white-box code \
 audit. You will receive FULL source-code file contents and static-analysis \
@@ -360,14 +400,8 @@ async def run_review(
                             "message": f"Reviewer {reviewer.deployment}: batch "
                                        f"{i + 1}/{len(batches)} → {len(bf)} findings"})
 
-        tasks = [asyncio.create_task(_do(i, b)) for i, b in enumerate(batches)]
-        try:
-            await asyncio.gather(*tasks)
-        except ScanControlSignal:
-            for t in tasks:
-                if not t.done():
-                    t.cancel()
-            raise
+        await _gather_with_control(
+            [_do(i, b) for i, b in enumerate(batches)], checkpoint, "ai_review")
         findings = [f for sub in results for f in sub]
         await emit({"type": "log",
                     "message": f"Reviewer {reviewer.deployment}: "
@@ -782,14 +816,9 @@ async def _run_exploit_phase(
             await stage("ai_exploit", "running",
                         done=done_batches["n"], total=exploit_total)
 
-    tasks = [asyncio.create_task(_do_exploit_batch(s, c)) for s, c in all_chunks]
-    try:
-        await asyncio.gather(*tasks)
-    except ScanControlSignal:
-        for t in tasks:
-            if not t.done():
-                t.cancel()
-        raise
+    await _gather_with_control(
+        [_do_exploit_batch(s, c) for s, c in all_chunks],
+        checkpoint or _noop_checkpoint, "ai_exploit")
 
     if stage:
         await stage("ai_exploit", "done", done=exploit_total, total=exploit_total)

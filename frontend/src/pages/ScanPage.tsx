@@ -25,18 +25,18 @@ export default function ScanPage() {
   useEffect(() => { refresh(); api.listChat(scanId!).then(setChat).catch(() => {}); }, [scanId]);
 
   // Re-pull authoritative findings whenever a finding lands or the scan finishes.
-  // Debounced so rapid batches of findings don't hammer the API.
+  // Debounced so rapid batches don't hammer the API — but we must NOT clear the
+  // pending timer on unrelated events (logs/status/stages stream constantly), or
+  // the refresh would never fire while a scan is active.
   const refreshTimer = useRef<ReturnType<typeof setTimeout>>();
   const lastType = events[events.length - 1]?.type;
   useEffect(() => {
-    if (!["finding", "done", "failed"].includes(lastType || "")) return;
     if (lastType === "done" || lastType === "failed") {
       refresh();
-    } else {
+    } else if (lastType === "finding") {
       clearTimeout(refreshTimer.current);
-      refreshTimer.current = setTimeout(refresh, 1500);
+      refreshTimer.current = setTimeout(refresh, 1200);
     }
-    return () => clearTimeout(refreshTimer.current);
   }, [events.length]);
 
   // Surface chat events streamed from the server (e.g. during-scan questions).

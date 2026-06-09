@@ -15,8 +15,6 @@ export default function ProjectPage() {
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [scans, setScans] = useState<Scan[]>([]);
   const [dash, setDash] = useState<Dashboard>();
-  const [models, setModels] = useState<string[]>([]);
-  const [model, setModel] = useState("");
   const [gitUrl, setGitUrl] = useState("");
   const [progress, setProgress] = useState<string | null>(null);
   const [artifactId, setArtifactId] = useState("");
@@ -40,7 +38,6 @@ export default function ProjectPage() {
     if (a[0] && !artifactId) setArtifactId(a[0].id);
   };
   useEffect(() => { reload().catch((e) => setErr(String(e))); }, [projectId]);
-  useEffect(() => { api.listModels().then((m) => { setModels(m.models); }).catch(() => {}); }, []);
 
   useEffect(() => {
     if (!artifactId) { setArtifactFiles([]); setSelectedPaths([]); return; }
@@ -108,7 +105,6 @@ export default function ProjectPage() {
     setErr("");
     const scan = await api.createScan(projectId, {
       artifact_id: artifactId, scanners, instructions,
-      model: model.trim() || undefined,
       file_paths: selectedPaths.length > 0 ? selectedPaths : undefined,
       review_scope: targeted ? "targeted" : "full",
     });
@@ -189,31 +185,26 @@ export default function ProjectPage() {
               {" "}SonarQube requires it to be enabled in Settings.
             </div>
             {useAI && (
-              <div className="mt-2">
-                <label className="flex items-center gap-1.5 text-sm">
-                  <input type="checkbox" checked={targeted}
-                    onChange={(e) => setTargeted(e.target.checked)} />
-                  Targeted review <span className="text-[11px] text-emerald-400">(much cheaper)</span>
-                </label>
-                <div className="text-[11px] text-muted mt-0.5">
+              <div className="mt-3">
+                <span className="text-sm text-muted">Review scope</span>
+                <div className="inline-flex rounded-md border border-border overflow-hidden mt-1 ml-2 align-middle">
+                  <button type="button" onClick={() => setTargeted(true)}
+                    className={`px-3 py-1 text-sm ${targeted ? "bg-accent text-white" : "bg-bg text-muted hover:bg-border"}`}>
+                    Targeted
+                  </button>
+                  <button type="button" onClick={() => setTargeted(false)}
+                    className={`px-3 py-1 text-sm ${!targeted ? "bg-accent text-white" : "bg-bg text-muted hover:bg-border"}`}>
+                    Full
+                  </button>
+                </div>
+                <div className="text-[11px] text-muted mt-1">
                   {targeted
-                    ? "Only files flagged by a scanner or exposing an endpoint go to the LLM — slashes token cost, but may miss vulns the scanners didn't flag."
-                    : "Full review reads every source file (most thorough, most expensive)."}
+                    ? "Targeted (much cheaper): only files flagged by a scanner or exposing an endpoint go to the LLM — slashes token cost, but may miss vulns the scanners didn't flag."
+                    : "Full review reads every source file — most thorough, most expensive."}
                 </div>
               </div>
             )}
           </div>
-          <label className="text-sm text-muted">Reviewer model override (optional)
-            <Input value={model} onChange={(e) => setModel(e.target.value)}
-              placeholder="Leave blank to use Settings roles" list="project-models-list"
-              className="mt-1 mb-3" />
-            <datalist id="project-models-list">
-              {models.map((m) => <option key={m} value={m} />)}
-            </datalist>
-            {models.length > 0 && (
-              <div className="text-[11px] text-muted">Available: {models.join(", ")}</div>
-            )}
-          </label>
           <label className="text-sm text-muted">Instructions for the agent (optional)</label>
           <textarea value={instructions} onChange={(e) => setInstructions(e.target.value)}
             placeholder="e.g. focus on auth & the payments module; ignore tests"
