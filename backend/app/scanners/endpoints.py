@@ -6,8 +6,12 @@ Go net/http, Gin, Rails, and Laravel.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import re
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Directories and size limits
@@ -161,6 +165,20 @@ _LANG_EXTS: dict[str, str] = {
     ".php": "php",
 }
 
+# Quick byte-level indicators per language. If none of these substrings appear
+# in the file, it cannot contain a route definition we'd match, so we skip it
+# entirely. This avoids full line-by-line regex on ~95% of source files.
+_PRESCREEN: dict[str, tuple[bytes, ...]] = {
+    "python": (b"@app.", b"@router.", b"@blueprint.", b"@bp.", b"path(", b"re_path(", b"url("),
+    "javascript": (b"app.", b"router.", b"Route", b"export", b"pages/api"),
+    "typescript": (b"app.", b"router.", b"Route", b"export", b"pages/api"),
+    "java": (b"Mapping",),
+    "csharp": (b"Http", b"[Route", b".Map"),
+    "go": (b"HandleFunc", b".GET", b".POST", b".PUT", b".DELETE", b".PATCH"),
+    "ruby": (b"get ", b"post ", b"put ", b"patch ", b"delete ", b"resources", b"resource "),
+    "php": (b"Route::"),
+}
+
 # ---------------------------------------------------------------------------
 # Next.js file-based routing detection
 # ---------------------------------------------------------------------------
@@ -206,12 +224,19 @@ def _is_binary(chunk: bytes) -> bool:
 
 
 async def extract_endpoints(workdir: str) -> list[dict]:
-    """Walk *workdir* and return a list of endpoint descriptors."""
+    """Walk *workdir* and return a list of endpoint descriptors.
 
+    Runs the I/O-heavy walk in a thread so the event loop stays responsive.
+    """
+    return await asyncio.to_thread(_extract_endpoints_sync, workdir)
+
+
+def _extract_endpoints_sync(workdir: str) -> list[dict]:
     results: list[dict] = []
+    files_checked = 0
+    files_read = 0
 
     for dirpath, dirnames, filenames in os.walk(workdir):
-        # Prune skipped directories in-place so os.walk won't descend.
         dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
 
         for fname in filenames:
@@ -221,15 +246,40 @@ async def extract_endpoints(workdir: str) -> list[dict]:
                 continue
 
             full_path = os.path.join(dirpath, fname)
+            files_checked += 1
 
-            # Size guard
             try:
-                if os.path.getsize(full_path) > _MAX_FILE_SIZE:
+                size = os.path.getsize(full_path)
+                if size > _MAX_FILE_SIZE:
                     continue
             except OSError:
                 continue
 
-            # Read & binary check
+            # Pre-screen: read first 8KB and check for route indicator strings.
+            # Skips files that can't possibly match any framework pattern.
+            indicators = _PRESCREEN.get(lang)
+            if indicators and size > 512:
+                try:
+                    with open(full_path, "rb") as fh:
+                        head = fh.read(min(size, 8192))
+                except OSError:
+                    continue
+                if _is_binary(head):
+                    continue
+                if not any(ind in head for ind in indicators):
+                    # For files > 8KB, the indicator might be deeper — read the rest.
+                    if size <= 8192:
+                        continue
+                    try:
+                        with open(full_path, "rb") as fh:
+                            fh.seek(8192)
+                            tail = fh.read()
+                    except OSError:
+                        continue
+                    if not any(ind in tail for ind in indicators):
+                        continue
+
+            # Full read for files that passed pre-screen
             try:
                 with open(full_path, "rb") as fh:
                     raw = fh.read()
@@ -239,6 +289,7 @@ async def extract_endpoints(workdir: str) -> list[dict]:
             if _is_binary(raw):
                 continue
 
+            files_read += 1
             text = raw.decode("utf-8", errors="replace")
             lines = text.splitlines()
             rel_path = os.path.relpath(full_path, workdir)
@@ -525,6 +576,8 @@ async def extract_endpoints(workdir: str) -> list[dict]:
                         })
                         continue
 
+    logger.info("endpoint extraction: checked %d files, read %d, found %d endpoints",
+                files_checked, files_read, len(results))
     return results
 
 
