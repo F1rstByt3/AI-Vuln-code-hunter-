@@ -5,6 +5,22 @@ import { useScanEvents } from "../hooks/useScanEvents";
 import { api } from "../lib/api";
 import type { ChatMessage, Endpoint, Finding, FindingCode, Scan, StageInfo, TokenUsage } from "../lib/types";
 
+// Some AI-produced raw fields can be objects (e.g. an attack_scenario with
+// {entry_point, sink, code_path} or a PoC with {steps, http_requests}). Coerce
+// any value to readable text so React never tries to render a raw object.
+function asText(v: unknown): string {
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  if (Array.isArray(v)) return v.map(asText).join("\n");
+  if (typeof v === "object") {
+    return Object.entries(v as Record<string, unknown>)
+      .map(([k, val]) => `${k}: ${asText(val)}`)
+      .join("\n");
+  }
+  return String(v);
+}
+
 export default function ScanPage() {
   const { scanId } = useParams();
   const nav = useNavigate();
@@ -353,7 +369,7 @@ function FindingRow({ f, onTriage }: { f: Finding; onTriage: (id: string, s: str
       </div>
       {open && (
         <div className="mt-3 text-sm space-y-2">
-          <p className="text-slate-300">{f.description}</p>
+          <p className="text-slate-300 whitespace-pre-wrap">{asText(f.description)}</p>
           {f.triage_note && <p className="text-xs text-amber-300/90">⚖ {f.triage_note}</p>}
 
           {/* Code view + AI analysis controls */}
@@ -385,33 +401,33 @@ function FindingRow({ f, onTriage }: { f: Finding; onTriage: (id: string, s: str
           {f.raw?.where_to_look && (
             <div className="text-xs">
               <span className="text-sky-400 font-medium">🔎 Where to look:</span>{" "}
-              <span className="text-slate-300 whitespace-pre-wrap">{f.raw.where_to_look}</span>
+              <span className="text-slate-300 whitespace-pre-wrap">{asText(f.raw.where_to_look)}</span>
             </div>
           )}
           {f.raw?.attack_scenario && (
             <div className="text-xs">
               <span className="text-orange-400 font-medium">🎯 Attack scenario:</span>{" "}
-              <span className="text-slate-300 whitespace-pre-wrap">{f.raw.attack_scenario}</span>
+              <span className="text-slate-300 whitespace-pre-wrap">{asText(f.raw.attack_scenario)}</span>
             </div>
           )}
           {f.raw?.proof_of_concept && (
             <div className="text-xs">
               <div className="text-rose-400 font-medium mb-1">
-                💥 Proof of concept {f.raw.exploited_by && <span className="text-muted font-normal">· {f.raw.exploited_by}</span>}
+                💥 Proof of concept {f.raw.exploited_by && <span className="text-muted font-normal">· {asText(f.raw.exploited_by)}</span>}
               </div>
-              <pre className="text-xs bg-bg border border-rose-500/30 rounded p-2 overflow-auto whitespace-pre-wrap">{f.raw.proof_of_concept}</pre>
+              <pre className="text-xs bg-bg border border-rose-500/30 rounded p-2 overflow-auto whitespace-pre-wrap">{asText(f.raw.proof_of_concept)}</pre>
             </div>
           )}
           {f.raw?.risk && (
             <div className="text-xs">
               <span className="text-amber-400 font-medium">⚠ Risk:</span>{" "}
-              <span className="text-slate-300 whitespace-pre-wrap">{f.raw.risk}</span>
+              <span className="text-slate-300 whitespace-pre-wrap">{asText(f.raw.risk)}</span>
             </div>
           )}
           {(f.raw?.recommendation || f.remediation) && (
             <p className="text-xs">
               <span className="text-emerald-400 font-medium">✓ Recommendation:</span>{" "}
-              <span className="text-slate-300 whitespace-pre-wrap">{f.raw?.recommendation || f.remediation}</span>
+              <span className="text-slate-300 whitespace-pre-wrap">{asText(f.raw?.recommendation || f.remediation)}</span>
             </p>
           )}
           {f.human_question && (
