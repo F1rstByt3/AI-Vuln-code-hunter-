@@ -173,7 +173,6 @@ class SonarScanner:
         page = 1
         # Try the newer issue types first; fall back to legacy if 400.
         types_options = [
-            "VULNERABILITY,BUG,CODE_SMELL",
             "VULNERABILITY,BUG",
             "VULNERABILITY",
         ]

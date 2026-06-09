@@ -382,6 +382,11 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
                 await set_stage("endpoints", "skipped")
 
             if "ai" in requested:
+                before_dedup = len(candidates)
+                candidates = _dedup_candidates(candidates)
+                if len(candidates) < before_dedup:
+                    await emit({"type": "log", "message":
+                                f"Deduplicated {before_dedup} → {len(candidates)} candidates"})
                 try:
                     result = await _ai_review(
                         session, scan, artifact, workdir, candidates, emit,
@@ -554,6 +559,22 @@ async def _static_scan(session, scan: Scan, artifact: Artifact, workdir: str, em
             await _stage("mcp", "done")
 
     return candidates
+
+
+def _dedup_candidates(candidates: list[dict]) -> list[dict]:
+    """Remove duplicate candidates that point to the same file+line+rule pattern.
+
+    When Semgrep and SonarQube both flag the same location, keep the one with
+    richer metadata (prefer semgrep which includes code_snippet)."""
+    seen: dict[str, dict] = {}
+    for c in candidates:
+        key = f"{c.get('file_path')}:{c.get('line_start')}:{(c.get('cwe') or c.get('rule') or c.get('title', ''))[:60]}"
+        existing = seen.get(key)
+        if existing is None:
+            seen[key] = c
+        elif c.get("code_snippet") and not existing.get("code_snippet"):
+            seen[key] = c
+    return list(seen.values())
 
 
 async def _persist_findings(session, scan: Scan, findings: list[dict]) -> None:
