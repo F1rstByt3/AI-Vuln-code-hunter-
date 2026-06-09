@@ -24,11 +24,19 @@ class SemgrepScanner:
     name = "semgrep"
 
     async def scan(self, workdir: str) -> list[Candidate]:
-        configs = [settings.semgrep_ruleset]
+        ruleset = settings.semgrep_ruleset
+        # "auto" requires `semgrep login`; fall back to p/default if not logged in.
+        if ruleset == "auto":
+            logged_in = await self._check_semgrep_login()
+            if not logged_in:
+                logger.info("semgrep not logged in — using p/default instead of auto")
+                ruleset = "p/default"
+
+        configs = [ruleset]
         if os.path.isdir(_RULES_DIR) and os.listdir(_RULES_DIR):
             configs.append(_RULES_DIR)
 
-        cmd = ["semgrep", "scan"]
+        cmd = ["semgrep", "scan", "--metrics=off"]
         for cfg in configs:
             cmd += ["--config", cfg]
         cmd += [
@@ -48,6 +56,7 @@ class SemgrepScanner:
             cwd=workdir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "SEMGREP_SEND_METRICS": "off"},
         )
         stdout, stderr = await proc.communicate()
         stderr_text = (stderr or b"").decode("utf-8", "replace").strip()
@@ -71,6 +80,38 @@ class SemgrepScanner:
                     len(results), len(errors), proc.returncode)
         return [self._to_candidate(r, workdir) for r in results]
 
+    @staticmethod
+    async def _check_semgrep_login() -> bool:
+        """Return True if semgrep is logged in (can use --config auto)."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "semgrep", "whoami",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, _ = await proc.communicate()
+            return proc.returncode == 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def _read_context(filepath: str, centre: int, radius: int = 3) -> str | None:
+        """Read a small window around *centre* from *filepath*."""
+        try:
+            with open(filepath, encoding="utf-8", errors="replace") as fh:
+                all_lines = fh.readlines()
+        except OSError:
+            return None
+        if not all_lines:
+            return None
+        start = max(0, centre - 1 - radius)
+        end = min(len(all_lines), centre + radius)
+        numbered = [
+            f"{start + i + 1:>5} | {line.rstrip()}"
+            for i, line in enumerate(all_lines[start:end])
+        ]
+        return "\n".join(numbered)
+
     def _to_candidate(self, r: dict, workdir: str) -> Candidate:
         extra = r.get("extra", {})
         meta = extra.get("metadata", {})
@@ -82,6 +123,12 @@ class SemgrepScanner:
         if isinstance(owasp, list):
             owasp = owasp[0] if owasp else None
         rel = os.path.relpath(r.get("path", ""), workdir)
+        snippet = extra.get("lines", "")
+        # Semgrep "lines" is just the matched text — try to read a few lines of
+        # context from the actual file so the snippet is more useful.
+        line_start = r.get("start", {}).get("line")
+        if line_start and r.get("path"):
+            snippet = self._read_context(r["path"], line_start, radius=3) or snippet
         return Candidate(
             source="semgrep",
             rule=r.get("check_id", ""),
@@ -92,7 +139,7 @@ class SemgrepScanner:
             owasp=str(owasp) if owasp else None,
             category=meta.get("category", "security"),
             file_path=rel,
-            line_start=r.get("start", {}).get("line"),
+            line_start=line_start,
             line_end=r.get("end", {}).get("line"),
-            code_snippet=extra.get("lines"),
+            code_snippet=snippet,
         )

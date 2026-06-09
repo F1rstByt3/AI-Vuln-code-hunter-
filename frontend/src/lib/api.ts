@@ -3,7 +3,8 @@ import type {
   FindingCode, FoundrySettings, McpServer, Project, Scan, ScannerSettings,
 } from "./types";
 
-const BASE = (import.meta as any).env?.VITE_API_BASE_URL || "http://localhost:8000";
+const _env_base = (import.meta as any).env?.VITE_API_BASE_URL;
+const BASE = _env_base || `http://${window.location.hostname}:8000`;
 
 // In production, swap this for the Entra access token (MSAL). Dev runs AUTH_DISABLED.
 function authHeader(): Record<string, string> {
