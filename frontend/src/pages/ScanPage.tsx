@@ -761,10 +761,11 @@ function CoveragePanel({ c }: { c: CoverageReport }) {
     (c.files_unreviewed ?? 0) > 0 && `${c.files_unreviewed} file(s) no reviewer could read (after retry)`,
     (c.files_unreadable ?? 0) > 0 && `${c.files_unreadable} file(s) unreadable (binary / too large)`,
     (c.candidates_over_cap ?? 0) > 0 && `${c.candidates_over_cap} scanner hit(s) over the triage cap`,
-    (c.candidates_triage_missing ?? 0) > 0 && `${c.candidates_triage_missing} scanner hit(s) got no AI verdict (kept as proposed)`,
+    (c.candidates_triage_missing ?? 0) > 0 && `${c.candidates_triage_missing} scanner hit(s) got no AI verdict (see their Semgrep/SonarQube findings)`,
     c.checks && !c.checks.coverage && staticTotal > withVerdict &&
       `${staticTotal - withVerdict} scanner hit(s) not addressed (coverage sweep off)`,
     (v?.over_cap ?? 0) > 0 && `${v!.over_cap} finding(s) over the verification cap`,
+    (v?.not_verified ?? 0) > 0 && `${v!.not_verified} finding(s) got no verdict from the verifier (model returned no usable output)`,
     c.endpoints && c.endpoints.total > c.endpoints.assessed && c.checks?.access_control &&
       `${c.endpoints.total - c.endpoints.assessed} endpoint(s) not assessed`,
   ].filter(Boolean) as string[];
@@ -795,7 +796,9 @@ function CoveragePanel({ c }: { c: CoverageReport }) {
         {tile("endpoints assessed", c.endpoints ? `${c.endpoints.assessed}/${c.endpoints.total}` : "—",
           undefined, !!c.endpoints && c.endpoints.assessed < c.endpoints.total)}
         {tile("FP verification", v ? `${v.eligible ?? 0} checked` : "off",
-          v ? `${v.true_positive ?? 0} confirmed · ${v.false_positive ?? 0} rejected · ${v.uncertain ?? 0} → human` : undefined)}
+          v ? `${v.true_positive ?? 0} confirmed · ${v.false_positive ?? 0} rejected · ${v.uncertain ?? 0} → human`
+            + ((v.not_verified ?? 0) > 0 ? ` · ${v.not_verified} no verdict` : "") : undefined,
+          (v?.not_verified ?? 0) > 0)}
       </div>
       <div className="flex flex-wrap gap-1.5 mt-2 text-[11px]">
         <span className="text-muted">Citations:</span>

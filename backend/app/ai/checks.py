@@ -560,14 +560,11 @@ async def run_coverage_sweep(
                  or by_loc.get((c.get("file_path"), _as_int(c.get("line_start"))))
                  or (got[n] if positional else None))
             if g is None:
-                # No verdict came back — keep the hit visible rather than drop it.
+                # No verdict came back. The scanner hit is already persisted as
+                # its own semgrep/sonarqube finding, so don't duplicate it —
+                # just count it; the coverage report flags the gap.
                 triaged["missing"] += 1
-                g = {"title": c.get("title") or c.get("rule") or "Static-analysis result",
-                     "description": c.get("message", ""), "state": "proposed",
-                     "confidence": 0.4,
-                     "triage_note": "Coverage sweep: no AI verdict returned; review manually.",
-                     **_meta(c, "severity", "cwe", "owasp", "category", "file_path",
-                             "line_start", "line_end", "code_snippet")}
+                continue
             else:
                 triaged["returned"] += 1
             g.setdefault("file_path", c.get("file_path"))
