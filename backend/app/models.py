@@ -10,7 +10,7 @@ import enum
 from datetime import datetime
 
 from sqlalchemy import (
-    JSON, Boolean, DateTime, Enum, Float, ForeignKey, Integer, String, Text,
+    JSON, BigInteger, Boolean, DateTime, Enum, Float, ForeignKey, Integer, String, Text,
     UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -121,7 +121,7 @@ class Artifact(Base):
     label: Mapped[str | None] = mapped_column(String(200))
     source_ref: Mapped[str | None] = mapped_column(String(500))  # commit sha / url / local path
     storage_key: Mapped[str | None] = mapped_column(String(500))  # object-store prefix
-    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, default=0)  # >2GB archives
     file_count: Mapped[int] = mapped_column(Integer, default=0)
     analyzable_count: Mapped[int] = mapped_column(Integer, default=0)
     meta: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -141,7 +141,7 @@ class ArtifactFile(Base):
         ForeignKey("artifacts.id", ondelete="CASCADE"), index=True
     )
     path: Mapped[str] = mapped_column(String(1024), index=True)
-    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, default=0)  # >2GB archives
     language: Mapped[str | None] = mapped_column(String(40))
     sha256: Mapped[str | None] = mapped_column(String(64), index=True)
     is_binary: Mapped[bool] = mapped_column(Boolean, default=False)

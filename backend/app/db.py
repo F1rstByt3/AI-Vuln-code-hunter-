@@ -44,6 +44,11 @@ async def init_models() -> None:
                 await conn.execute(
                     sa_text(f"ALTER TABLE findings ALTER COLUMN {col} TYPE varchar(200)")
                 )
+            # Byte sizes were int32 — uploads over ~2.1GB failed to insert.
+            for table in ("artifacts", "artifact_files"):
+                await conn.execute(
+                    sa_text(f"ALTER TABLE {table} ALTER COLUMN size_bytes TYPE bigint")
+                )
 
     if engine.dialect.name == "postgresql":
         # Enum values added after the type was first created. ADD VALUE must be

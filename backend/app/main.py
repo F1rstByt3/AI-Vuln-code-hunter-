@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+import logging
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.api import (
     artifacts,
@@ -22,6 +25,8 @@ from app.api import (
 from app.config import settings
 from app.db import init_models
 
+log = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -36,6 +41,20 @@ app = FastAPI(
     description="Agentic AI code-security review (Azure AI Foundry).",
     lifespan=lifespan,
 )
+
+@app.middleware("http")
+async def _json_errors(request: Request, call_next):
+    """Turn unhandled exceptions into a JSON 500 *inside* the CORS middleware
+    (registered before it, so CORS wraps it). Otherwise Starlette's outermost
+    error handler replies without CORS headers and the browser only shows an
+    opaque "NetworkError" instead of the actual error."""
+    try:
+        return await call_next(request)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("unhandled error on %s %s", request.method, request.url.path)
+        return JSONResponse(status_code=500,
+                            content={"detail": f"{type(exc).__name__}: {exc}"[:500]})
+
 
 app.add_middleware(
     CORSMiddleware,

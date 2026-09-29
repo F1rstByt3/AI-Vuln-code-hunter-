@@ -11,6 +11,8 @@ blips and never lands fully in API memory.
 
 from __future__ import annotations
 
+import uuid
+
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -77,6 +79,9 @@ async def init_upload(
 
         raise HTTPException(413, "file exceeds max upload size")
     artifact = Artifact(
+        # Assign the id now: the default only fires at flush, so the storage key
+        # below used to read ".../None/<filename>" and uploads could collide.
+        id=str(uuid.uuid4()),
         project_id=project_id, kind=ArtifactKind.upload, label=body.filename,
         size_bytes=body.size_bytes,
         meta={"filename": body.filename, "declared_size": body.size_bytes},
