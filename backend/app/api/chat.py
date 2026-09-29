@@ -66,13 +66,16 @@ async def post_chat(scan_id: str, body: ChatIn, session: AsyncSession = Depends(
         f"- [{f.severity.value}] {f.title} ({f.file_path}:{f.line_start}) state={f.state.value}"
         for f in findings
     ) or "No findings yet."
+    # Bulky lists (endpoint matrix, stage table) would swamp the prompt.
+    summary = {k: v for k, v in (scan.summary or {}).items()
+               if k not in ("endpoints", "stages", "tokens")}
     messages = [
         {"role": "system", "content": _SYSTEM},
-        {"role": "system", "content": f"Scan summary: {scan.summary}\nFindings:\n{context}"},
+        {"role": "system", "content": f"Scan summary: {summary}\nFindings:\n{context}"},
         *[{"role": m.role, "content": m.content} for m in reversed(history)],
     ]
 
-    cfg = await get_foundry_config(session)
+    cfg = await get_foundry_config(session, profile_id=(scan.config or {}).get("profile_id"))
     client = get_foundry_client(cfg)
     chat_role = cfg.resolve_roles().chat
     reply = "".join([

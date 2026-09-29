@@ -17,9 +17,9 @@ from fastapi import HTTPException, status as http_status
 from sqlalchemy import func
 
 from app.models import (
-    Artifact, Finding, Project, Role, Scan, ScanCheckpoint, ScanStatus, Severity,
+    AiProfile, Artifact, Finding, Project, Role, Scan, ScanCheckpoint, ScanStatus, Severity,
 )
-from app.schemas import FindingOut, ScanControl, ScanCreate, ScanOut, ScanRerun
+from app.schemas import FindingOut, ScanChecks, ScanControl, ScanCreate, ScanOut, ScanRerun
 from app.worker import RERUNNABLE_STAGES
 
 router = APIRouter(tags=["scans"])
@@ -45,6 +45,10 @@ async def create_scan(
 ):
     await get_or_404(session, Project, project_id)
     await get_or_404(session, Artifact, body.artifact_id)
+    profile_name = None
+    if body.profile_id:
+        profile_name = (await get_or_404(session, AiProfile, body.profile_id)).name
+    checks = (body.checks or ScanChecks()).model_dump()
     scan = Scan(
         project_id=project_id,
         artifact_id=body.artifact_id,
@@ -53,6 +57,8 @@ async def create_scan(
             "scanners": body.scanners, "instructions": body.instructions,
             "model": body.model, "file_paths": body.file_paths,
             "review_scope": body.review_scope,
+            "profile_id": body.profile_id, "profile_name": profile_name,
+            "checks": checks,
         },
     )
     session.add(scan)

@@ -169,6 +169,35 @@ async def export_endpoints(
     )
 
 
+@router.get("/scans/{scan_id}/export/access-matrix")
+async def export_access_matrix(
+    scan_id: str,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """Endpoint authorization matrix (who can call what) as CSV."""
+    import csv
+    import io
+
+    scan = await get_or_404(session, Scan, scan_id)
+    cols = ["method", "path", "authn", "authz", "risk", "auth_scope", "heuristic_risk",
+            "file_path", "line", "handler", "handler_file", "handler_line", "notes",
+            "route_auth", "file_auth", "role_hints", "ownership_hints"]
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(cols)
+    for ep in (scan.summary or {}).get("endpoints", []):
+        if not isinstance(ep, dict):
+            continue
+        w.writerow(["; ".join(map(str, ep.get(c) or [])) if isinstance(ep.get(c), list)
+                    else ("" if ep.get(c) is None else ep.get(c)) for c in cols])
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition":
+                 f'attachment; filename="scan_{scan_id}_access_matrix.csv"'},
+    )
+
+
 # ---------------------------------------------------------------------------
 # 3. SARIF 2.1.0
 # ---------------------------------------------------------------------------

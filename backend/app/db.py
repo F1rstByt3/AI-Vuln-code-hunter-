@@ -38,8 +38,22 @@ async def init_models() -> None:
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Widen columns that were too narrow in earlier schema versions.
-        for col in ("cwe", "owasp", "category"):
-            await conn.execute(
-                sa_text(f"ALTER TABLE findings ALTER COLUMN {col} TYPE varchar(200)")
-            )
+        if conn.dialect.name == "postgresql":
+            # Widen columns that were too narrow in earlier schema versions.
+            for col in ("cwe", "owasp", "category"):
+                await conn.execute(
+                    sa_text(f"ALTER TABLE findings ALTER COLUMN {col} TYPE varchar(200)")
+                )
+
+    if engine.dialect.name == "postgresql":
+        # Enum values added after the type was first created. ADD VALUE must be
+        # committed before use, so run it outside the DDL transaction. The api
+        # and worker both call this at startup; a concurrent duplicate add is
+        # harmless, so swallow that race.
+        async with engine.connect() as conn:
+            conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+            try:
+                await conn.execute(sa_text(
+                    "ALTER TYPE findingsource ADD VALUE IF NOT EXISTS 'access'"))
+            except Exception:  # noqa: BLE001
+                pass

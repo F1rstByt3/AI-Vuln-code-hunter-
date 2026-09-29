@@ -3,22 +3,33 @@ runtime and persisted to the DB so it survives restarts without a redeploy."""
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.ai.foundry import get_foundry_client
+from app.ai.foundry import FoundryConfig, get_foundry_client
 from app.auth import require_role
 from app.db import get_session
 from app.models import Role
 from app.runtime_config import (
+    activate_profile,
+    build_foundry_config,
+    create_profile,
+    delete_profile,
     get_foundry_config,
     get_foundry_settings_masked,
+    get_profile,
     get_scanner_config,
     get_scanner_settings_masked,
+    list_profiles,
+    profile_name_taken,
     update_foundry_settings,
+    update_profile,
     update_scanner_settings,
 )
 from app.schemas import (
+    AiProfileCreate,
+    AiProfileOut,
+    AiProfileUpdate,
     ConnectionTest,
     FoundrySettingsOut,
     FoundrySettingsUpdate,
@@ -52,9 +63,72 @@ async def list_models(session: AsyncSession = Depends(get_session)):
 @router.post("/foundry/test", response_model=ConnectionTest,
              dependencies=[Depends(require_role(Role.admin))])
 async def test_connection(session: AsyncSession = Depends(get_session)):
-    cfg = await get_foundry_config(session)
-    client = get_foundry_client(cfg)
+    return await _test_config(await get_foundry_config(session))
+
+
+# --------------------------------------------------------------------------- profiles
+@router.get("/profiles", response_model=list[AiProfileOut])
+async def get_profiles(session: AsyncSession = Depends(get_session)):
+    """Saved AI profiles (local / cloud / mock), secrets masked."""
+    return await list_profiles(session)
+
+
+@router.post("/profiles", response_model=AiProfileOut,
+             dependencies=[Depends(require_role(Role.admin))])
+async def post_profile(body: AiProfileCreate, session: AsyncSession = Depends(get_session)):
+    if await profile_name_taken(session, body.name.strip()):
+        raise HTTPException(409, f"A profile named '{body.name}' already exists")
+    return await create_profile(
+        session, name=body.name, description=body.description,
+        from_current=body.from_current,
+        patch=body.settings.model_dump(exclude_unset=True) if body.settings else None,
+        activate=body.activate,
+    )
+
+
+@router.put("/profiles/{profile_id}", response_model=AiProfileOut,
+            dependencies=[Depends(require_role(Role.admin))])
+async def put_profile(profile_id: str, body: AiProfileUpdate,
+                      session: AsyncSession = Depends(get_session)):
+    prof = await _profile_or_404(session, profile_id)
+    patch = body.model_dump(exclude_unset=True)
+    if patch.get("name") and await profile_name_taken(session, patch["name"].strip(),
+                                                      exclude_id=prof.id):
+        raise HTTPException(409, f"A profile named '{patch['name']}' already exists")
+    return await update_profile(session, prof, patch)
+
+
+@router.delete("/profiles/{profile_id}", status_code=204,
+               dependencies=[Depends(require_role(Role.admin))])
+async def remove_profile(profile_id: str, session: AsyncSession = Depends(get_session)):
+    await delete_profile(session, await _profile_or_404(session, profile_id))
+
+
+@router.post("/profiles/{profile_id}/activate", response_model=FoundrySettingsOut,
+             dependencies=[Depends(require_role(Role.admin))])
+async def post_activate_profile(profile_id: str, session: AsyncSession = Depends(get_session)):
+    """Make this profile the default for new scans (and load it into the editor)."""
+    return await activate_profile(session, await _profile_or_404(session, profile_id))
+
+
+@router.post("/profiles/{profile_id}/test", response_model=ConnectionTest,
+             dependencies=[Depends(require_role(Role.admin))])
+async def test_profile(profile_id: str, session: AsyncSession = Depends(get_session)):
+    prof = await _profile_or_404(session, profile_id)
+    return await _test_config(build_foundry_config(dict(prof.config or {})))
+
+
+async def _profile_or_404(session: AsyncSession, profile_id: str):
+    prof = await get_profile(session, profile_id)
+    if prof is None:
+        raise HTTPException(404, "Profile not found")
+    return prof
+
+
+async def _test_config(cfg: FoundryConfig) -> ConnectionTest:
+    """Verify every role of *cfg* accepts an inference call."""
     try:
+        client = get_foundry_client(cfg)
         models = await client.list_models()
         if cfg.mock:
             return ConnectionTest(ok=True, detail="mock mode (no endpoint configured)",
@@ -68,6 +142,8 @@ async def test_connection(session: AsyncSession = Depends(get_session)):
             checks.append(("judge", roles.judge))
         if roles.exploit:
             checks.append(("exploit", roles.exploit))
+        if roles.verifier:
+            checks.append(("verifier", roles.verifier))
 
         # de-dup identical (deployment, transport) pairs to keep the test fast
         seen: set[tuple[str, str]] = set()

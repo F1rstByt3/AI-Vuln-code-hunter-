@@ -80,8 +80,10 @@ _DJANGO_PATH = re.compile(
 )
 
 # -- JS/TS: Express --------------------------------------------------------
+# Server-side router objects only (app, router, usersRouter, server) — not
+# `api.get(...)`, which is usually a client-side axios instance.
 _EXPRESS = re.compile(
-    r"""(?:app|router)\."""
+    r"""\b(?:app|router|\w+Router|server)\."""
     r"""(get|post|put|delete|patch|head|options|all)"""
     r"""\(\s*["'`]([^"'`]+)["'`]"""
     r"""(?:\s*,\s*(\w+))?""",
@@ -170,13 +172,13 @@ _LANG_EXTS: dict[str, str] = {
 # entirely. This avoids full line-by-line regex on ~95% of source files.
 _PRESCREEN: dict[str, tuple[bytes, ...]] = {
     "python": (b"@app.", b"@router.", b"@blueprint.", b"@bp.", b"path(", b"re_path(", b"url("),
-    "javascript": (b"app.", b"router.", b"Route", b"export", b"pages/api"),
-    "typescript": (b"app.", b"router.", b"Route", b"export", b"pages/api"),
+    "javascript": (b"app.", b"outer.", b"server.", b"Route", b"export", b"pages/api"),
+    "typescript": (b"app.", b"outer.", b"server.", b"Route", b"export", b"pages/api"),
     "java": (b"Mapping",),
     "csharp": (b"Http", b"[Route", b".Map"),
     "go": (b"HandleFunc", b".GET", b".POST", b".PUT", b".DELETE", b".PATCH"),
     "ruby": (b"get ", b"post ", b"put ", b"patch ", b"delete ", b"resources", b"resource "),
-    "php": (b"Route::"),
+    "php": (b"Route::",),
 }
 
 # ---------------------------------------------------------------------------

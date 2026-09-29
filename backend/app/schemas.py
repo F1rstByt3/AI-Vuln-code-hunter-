@@ -99,6 +99,12 @@ class UploadComplete(BaseModel):
 
 
 # ---- Scan ----
+class ScanChecks(BaseModel):
+    coverage: bool = True        # re-triage unaddressed scanner hits + second look
+    verify: bool = True          # adversarial false-positive verification
+    access_control: bool = True  # endpoint authn/authz (BOLA/BFLA/IDOR) review
+
+
 class ScanCreate(BaseModel):
     artifact_id: str
     scanners: list[str] = Field(default_factory=lambda: ["semgrep", "mcp", "ai"])
@@ -108,6 +114,10 @@ class ScanCreate(BaseModel):
     # "full" reviews every file; "targeted" reviews only files with static
     # candidates + endpoint handlers (much cheaper, may miss scanner-blind vulns)
     review_scope: str = "full"
+    profile_id: str | None = None    # saved AI profile to use (else the active one)
+    # Extra verification passes (all default on): coverage sweep, adversarial
+    # false-positive verification, endpoint access-control review.
+    checks: ScanChecks | None = None
 
 
 class ScanRerun(BaseModel):
@@ -201,6 +211,7 @@ class ModelRolesOut(BaseModel):
     reviewers: list[ModelRoleOut] = []
     judge: ModelRoleOut | None = None
     exploit: ModelRoleOut | None = None
+    verifier: ModelRoleOut | None = None
 
 
 class FoundrySettingsOut(BaseModel):
@@ -212,7 +223,12 @@ class FoundrySettingsOut(BaseModel):
     api_key_set: bool
     mock_mode: bool
     auth_mode: str
+    kind: str = "cloud"              # mock | local | cloud
+    context_tokens: int | None = None
+    concurrency: int | None = None
     roles: ModelRolesOut = ModelRolesOut()
+    active_profile_id: str | None = None
+    active_profile_name: str | None = None
 
 
 class FoundrySettingsUpdate(BaseModel):
@@ -220,9 +236,34 @@ class FoundrySettingsUpdate(BaseModel):
     api_key: str | None = None       # blank => leave existing secret unchanged
     deployment: str | None = None
     api_version: str | None = None
-    api_style: str | None = None     # v1 | azure
+    api_style: str | None = None     # v1 | azure | local
     use_agent_service: bool | None = None
     roles: ModelRolesOut | None = None
+    context_tokens: int | None = None  # null/0 => auto-detect from model name
+    concurrency: int | None = None     # null/0 => global default
+
+
+# ---- AI profiles (saved connection + roles + tuning) ----
+class AiProfileOut(FoundrySettingsOut):
+    id: str
+    name: str
+    description: str | None = None
+    active: bool = False
+
+
+class AiProfileCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: str | None = None
+    # true: snapshot the active config (incl. its API key, server-side);
+    # false: start from `settings` only (e.g. a local/cloud template).
+    from_current: bool = True
+    settings: FoundrySettingsUpdate | None = None
+    activate: bool = False
+
+
+class AiProfileUpdate(FoundrySettingsUpdate):
+    name: str | None = Field(default=None, max_length=120)
+    description: str | None = None
 
 
 class ScannerSettingsOut(BaseModel):
@@ -269,6 +310,15 @@ class EndpointOut(BaseModel):
     framework: str
     handler: str | None = None
     auth_hints: list[str] = Field(default_factory=list)
+    # Access-control enrichment / AI verdicts (present when that check ran).
+    auth_scope: str | None = None     # route | file | global | public | none
+    state_changing: bool | None = None
+    sensitive: bool | None = None
+    heuristic_risk: str | None = None
+    authn: str | None = None          # required | none | public | unclear | unassessed
+    authz: str | None = None          # role | ownership | tenant | none | unclear
+    risk: str | None = None
+    notes: str | None = None
 
 
 class DashboardSummary(BaseModel):

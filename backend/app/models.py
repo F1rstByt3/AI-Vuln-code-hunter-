@@ -61,6 +61,7 @@ class FindingSource(str, enum.Enum):
     sonarqube = "sonarqube"
     ai = "ai"
     correlated = "correlated"      # AI-confirmed a static-tool candidate
+    access = "access"              # endpoint access-control analysis (heuristic + AI)
 
 
 class Role(str, enum.Enum):
@@ -242,6 +243,20 @@ class Setting(Base):
     __tablename__ = "settings"
     key: Mapped[str] = mapped_column(String(120), unique=True, index=True)
     value: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class AiProfile(Base):
+    """A named, saved AI configuration (connection + model roles + tuning).
+
+    Lets a team keep e.g. "Local Ollama", "Azure Foundry (prod)" and "Mock"
+    side by side, switch the active one, or pick one per scan. ``config`` holds
+    the same keys as the ``foundry`` Setting row; the API key lives here as-is
+    in dev and is only ever returned masked."""
+
+    __tablename__ = "ai_profiles"
+    name: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    description: Mapped[str | None] = mapped_column(Text)
+    config: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
 class AgentEvent(Base):

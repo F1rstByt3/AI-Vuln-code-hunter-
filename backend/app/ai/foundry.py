@@ -39,6 +39,9 @@ log = logging.getLogger(__name__)
 _CTX_RE = re.compile(r"<<CONTEXT_JSON>>(.*?)<<END>>", re.DOTALL)
 _FINDINGS_RE = re.compile(r"<<FINDINGS_JSON>>(.*?)<<END>>", re.DOTALL)
 _EXPLOIT_RE = re.compile(r"<<EXPLOIT_JSON>>(.*?)<<END>>", re.DOTALL)
+_VERIFY_RE = re.compile(r"<<VERIFY_JSON>>(.*?)<<END>>", re.DOTALL)
+_ACCESS_RE = re.compile(r"<<ACCESS_JSON>>(.*?)<<END>>", re.DOTALL)
+_TRIAGE_RE = re.compile(r"<<TRIAGE_JSON>>(.*?)<<END>>", re.DOTALL)
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 # Models that only speak the Responses API (no Chat Completions).
@@ -159,6 +162,16 @@ class ReviewRoles:
     reviewers: list[ModelRole]
     judge: ModelRole | None
     exploit: ModelRole | None = None  # writes PoC / where-to-look / risk
+    verifier: ModelRole | None = None  # adversarial false-positive re-check
+    # Profile tuning: explicit context window (tokens) for batch sizing and the
+    # number of parallel requests. None = auto-detect / global default. Local
+    # servers (Ollama etc.) usually want a small window and concurrency 1.
+    context_tokens: int | None = None
+    concurrency: int | None = None
+
+    @property
+    def verifier_or_fallback(self) -> ModelRole:
+        return self.verifier or self.judge or self.reviewers[0]
 
 
 @dataclass
@@ -182,6 +195,9 @@ class FoundryConfig:
     reviewer_models: list[ModelRole] = field(default_factory=list)
     judge_model: ModelRole | None = None
     exploit_model: ModelRole | None = None  # PoC / exploitation analyst
+    verifier_model: ModelRole | None = None  # FP verifier (falls back to judge)
+    context_tokens: int | None = None
+    concurrency: int | None = None
 
     @property
     def mock(self) -> bool:
@@ -198,10 +214,10 @@ class FoundryConfig:
             reviewers = [ModelRole(deployment=reviewer_override)]
         else:
             reviewers = list(self.reviewer_models) or [fallback]
-        judge = self.judge_model
-        exploit = self.exploit_model
         return ReviewRoles(
-            chat=chat, reviewers=reviewers, judge=judge, exploit=exploit
+            chat=chat, reviewers=reviewers, judge=self.judge_model,
+            exploit=self.exploit_model, verifier=self.verifier_model,
+            context_tokens=self.context_tokens, concurrency=self.concurrency,
         )
 
     @classmethod
@@ -529,6 +545,15 @@ class MockFoundryClient(FoundryClient):
         exploit = self._extract(messages, _EXPLOIT_RE)
         if exploit is not None:
             return {"findings": self._exploit(exploit.get("findings", []))}
+        verify = self._extract(messages, _VERIFY_RE)
+        if verify is not None:
+            return {"verdicts": self._verify(verify.get("findings", []))}
+        access = self._extract(messages, _ACCESS_RE)
+        if access is not None:
+            return self._access(access)
+        triage = self._extract(messages, _TRIAGE_RE)
+        if triage is not None:
+            return {"findings": self._triage(triage.get("results", []))}
         judged = self._extract(messages, _FINDINGS_RE)
         if judged is not None:
             return {"findings": self._judge(judged.get("findings", []))}
@@ -649,6 +674,98 @@ class MockFoundryClient(FoundryClient):
             )
             verdict["exploited_by"] = "exploit:mock"
             out.append(verdict)
+        return out
+
+    def _triage(self, results: list[dict]) -> list[dict]:
+        """Give every unaddressed scanner hit an explicit verdict."""
+        out: list[dict] = []
+        for r in results:
+            sev = r.get("severity", "medium")
+            real = sev in ("critical", "high")
+            out.append({
+                "id": r.get("id"),
+                "title": r.get("title") or r.get("rule") or "Static-analysis result",
+                "description": f"Triage of {r.get('source', 'scanner')} result: "
+                               f"{r.get('message', '')}".strip(),
+                "severity": sev, "confidence": 0.6 if real else 0.3,
+                "cwe": r.get("cwe"), "owasp": r.get("owasp"),
+                "category": r.get("category") or "static-analysis",
+                "file_path": r.get("file_path"), "line_start": r.get("line_start"),
+                "line_end": r.get("line_end"), "code_snippet": r.get("code_snippet"),
+                "source": "correlated",
+                "state": "proposed" if real else "dismissed",
+                "triage_note": None if real else "Triage (mock): low-severity scanner "
+                                                 "noise; no attacker-controlled input.",
+            })
+        return out
+
+    def _access(self, payload: dict) -> dict:
+        """Deterministic endpoint verdicts: no auth hints on a state-changing
+        route → finding; id path params without ownership → needs_info."""
+        verdicts: list[dict] = []
+        findings: list[dict] = []
+        for ep in payload.get("endpoints") or []:
+            has_auth = ep.get("auth_scope") in ("route", "file", "global")
+            owned = bool(ep.get("ownership_hints"))
+            label = f"{ep.get('method')} {ep.get('path')}"
+            verdicts.append({
+                "id": ep.get("id"),
+                "authn": "required" if has_auth else (
+                    "public" if ep.get("likely_public") else "none"),
+                "authz": "ownership" if owned else (
+                    "role" if ep.get("role_hints") else "unclear"),
+                "risk": "high" if (not has_auth and ep.get("state_changing")
+                                   and not ep.get("likely_public")) else "low",
+                "notes": "mock verdict",
+            })
+            if ep.get("likely_public"):
+                continue
+            if not has_auth and ep.get("state_changing"):
+                findings.append({
+                    "title": f"Missing authentication on {label}",
+                    "description": "State-changing endpoint reachable without any "
+                                   "detected authentication.",
+                    "severity": "high", "confidence": 0.55, "cwe": "CWE-306",
+                    "owasp": "A01:2021", "category": "access-control",
+                    "file_path": ep.get("file_path"), "line_start": ep.get("line"),
+                    "line_end": ep.get("line"), "endpoint": label,
+                    "source": "access", "state": "proposed",
+                })
+            elif ep.get("path_params") and not owned:
+                findings.append({
+                    "title": f"Possible IDOR on {label}",
+                    "description": "Object fetched by client-supplied id with no "
+                                   "ownership check detected.",
+                    "severity": "medium", "confidence": 0.4, "cwe": "CWE-639",
+                    "owasp": "A01:2021", "category": "access-control",
+                    "file_path": ep.get("file_path"), "line_start": ep.get("line"),
+                    "line_end": ep.get("line"), "endpoint": label,
+                    "source": "access", "state": "needs_info",
+                    "human_question": "Should callers only reach objects they own?",
+                })
+        return {"endpoints": verdicts, "findings": findings}
+
+    def _verify(self, findings: list[dict]) -> list[dict]:
+        """Adversarial re-check: no evidence → FP; business logic → uncertain."""
+        out: list[dict] = []
+        for f in findings:
+            ev = (f.get("evidence") or {}).get("status")
+            if not f.get("file_path") or ev in ("file_missing", "line_out_of_range"):
+                out.append({"id": f.get("id"), "verdict": "false_positive",
+                            "confidence": 0.2,
+                            "reasoning": "Mock verifier: cited code could not be "
+                                         "located, so the claim is unsupported."})
+            elif f.get("state") == "needs_info":
+                out.append({"id": f.get("id"), "verdict": "uncertain",
+                            "confidence": 0.4,
+                            "reasoning": "Mock verifier: depends on business rules.",
+                            "human_question": f.get("human_question")
+                            or "Confirm the intended authorization rule."})
+            else:
+                out.append({"id": f.get("id"), "verdict": "true_positive",
+                            "confidence": max(float(f.get("confidence") or 0.5), 0.8),
+                            "reasoning": "Mock verifier: no guard found between "
+                                         "source and sink."})
         return out
 
     async def list_models(self) -> list[str]:

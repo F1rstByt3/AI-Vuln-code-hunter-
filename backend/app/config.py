@@ -76,6 +76,17 @@ class Settings(BaseSettings):
     # Only write exploit PoCs for findings at/above this severity (the exploit
     # phase is expensive). critical | high | medium | low | info.
     ai_exploit_min_severity: str = "high"
+    # ---- Verification & coverage checks ----
+    # Adversarial false-positive verification runs on non-dismissed findings
+    # at/above this severity, capped (most severe / most confident first).
+    ai_verify_min_severity: str = "medium"
+    ai_verify_max_findings: int = 400
+    # Coverage sweep: scanner hits no reviewer addressed get an explicit AI
+    # verdict; files with dangerous sinks but zero findings get a second look.
+    ai_triage_max_candidates: int = 3000
+    ai_second_look_max_files: int = 150
+    # Access-control review: endpoints per AI call.
+    ai_access_endpoints_per_batch: int = 40
 
     @property
     def foundry_mock(self) -> bool:

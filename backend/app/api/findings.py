@@ -175,9 +175,12 @@ async def analyze_finding(
         )},
     ]
 
-    cfg = await get_foundry_config(session)
+    scan = await session.get(Scan, finding.scan_id)
+    cfg = await get_foundry_config(
+        session, profile_id=((scan.config or {}).get("profile_id") if scan else None))
     client = get_foundry_client(cfg)
-    role = cfg.resolve_roles().judge or cfg.resolve_roles().chat
+    roles = cfg.resolve_roles()
+    role = roles.verifier or roles.judge or roles.chat
     try:
         analysis = "".join([
             tok async for tok in client.stream(

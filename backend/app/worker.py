@@ -19,13 +19,14 @@ from sqlalchemy import delete as sql_delete
 from sqlalchemy import select
 
 from app import control, events
-from app.ai.agent import run_review
+from app.ai.agent import DEFAULT_CHECKS, run_review
 from app.ai.foundry import get_foundry_client
 from app.config import settings
 from app.control import Controller, ScanCanceledSignal, StageSkippedSignal
 from app.db import SessionLocal, init_models
 from app.ingestion import index_files, materialize
 from app.models import (
+    AiProfile,
     Artifact,
     ArtifactFile,
     ArtifactStatus,
@@ -40,6 +41,7 @@ from app.models import (
     Severity,
 )
 from app.runtime_config import get_foundry_config, get_scanner_config
+from app.scanners.access_control import analyze_endpoints
 from app.scanners.endpoints import extract_endpoints
 from app.scanners.mcp_client import McpClient
 from app.scanners.semgrep import SemgrepScanner
@@ -68,21 +70,34 @@ _STAGE_LABELS = {
     "sonarqube": "SonarQube",
     "mcp": "MCP scanners",
     "endpoints": "Endpoint extraction",
+    "access_control": "Access-control map",
     "ai_plan": "AI plan",
     "ai_review": "AI review",
+    "ai_coverage": "Coverage sweep",
+    "ai_access": "Access-control review",
     "ai_judge": "AI judge",
+    "ai_verify": "FP verification",
     "ai_exploit": "Exploit analyst",
     "persist": "Persist findings",
 }
 _STAGE_ORDER = list(_STAGE_LABELS.keys())
+
+# Findings the AI pipeline owns and replaces with its canonical set at the end.
+_AI_SOURCES = {"ai", "correlated", "access"}
 
 
 def _stage_order(name: str) -> int:
     return _STAGE_ORDER.index(name) if name in _STAGE_ORDER else 99
 
 
-def _planned_stages(requested: set[str], scfg) -> list[str]:
+def _scan_checks(scan: Scan) -> dict:
+    """Which extra verification passes this scan runs (all on by default)."""
+    return {**DEFAULT_CHECKS, **((scan.config or {}).get("checks") or {})}
+
+
+def _planned_stages(requested: set[str], scfg, checks: dict | None = None) -> list[str]:
     """The ordered list of stages this scan intends to run (for the UI panel)."""
+    checks = checks or DEFAULT_CHECKS
     stages = ["ingest"]
     if scfg.semgrep_enabled and "semgrep" in requested:
         stages.append("semgrep")
@@ -91,8 +106,18 @@ def _planned_stages(requested: set[str], scfg) -> list[str]:
     if "mcp" in requested:
         stages.append("mcp")
     stages.append("endpoints")
+    if checks.get("access_control"):
+        stages.append("access_control")
     if "ai" in requested:
-        stages += ["ai_plan", "ai_review", "ai_judge", "ai_exploit"]
+        stages += ["ai_plan", "ai_review"]
+        if checks.get("coverage"):
+            stages.append("ai_coverage")
+        if checks.get("access_control"):
+            stages.append("ai_access")
+        stages.append("ai_judge")
+        if checks.get("verify"):
+            stages.append("ai_verify")
+        stages.append("ai_exploit")
     stages.append("persist")
     return stages
 
@@ -178,7 +203,8 @@ class _CheckpointStore:
             )).scalars().first()
             return (row.payload if row else None) or None
 
-    async def save_inputs(self, files: list[dict], candidates: list[dict]) -> None:
+    async def save_inputs(self, files: list[dict], candidates: list[dict],
+                          extra: dict | None = None) -> None:
         async with self._lock, SessionLocal() as s:
             await s.execute(sql_delete(ScanCheckpoint).where(
                 ScanCheckpoint.scan_id == self.scan_id,
@@ -186,7 +212,8 @@ class _CheckpointStore:
             ))
             s.add(ScanCheckpoint(scan_id=self.scan_id, phase="inputs",
                                  chunk_key="v1",
-                                 payload={"files": files, "candidates": candidates}))
+                                 payload={"files": files, "candidates": candidates,
+                                          **(extra or {})}))
             await s.commit()
 
     async def clear(self) -> None:
@@ -207,27 +234,43 @@ class _CheckpointStore:
 async def _ai_review(session, scan: Scan, artifact: Artifact, workdir: str,
                      candidates: list[dict], emit, checkpoint=None,
                      endpoints: list[dict] | None = None,
-                     store: "_CheckpointStore | None" = None,
-                     on_findings=None) -> dict:
+                     store: _CheckpointStore | None = None,
+                     on_findings=None, access_map: dict | None = None) -> dict:
     """Run the AI reviewer/judge/exploit pipeline. Returns run_review's result.
 
     When *store* is supplied, the reviewer/judge/exploit units are checkpointed
     so a later resume skips completed work. The first run freezes the exact
-    (files, candidates) inputs so a resume rebuilds byte-identical batches —
-    keeping checkpoint keys (batch indices) valid across restarts."""
+    (files, candidates, access map) inputs so a resume rebuilds byte-identical
+    batches — keeping checkpoint keys (batch indices) valid across restarts."""
     async def read_file(rel: str) -> str | None:
         return _safe_read(workdir, rel)
 
-    cfg = await get_foundry_config(session)
+    profile_id = (scan.config or {}).get("profile_id")
+    cfg = await get_foundry_config(session, profile_id=profile_id)
     client = get_foundry_client(cfg)
     reviewer_override = (scan.config or {}).get("model") or None
     roles = cfg.resolve_roles(reviewer_override=reviewer_override)
+    checks = _scan_checks(scan)
     mode = "MOCK (no endpoint)" if cfg.mock else f"LIVE → {cfg.endpoint}"
+    profile = (scan.config or {}).get("profile_name") or "active settings"
     reviewers = ", ".join(r.deployment for r in roles.reviewers)
     judge = roles.judge.deployment if roles.judge else "none"
     await emit({"type": "log", "message": (
-        f"AI pipeline [{mode}] — chat={roles.chat.deployment} "
-        f"reviewers=[{reviewers}] judge={judge}")})
+        f"AI pipeline [{mode}] profile={profile} — chat={roles.chat.deployment} "
+        f"reviewers=[{reviewers}] judge={judge} "
+        f"verifier={roles.verifier_or_fallback.deployment}")})
+    if profile_id and await session.get(AiProfile, profile_id) is None:
+        await emit({"type": "log", "message":
+                    "⚠ The scan's AI profile no longer exists; using active settings"})
+
+    common = {
+        "client": client, "roles": roles,
+        "instructions": (scan.config or {}).get("instructions"),
+        "read_file": read_file, "emit": emit, "checkpoint": checkpoint,
+        "load_chunks": store.load if store else None,
+        "save_chunk": store.save if store else None,
+        "on_findings": on_findings, "checks": checks,
+    }
 
     # Resume path: if we already froze this scan's inputs, reuse them verbatim
     # so batching (and therefore every checkpoint key) is identical. Skips the
@@ -239,19 +282,9 @@ async def _ai_review(session, scan: Scan, artifact: Artifact, workdir: str,
         await emit({"type": "log", "message":
                     f"Resuming AI review with frozen inputs: {len(files)} files, "
                     f"{len(candidates)} static candidates"})
-        return await run_review(
-            client=client,
-            roles=roles,
-            instructions=(scan.config or {}).get("instructions"),
-            files=files,
-            candidates=candidates,
-            read_file=read_file,
-            emit=emit,
-            checkpoint=checkpoint,
-            load_chunks=store.load if store else None,
-            save_chunk=store.save if store else None,
-            on_findings=on_findings,
-        )
+        return await run_review(files=files, candidates=candidates,
+                                access_map=frozen.get("access_map") or access_map,
+                                **common)
 
     artifact_files = (await session.execute(
         select(ArtifactFile).where(
@@ -275,6 +308,9 @@ async def _ai_review(session, scan: Scan, artifact: Artifact, workdir: str,
     if scope == "targeted":
         focus = {c.get("file_path") for c in candidates if c.get("file_path")}
         focus |= {ep.get("file_path") for ep in (endpoints or []) if ep.get("file_path")}
+        focus |= {ep.get("handler_file")
+                  for ep in ((access_map or {}).get("endpoints") or [])
+                  if ep.get("handler_file")}
         if focus:
             before = len(artifact_files)
             artifact_files = [f for f in artifact_files if f.path in focus]
@@ -291,21 +327,11 @@ async def _ai_review(session, scan: Scan, artifact: Artifact, workdir: str,
 
     # Freeze inputs so a future resume rebuilds identical batches.
     if store:
-        await store.save_inputs(files, candidates)
+        await store.save_inputs(files, candidates,
+                                {"access_map": access_map} if access_map else None)
 
-    return await run_review(
-        client=client,
-        roles=roles,
-        instructions=(scan.config or {}).get("instructions"),
-        files=files,
-        candidates=candidates,
-        read_file=read_file,
-        emit=emit,
-        checkpoint=checkpoint,
-        load_chunks=store.load if store else None,
-        save_chunk=store.save if store else None,
-        on_findings=on_findings,
-    )
+    return await run_review(files=files, candidates=candidates, access_map=access_map,
+                            **common)
 
 
 async def run_scan(ctx: dict, scan_id: str) -> None:
@@ -351,7 +377,8 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
 
         requested = set((scan.config or {}).get("scanners", _DEFAULT_SCANNERS))
         scfg = await get_scanner_config(session)
-        stages.seed(_planned_stages(requested, scfg))
+        checks = _scan_checks(scan)
+        stages.seed(_planned_stages(requested, scfg, checks))
         await emit({"type": "stages", "stages": stages.snapshot()})
 
         async def finalize(status: ScanStatus, summary: dict, needs_review: bool) -> None:
@@ -394,6 +421,32 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
                 endpoints = []
                 await set_stage("endpoints", "skipped")
 
+            # Deterministic access-control map over the endpoints: where auth is
+            # enforced, role/ownership checks, IDOR candidates. Its heuristic
+            # findings show up immediately; the AI access review refines them.
+            access_map = None
+            access_findings: list[dict] = []
+            if checks["access_control"] and endpoints:
+                access_map = await _build_access_map(
+                    endpoints, workdir, emit, controller, set_stage)
+                if access_map:
+                    endpoints = access_map["endpoints"]
+                    access_findings = access_map["candidates"]
+                    if access_findings:
+                        await _persist_findings(session, scan, access_findings)
+                        await emit({"type": "finding", "finding": {
+                            "_bulk": True, "count": len(access_findings)}})
+            elif checks["access_control"]:
+                await set_stage("access_control", "skipped")
+
+            static_summary = _summary_from_finding_dicts(
+                [_candidate_to_finding(c) for c in candidates] + access_findings)
+            if access_map:
+                static_summary["access_control"] = {
+                    **access_map["stats"],
+                    "global_auth": access_map["global_auth"][:50],
+                    "mechanisms": access_map["mechanisms"]}
+
             if "ai" in requested:
                 before_dedup = len(candidates)
                 candidates = _dedup_candidates(candidates)
@@ -412,34 +465,33 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
                     result = await _ai_review(
                         session, scan, artifact, workdir, candidates, emit,
                         checkpoint=controller.checkpoint, endpoints=endpoints,
-                        store=store, on_findings=_on_findings,
+                        store=store, on_findings=_on_findings, access_map=access_map,
                     )
-                    # Replace incremental AI findings with the final canonical set
-                    # (judge may have updated severity/state, exploit added PoCs).
-                    await _delete_findings_by_source(session, scan.id, {"ai", "correlated"})
+                    # Replace incremental AI findings (and the heuristic access
+                    # flags, which the AI confirmed/rejected) with the final
+                    # canonical set: judge/verifier states, exploit PoCs.
+                    await _delete_findings_by_source(session, scan.id, _AI_SOURCES)
                     await _persist_findings(session, scan, result["findings"])
                     await emit({"type": "finding", "finding": {"_final": True}})
                     await set_stage("persist", "done")
                     await finalize(ScanStatus.completed,
-                                   {**result["summary"], "endpoints": endpoints},
+                                   {**result["summary"],
+                                    "endpoints": result.get("endpoints") or endpoints},
                                    bool(result["summary"].get("needs_review")))
                 except StageSkippedSignal:
                     await emit({"type": "log", "message":
                                 "AI review skipped; finalizing with static findings"})
                     await set_stage("persist", "done")
                     await finalize(ScanStatus.completed,
-                                   {**_summary_from_finding_dicts(
-                                       [_candidate_to_finding(c) for c in candidates]),
-                                    "endpoints": endpoints}, False)
+                                   {**static_summary, "endpoints": endpoints}, False)
             else:
                 await set_stage("persist", "done")
                 await emit({"type": "log", "message":
                             f"Static-only run: persisted {len(candidates)} candidates "
-                            f"as findings (no AI review requested)"})
+                            f"and {len(access_findings)} access-control flags as findings "
+                            f"(no AI review requested)"})
                 await finalize(ScanStatus.completed,
-                               {**_summary_from_finding_dicts(
-                                   [_candidate_to_finding(c) for c in candidates]),
-                                "endpoints": endpoints}, False)
+                               {**static_summary, "endpoints": endpoints}, False)
         except ScanCanceledSignal:
             await session.rollback()
             scan.status = ScanStatus.canceled
@@ -580,6 +632,37 @@ async def _static_scan(session, scan: Scan, artifact: Artifact, workdir: str, em
     return candidates
 
 
+async def _build_access_map(endpoints: list[dict], workdir: str, emit,
+                            controller=None, set_stage=None) -> dict | None:
+    """Run the deterministic access-control analysis as its own stage."""
+    async def _stage(state: str) -> None:
+        if set_stage:
+            await set_stage("access_control", state)
+
+    try:
+        if controller:
+            await controller.checkpoint("access_control")
+    except StageSkippedSignal:
+        await _stage("skipped")
+        return None
+    await _stage("running")
+    await emit({"type": "status", "status": "mapping access control"})
+    try:
+        amap = await analyze_endpoints(endpoints, workdir)
+    except Exception as exc:  # noqa: BLE001
+        await emit({"type": "log", "message": f"Access-control map error: {exc}"})
+        await _stage("failed")
+        return None
+    st = amap["stats"]
+    scopes = ", ".join(f"{k}={v}" for k, v in sorted(st["by_scope"].items()))
+    await emit({"type": "log", "message":
+                f"Access-control map: {st['endpoints']} endpoints ({scopes}); "
+                f"{st['heuristic_findings']} heuristic flags; global auth "
+                f"{'enforced' if st['global_auth_enforced'] else 'not detected'}"})
+    await _stage("done")
+    return amap
+
+
 def _dedup_candidates(candidates: list[dict]) -> list[dict]:
     """Remove duplicate candidates that point to the same file+line+rule pattern.
 
@@ -640,7 +723,8 @@ def _candidate_to_finding(c: dict) -> dict:
         "description": c.get("message", ""),
         "severity": c.get("severity") or "medium",
         "confidence": 0.5,
-        "source": c.get("source") if c.get("source") in {"semgrep", "sonarqube"} else "semgrep",
+        "source": (c.get("source") if c.get("source") in {"semgrep", "sonarqube", "access"}
+                   else "semgrep"),
         "state": "proposed",
         "cwe": c.get("cwe"),
         "owasp": c.get("owasp"),
@@ -774,6 +858,7 @@ async def rerun_stage(ctx: dict, scan_id: str, stage: str, resume: bool = False)
             workdir = await _ensure_workdir(session, artifact, emit)
             scfg = await get_scanner_config(session)
             needs_review = False
+            ai_summary: dict = {}  # coverage / access matrix from an AI re-run
 
             if stage == "semgrep":
                 await emit({"type": "status", "status": "semgrep"})
@@ -801,7 +886,15 @@ async def rerun_stage(ctx: dict, scan_id: str, stage: str, resume: bool = False)
                             f"AI {'resume' if resume else 're-run'} over "
                             f"{len(candidates)} existing static candidates"})
                 # Delete prior AI findings upfront so incremental ones appear cleanly.
-                await _delete_findings_by_source(session, scan_id, {"ai", "correlated"})
+                await _delete_findings_by_source(session, scan_id, _AI_SOURCES)
+
+                # Rebuild the access-control map (cheap, deterministic) unless a
+                # resume will reuse the frozen one.
+                endpoints = (scan.summary or {}).get("endpoints") or []
+                access_map = None
+                if _scan_checks(scan)["access_control"] and endpoints \
+                        and not (resume and await store.has_any()):
+                    access_map = await _build_access_map(endpoints, workdir, emit)
 
                 async def _on_findings_rerun(_phase: str, batch: list[dict]) -> None:
                     async with emit_lock:
@@ -811,10 +904,16 @@ async def rerun_stage(ctx: dict, scan_id: str, stage: str, resume: bool = False)
 
                 result = await _ai_review(session, scan, artifact, workdir, candidates, emit,
                                           checkpoint=controller.checkpoint,
-                                          endpoints=(scan.summary or {}).get("endpoints"),
-                                          store=store, on_findings=_on_findings_rerun)
+                                          endpoints=endpoints, store=store,
+                                          on_findings=_on_findings_rerun,
+                                          access_map=access_map)
                 await store.clear()  # completed — no resume needed
                 needs_review = bool(result["summary"].get("needs_review"))
+                ai_summary = {k: result["summary"][k]
+                              for k in ("coverage", "access_control", "models")
+                              if k in result["summary"]}
+                if result.get("endpoints"):
+                    ai_summary["endpoints"] = result["endpoints"]
             else:
                 raise ValueError(f"unknown stage: {stage}")
 
@@ -825,7 +924,7 @@ async def rerun_stage(ctx: dict, scan_id: str, stage: str, resume: bool = False)
             fdicts = [{"severity": f.severity.value, "state": f.state.value,
                        "category": f.category} for f in all_findings]
             scan.summary = _summary_from_finding_dicts(
-                fdicts, {**(scan.summary or {})})
+                fdicts, {**(scan.summary or {}), **ai_summary})
             if tokens["v"]:
                 scan.summary["tokens"] = tokens["v"]
             if any(f.state == FindingState.needs_info for f in all_findings):
