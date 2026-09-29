@@ -13,6 +13,7 @@ from app.api.deps import get_or_404
 from app.auth import CurrentUser, require_role
 from app.config import settings
 from app.db import get_session
+from app.ingestion import resolve_rel
 from app.models import Artifact, Finding, Role, Scan
 from app.runtime_config import get_foundry_config
 from app.schemas import FindingOut, FindingTriage
@@ -64,6 +65,9 @@ async def _resolve_workdir(session: AsyncSession, finding: Finding) -> str | Non
 
 def _read_window(workdir: str, rel: str, line: int, radius: int):
     """Return (start_line, lines[]) for a window of *rel* centred on *line*."""
+    rel = resolve_rel(workdir, rel)  # also repairs legacy "../../app/..." paths
+    if rel is None:
+        return None
     target = os.path.realpath(os.path.join(workdir, rel))
     if not target.startswith(os.path.realpath(workdir) + os.sep):
         return None

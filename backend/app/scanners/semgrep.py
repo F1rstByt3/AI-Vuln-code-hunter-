@@ -122,13 +122,20 @@ class SemgrepScanner:
         owasp = meta.get("owasp")
         if isinstance(owasp, list):
             owasp = owasp[0] if owasp else None
-        rel = os.path.relpath(r.get("path", ""), workdir)
+        # Semgrep runs with cwd=workdir on ".", so paths come back relative to
+        # the workdir — resolve them there, not against the worker's own cwd
+        # (which produced "../../../app/..." paths nothing could open).
+        raw_path = r.get("path", "")
+        full = raw_path if os.path.isabs(raw_path) else os.path.join(workdir, raw_path)
+        rel = os.path.relpath(full, workdir)
         snippet = extra.get("lines", "")
-        # Semgrep "lines" is just the matched text — try to read a few lines of
-        # context from the actual file so the snippet is more useful.
+        if snippet.strip() == "requires login":  # Semgrep's placeholder when logged out
+            snippet = ""
+        # Semgrep "lines" is just the matched text — read a few lines of real
+        # context from the file so the snippet is useful.
         line_start = r.get("start", {}).get("line")
-        if line_start and r.get("path"):
-            snippet = self._read_context(r["path"], line_start, radius=3) or snippet
+        if line_start and raw_path:
+            snippet = self._read_context(full, line_start, radius=3) or snippet
         return Candidate(
             source="semgrep",
             rule=r.get("check_id", ""),

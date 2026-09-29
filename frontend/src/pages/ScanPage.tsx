@@ -147,7 +147,9 @@ export default function ScanPage() {
         </div>
       )}
 
-      {resumeInfo?.resumable && (
+      {/* Checkpoints also exist while a scan is running normally — only offer
+          a resume once it has actually stopped (failed / canceled / crashed). */}
+      {resumeInfo?.resumable && !busy && (
         <div className="flex items-center gap-3 mb-4 p-3 rounded border border-amber-500/40 bg-amber-500/10 text-sm">
           <span className="text-amber-300">⏸ This scan was interrupted with saved progress.</span>
           <span className="flex-1 text-[11px] text-muted">

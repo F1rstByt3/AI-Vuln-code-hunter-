@@ -545,10 +545,17 @@ async def run_coverage_sweep(
 
         async with sem:
             got, failed = await _robust(call, list(ids.items()), emit, "Coverage triage")
-        by_id = {g.get("id"): g for g in got}
+        by_id = {g.get("id"): g for g in got if g.get("id") in ids}
+        # Smaller models often drop the "id" echo: match the rest by
+        # file+line, then by position when the counts line up.
+        loose = [g for g in got if g.get("id") not in ids]
+        by_loc = {(g.get("file_path"), _as_int(g.get("line_start"))): g for g in loose}
+        positional = len(got) == len(ids) and not by_id
         out: list[dict] = []
-        for cid, c in ids.items():
-            g = by_id.get(cid)
+        for n, (cid, c) in enumerate(ids.items()):
+            g = (by_id.get(cid)
+                 or by_loc.get((c.get("file_path"), _as_int(c.get("line_start"))))
+                 or (got[n] if positional else None))
             if g is None:
                 # No verdict came back — keep the hit visible rather than drop it.
                 triaged["missing"] += 1

@@ -24,7 +24,7 @@ from app.ai.foundry import get_foundry_client
 from app.config import settings
 from app.control import Controller, ScanCanceledSignal, StageSkippedSignal
 from app.db import SessionLocal, init_models
-from app.ingestion import index_files, materialize
+from app.ingestion import index_files, materialize, resolve_rel
 from app.models import (
     AiProfile,
     Artifact,
@@ -437,6 +437,9 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
                         await emit({"type": "finding", "finding": {
                             "_bulk": True, "count": len(access_findings)}})
             elif checks["access_control"]:
+                await emit({"type": "log", "message":
+                            "Access-control map skipped: no HTTP endpoints were "
+                            "extracted (no supported route definitions found)"})
                 await set_stage("access_control", "skipped")
 
             static_summary = _summary_from_finding_dicts(
@@ -778,9 +781,14 @@ async def _delete_findings_by_source(session, scan_id: str, sources: set[str]) -
     return n
 
 
-async def _candidates_from_findings(session, scan_id: str) -> list[dict]:
+async def _candidates_from_findings(session, scan_id: str,
+                                    workdir: str | None = None) -> list[dict]:
     """Rebuild static-scanner candidates from the findings currently in the DB
-    (so an AI re-run sees the same SAST candidates without re-running them)."""
+    (so an AI re-run sees the same SAST candidates without re-running them).
+
+    With *workdir*, also repairs rows stored by older versions: Semgrep paths
+    resolved against the worker's cwd ("../../../app/...") and Semgrep's
+    logged-out "requires login" placeholder snippet."""
     rows = (await session.execute(
         select(Finding).where(
             Finding.scan_id == scan_id,
@@ -788,7 +796,16 @@ async def _candidates_from_findings(session, scan_id: str) -> list[dict]:
         )
     )).scalars().all()
     out: list[dict] = []
+    repaired = 0
     for f in rows:
+        if workdir and f.file_path:
+            fixed = resolve_rel(workdir, f.file_path)
+            if fixed and fixed != f.file_path:
+                f.file_path = fixed
+                repaired += 1
+        if (f.code_snippet or "").strip() == "requires login":
+            f.code_snippet = None
+            repaired += 1
         out.append({
             "source": f.source.value, "rule": (f.raw or {}).get("rule", ""),
             "title": f.title, "message": f.description, "severity": f.severity.value,
@@ -796,6 +813,8 @@ async def _candidates_from_findings(session, scan_id: str) -> list[dict]:
             "file_path": f.file_path, "line_start": f.line_start,
             "line_end": f.line_end, "code_snippet": f.code_snippet,
         })
+    if repaired:
+        await session.commit()
     return out
 
 
@@ -881,7 +900,7 @@ async def rerun_stage(ctx: dict, scan_id: str, stage: str, resume: bool = False)
             elif stage == "ai":
                 if not resume:
                     await store.clear()  # fresh redo: drop any old checkpoints
-                candidates = await _candidates_from_findings(session, scan_id)
+                candidates = await _candidates_from_findings(session, scan_id, workdir)
                 await emit({"type": "log", "message":
                             f"AI {'resume' if resume else 're-run'} over "
                             f"{len(candidates)} existing static candidates"})

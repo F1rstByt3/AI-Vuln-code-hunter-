@@ -274,3 +274,22 @@ def _sha256(path: str) -> str:
         while data := fh.read(1 << 20):
             h.update(data)
     return h.hexdigest()
+
+
+def resolve_rel(workdir: str, rel: str | None) -> str | None:
+    """Map a finding's file path onto a real file inside *workdir*.
+
+    Older Semgrep results were stored resolved against the worker's cwd
+    (e.g. "../../../app/proj/src/x.py"). Drop leading "../" and then leading
+    segments until the remainder exists under the workdir. Returns the clean
+    relative path, or None if nothing matches (never escapes the workdir)."""
+    if not rel:
+        return None
+    root = os.path.realpath(workdir)
+    parts = [p for p in rel.replace("\\", "/").split("/") if p not in ("", ".", "..")]
+    for i in range(min(len(parts), 6)):
+        cand = "/".join(parts[i:])
+        full = os.path.realpath(os.path.join(root, cand))
+        if full.startswith(root + os.sep) and os.path.isfile(full):
+            return cand
+    return None
