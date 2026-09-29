@@ -360,6 +360,7 @@ def _enrich(ep: dict, idx: int, lines_of, file_auth_of, all_paths: list[str],
         risk = "low"
 
     route_src = route_lines[route_line - 1].strip() if 0 < route_line <= len(route_lines) else ""
+    handler_src = h_lines[h_line - 1].strip() if 0 < h_line <= len(h_lines) else route_src
     ep.update({
         "id": f"e{idx}",
         "method": method,
@@ -383,6 +384,7 @@ def _enrich(ep: dict, idx: int, lines_of, file_auth_of, all_paths: list[str],
         "handler_start": h_start,
         "handler_end": h_end,
         "route_source": route_src[:240],
+        "handler_source": handler_src[:240],
     })
     return ep
 
@@ -678,7 +680,8 @@ def _finding(ep: dict, rule: str, title: str, description: str, severity: str,
         "file_path": ep.get("handler_file") or ep.get("file_path"),
         "line_start": ep.get("handler_line") or ep.get("line"),
         "line_end": ep.get("handler_line") or ep.get("line"),
-        "code_snippet": ep.get("route_source") or None,
+        # Quote the line actually cited (the handler), so evidence checks match.
+        "code_snippet": ep.get("handler_source") or ep.get("route_source") or None,
         "remediation": remediation,
         "source": "access",
         "state": "proposed",

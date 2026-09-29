@@ -56,6 +56,14 @@ can drive the entire flow end-to-end. To go live:
 
 All scans from that point use the real model. No restart, no config file.
 
+**AI profiles** — save complete setups (connection, key, model roles, tuning) under
+a name and switch between them, e.g. *Local Ollama* for sensitive code and *Azure
+prod* for large scans. Start one from the current settings or from a local /
+cloud / mock template in **Settings → AI profiles**. The active profile is the
+default; any scan can pin another in the scan form. For local servers set the
+**context window** your server really loads (Ollama `num_ctx`) and **1 parallel
+request**.
+
 Alternatively, create a `.env` (copy `.env.example`) and set `FOUNDRY_ENDPOINT` /
 `FOUNDRY_API_KEY` / `FOUNDRY_DEPLOYMENT` there — those are picked up on next start.
 
@@ -88,6 +96,21 @@ pip install -e ".[dev]" && pytest -q
    remediation, and probes for logic flaws (authz, IDOR, races, secret handling).
    Uncertain / business-logic items become `needs_info` findings **with a specific
    question for you**.
+3b. **Verification checks** (each can be toggled per scan):
+   - *Evidence check* (always on) — every cited file/snippet is matched against the
+     real code; hallucinated citations are corrected, down-weighted or dismissed.
+     Failed review batches are retried and unreadable files reported.
+   - *Coverage sweep* — every scanner hit no reviewer addressed gets an explicit
+     verdict; files with dangerous sinks but zero findings get a second look.
+   - *Broken access control* — every extracted endpoint is mapped (route /
+     controller / global auth, role and ownership checks, id params), heuristic
+     flags are raised (missing auth, IDOR, privileged routes without a role check,
+     inconsistent protection across sibling routes), then an AI review produces
+     an authn/authz **access matrix** (exportable as CSV) and findings.
+   - *False-positive verification* — an adversarial verifier (optionally a
+     different model) tries to disprove each medium+ finding using a wider code
+     window, the function's callers and the routes that reach it.
+   The scan page shows a **Coverage & verification** report listing any gaps.
 4. **Live + interactive** — every step streams over SSE; you can chat with the
    reviewer during and after, and triage each finding
    (`confirmed` / `dismissed` / `needs_info`).

@@ -28,6 +28,10 @@ export interface Finding {
     reviewed_by?: string; merged_count?: number;
     where_to_look?: string; attack_scenario?: string; proof_of_concept?: string;
     risk?: string; recommendation?: string; exploited_by?: string;
+    evidence?: { status: string; note?: string };
+    reviewer_agreement?: { count: number; of: number };
+    verification?: { verdict: string; confidence?: number | null; reasoning?: string; by?: string };
+    severity_original?: string; endpoint?: string; origin?: string; rule?: string;
   } & Record<string, any>;
 }
 export interface FindingCode {
@@ -50,13 +54,39 @@ export interface ModelRole {
 }
 export interface ModelRoles {
   chat?: ModelRole | null; reviewers: ModelRole[]; judge?: ModelRole | null;
-  exploit?: ModelRole | null;
+  exploit?: ModelRole | null; verifier?: ModelRole | null;
 }
+export type ProfileKind = "mock" | "local" | "cloud";
 export interface FoundrySettings {
   endpoint?: string; deployment: string; api_version: string; api_style: string;
   use_agent_service: boolean;
   api_key_set: boolean; mock_mode: boolean; auth_mode: string;
+  kind?: ProfileKind;
+  context_tokens?: number | null; concurrency?: number | null;
   roles: ModelRoles;
+  active_profile_id?: string | null; active_profile_name?: string | null;
+}
+export interface AiProfile extends FoundrySettings {
+  id: string; name: string; description?: string | null; active: boolean;
+}
+export interface ScanChecks { coverage: boolean; verify: boolean; access_control: boolean; }
+export interface CoverageReport {
+  checks?: ScanChecks;
+  files_total?: number; files_loaded?: number; files_unreadable?: number;
+  files_unreviewed?: number; unreviewed_files?: string[];
+  batches_errored?: number; batches_recovered?: number; batches_failed?: number;
+  evidence?: Record<string, number>;
+  reviewer_agreement?: Record<string, number>;
+  static_candidates?: number; candidates_addressed_by_review?: number;
+  candidates_unaddressed_after_review?: number; candidates_triaged?: number;
+  candidates_triage_missing?: number; candidates_over_cap?: number;
+  sink_files?: number; sink_files_without_findings?: number;
+  second_look_files?: number; second_look_findings?: number;
+  endpoints?: { total: number; assessed: number };
+  verification?: {
+    eligible?: number; over_cap?: number; true_positive?: number;
+    false_positive?: number; uncertain?: number; not_verified?: number; by?: string;
+  };
 }
 export interface ScannerSettings {
   semgrep_enabled: boolean; semgrep_ruleset: string;
@@ -66,6 +96,16 @@ export interface ScannerSettings {
 export interface Endpoint {
   method: string; path: string; file_path: string; line: number;
   framework: string; handler: string; auth_hints: string[];
+  // Access-control enrichment (deterministic) + AI verdicts, when that check ran.
+  id?: string;
+  auth_scope?: "route" | "file" | "global" | "public" | "none";
+  role_hints?: string[]; ownership_hints?: string[]; id_params?: string[];
+  state_changing?: boolean; sensitive?: boolean; privileged?: boolean;
+  likely_public?: boolean; heuristic_risk?: "high" | "medium" | "low";
+  handler_file?: string; handler_line?: number;
+  authn?: "required" | "public" | "none" | "unclear" | "unassessed";
+  authz?: "role" | "ownership" | "tenant" | "none" | "unclear";
+  risk?: "high" | "medium" | "low"; notes?: string;
 }
 export interface Dashboard {
   project_id: string; total_findings: number; open_findings: number; needs_review: number;

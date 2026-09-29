@@ -210,6 +210,8 @@ def _auth_mode(cfg: FoundryConfig) -> str:
         return "api_key"
     if cfg.client_id and cfg.client_secret:
         return "service_principal"
+    if cfg.endpoint and cfg.is_local:
+        return "none"  # local OpenAI-compatible servers need no credentials
     if cfg.endpoint:
         return "managed_identity"
     return "none"

@@ -4,7 +4,7 @@ import JSZip from "jszip";
 import FileTree from "../components/FileTree";
 import { Button, Card, Input, Spinner } from "../components/ui";
 import { api } from "../lib/api";
-import type { Artifact, ArtifactFile, Dashboard, Project, Scan } from "../lib/types";
+import type { AiProfile, Artifact, ArtifactFile, Dashboard, Project, Scan, ScanChecks } from "../lib/types";
 
 const SEV_ORDER = ["critical", "high", "medium", "low", "info"] as const;
 
@@ -26,6 +26,9 @@ export default function ProjectPage() {
   const [useSonar, setUseSonar] = useState(false);
   const [useAI, setUseAI] = useState(true);
   const [targeted, setTargeted] = useState(false);
+  const [profiles, setProfiles] = useState<AiProfile[]>([]);
+  const [profileId, setProfileId] = useState("");  // "" = active profile/settings
+  const [checks, setChecks] = useState<ScanChecks>({ coverage: true, verify: true, access_control: true });
   const [err, setErr] = useState("");
 
   const reload = async () => {
@@ -36,6 +39,7 @@ export default function ProjectPage() {
     ]);
     setProject(p); setArtifacts(a); setScans(s); setDash(d);
     if (a[0] && !artifactId) setArtifactId(a[0].id);
+    api.listProfiles().then(setProfiles).catch(() => setProfiles([]));
   };
   useEffect(() => { reload().catch((e) => setErr(String(e))); }, [projectId]);
 
@@ -107,6 +111,8 @@ export default function ProjectPage() {
       artifact_id: artifactId, scanners, instructions,
       file_paths: selectedPaths.length > 0 ? selectedPaths : undefined,
       review_scope: targeted ? "targeted" : "full",
+      profile_id: useAI && profileId ? profileId : undefined,
+      checks,
     });
     nav(`/scans/${scan.id}`);
   };
@@ -204,6 +210,40 @@ export default function ProjectPage() {
                 </div>
               </div>
             )}
+            {useAI && (
+              <label className="block mt-3 text-sm text-muted">AI profile
+                <select value={profileId} onChange={(e) => setProfileId(e.target.value)}
+                  className="block w-full mt-1 px-2 py-1.5 rounded-md bg-bg border border-border text-sm text-slate-200">
+                  <option value="">
+                    Active{profiles.find((p) => p.active) ? ` — ${profiles.find((p) => p.active)!.name}` : " settings"}
+                  </option>
+                  {profiles.filter((p) => !p.active).map((p) => (
+                    <option key={p.id} value={p.id}>{p.name} ({p.kind})</option>
+                  ))}
+                </select>
+              </label>
+            )}
+            <div className="mt-3">
+              <span className="text-sm text-muted">Verification checks</span>
+              <div className="mt-1 space-y-1">
+                <CheckRow on={checks.access_control}
+                  onChange={(v) => setChecks({ ...checks, access_control: v })}
+                  label="Broken access control"
+                  hint={useAI
+                    ? "Maps auth on every extracted endpoint, then an AI review checks authn, role checks, IDOR/BOLA and mass assignment."
+                    : "Maps auth on every extracted endpoint and flags missing auth, IDOR candidates and inconsistent protection (heuristic)."} />
+                {useAI && (<>
+                  <CheckRow on={checks.coverage}
+                    onChange={(v) => setChecks({ ...checks, coverage: v })}
+                    label="Coverage sweep"
+                    hint="Every scanner hit the reviewers skipped gets an explicit verdict; risky files with no findings get a second look." />
+                  <CheckRow on={checks.verify}
+                    onChange={(v) => setChecks({ ...checks, verify: v })}
+                    label="False-positive verification"
+                    hint="An adversarial verifier tries to disprove each medium+ finding using callers and routes." />
+                </>)}
+              </div>
+            </div>
           </div>
           <label className="text-sm text-muted">Instructions for the agent (optional)</label>
           <textarea value={instructions} onChange={(e) => setInstructions(e.target.value)}
@@ -254,7 +294,10 @@ export default function ProjectPage() {
 function DashboardPanel({ d }: { d: Dashboard }) {
   const [showEndpoints, setShowEndpoints] = useState(false);
   const endpoints = d.endpoints || [];
-  const unauthEndpoints = endpoints.filter((e) => e.auth_hints.length === 0);
+  // Prefer the AI verdict, then the access-control map, then raw auth hints.
+  const isUnauth = (e: typeof endpoints[number]) =>
+    e.authn ? e.authn === "none" : e.auth_scope ? e.auth_scope === "none" : e.auth_hints.length === 0;
+  const unauthEndpoints = endpoints.filter(isUnauth);
 
   return (
     <Card className="p-4">
@@ -315,13 +358,17 @@ function DashboardPanel({ d }: { d: Dashboard }) {
                 </thead>
                 <tbody>
                   {endpoints.map((ep, i) => (
-                    <tr key={i} className={`border-b border-border/50 ${ep.auth_hints.length === 0 ? "text-amber-300/80" : ""}`}>
+                    <tr key={i} className={`border-b border-border/50 ${isUnauth(ep) ? "text-amber-300/80" : ""}`}>
                       <td className="px-2 py-0.5 font-mono">{ep.method}</td>
                       <td className="px-2 py-0.5 font-mono">{ep.path}</td>
                       <td className="px-2 py-0.5 text-muted">{ep.file_path}:{ep.line}</td>
                       <td className="px-2 py-0.5">
-                        {ep.auth_hints.length > 0
-                          ? <span className="text-emerald-400">{ep.auth_hints.join(", ")}</span>
+                        {ep.authn
+                          ? <span className={ep.authn === "none" ? "text-amber-400" : "text-emerald-400"}>
+                              {ep.authn}{ep.authz && ep.authz !== "unclear" ? ` · ${ep.authz}` : ""}
+                            </span>
+                          : !isUnauth(ep)
+                          ? <span className="text-emerald-400">{ep.auth_hints.join(", ") || ep.auth_scope}</span>
                           : <span className="text-amber-400">none detected</span>}
                       </td>
                     </tr>
@@ -333,6 +380,20 @@ function DashboardPanel({ d }: { d: Dashboard }) {
         </div>
       )}
     </Card>
+  );
+}
+
+function CheckRow({ on, onChange, label, hint }: {
+  on: boolean; onChange: (v: boolean) => void; label: string; hint: string;
+}) {
+  return (
+    <label className="flex items-start gap-2 text-sm cursor-pointer">
+      <input type="checkbox" className="mt-1" checked={on} onChange={(e) => onChange(e.target.checked)} />
+      <span>
+        {label}
+        <span className="block text-[11px] text-muted">{hint}</span>
+      </span>
+    </label>
   );
 }
 

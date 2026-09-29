@@ -908,6 +908,12 @@ async def rerun_stage(ctx: dict, scan_id: str, stage: str, resume: bool = False)
                                           on_findings=_on_findings_rerun,
                                           access_map=access_map)
                 await store.clear()  # completed — no resume needed
+                # Same as a full scan: swap the incremental rows (reviewer, judge,
+                # coverage, access…) for the final canonical set — verifier
+                # verdicts, carried heuristic flags and exploit PoCs included.
+                await _delete_findings_by_source(session, scan_id, _AI_SOURCES)
+                await _persist_findings(session, scan, result["findings"])
+                await emit({"type": "finding", "finding": {"_final": True}})
                 needs_review = bool(result["summary"].get("needs_review"))
                 ai_summary = {k: result["summary"][k]
                               for k in ("coverage", "access_control", "models")

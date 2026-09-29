@@ -1,6 +1,6 @@
 import type {
-  Artifact, ArtifactFile, ChatMessage, Client, Dashboard, Finding,
-  FindingCode, FoundrySettings, McpServer, Project, Scan, ScannerSettings,
+  AiProfile, Artifact, ArtifactFile, ChatMessage, Client, Dashboard, Finding,
+  FindingCode, FoundrySettings, McpServer, Project, Scan, ScanChecks, ScannerSettings,
 } from "./types";
 
 const _env_base = (import.meta as any).env?.VITE_API_BASE_URL;
@@ -46,7 +46,10 @@ export const api = {
 
   // scans
   listScans: (projectId: string) => req<Scan[]>(`/projects/${projectId}/scans`),
-  createScan: (projectId: string, b: { artifact_id: string; scanners: string[]; instructions?: string; model?: string; file_paths?: string[]; review_scope?: string }) =>
+  createScan: (projectId: string, b: {
+    artifact_id: string; scanners: string[]; instructions?: string; model?: string;
+    file_paths?: string[]; review_scope?: string; profile_id?: string; checks?: ScanChecks;
+  }) =>
     req<Scan>(`/projects/${projectId}/scans`, { method: "POST", body: JSON.stringify(b) }),
   getScan: (id: string) => req<Scan>(`/scans/${id}`),
   cancelScan: (id: string) => req<Scan>(`/scans/${id}/cancel`, { method: "POST" }),
@@ -80,6 +83,20 @@ export const api = {
   updateFoundry: (b: Record<string, any>) => req<FoundrySettings>("/settings/foundry", { method: "PUT", body: JSON.stringify(b) }),
   listModels: () => req<{ models: string[]; mock: boolean }>("/settings/foundry/models"),
   testFoundry: () => req<{ ok: boolean; detail: string; models: string[] }>("/settings/foundry/test", { method: "POST" }),
+
+  // saved AI profiles (local / cloud / mock)
+  listProfiles: () => req<AiProfile[]>("/settings/profiles"),
+  createProfile: (b: {
+    name: string; description?: string; from_current?: boolean; activate?: boolean;
+    settings?: Record<string, any>;
+  }) => req<AiProfile>("/settings/profiles", { method: "POST", body: JSON.stringify(b) }),
+  updateProfile: (id: string, b: Record<string, any>) =>
+    req<AiProfile>(`/settings/profiles/${id}`, { method: "PUT", body: JSON.stringify(b) }),
+  deleteProfile: (id: string) => req<void>(`/settings/profiles/${id}`, { method: "DELETE" }),
+  activateProfile: (id: string) =>
+    req<FoundrySettings>(`/settings/profiles/${id}/activate`, { method: "POST" }),
+  testProfile: (id: string) =>
+    req<{ ok: boolean; detail: string; models: string[] }>(`/settings/profiles/${id}/test`, { method: "POST" }),
   getScanners: () => req<ScannerSettings>("/settings/scanners"),
   updateScanners: (b: Record<string, any>) => req<ScannerSettings>("/settings/scanners", { method: "PUT", body: JSON.stringify(b) }),
   testSonar: () => req<{ ok: boolean; detail: string }>("/settings/scanners/sonar-test", { method: "POST" }),

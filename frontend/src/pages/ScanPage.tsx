@@ -3,7 +3,9 @@ import { useNavigate, useParams } from "react-router-dom";
 import { Button, Card, SeverityBadge, Spinner, StateBadge } from "../components/ui";
 import { useScanEvents } from "../hooks/useScanEvents";
 import { api } from "../lib/api";
-import type { ChatMessage, Endpoint, Finding, FindingCode, Scan, StageInfo, TokenUsage } from "../lib/types";
+import type {
+  ChatMessage, CoverageReport, Endpoint, Finding, FindingCode, Scan, StageInfo, TokenUsage,
+} from "../lib/types";
 
 // Some AI-produced raw fields can be objects (e.g. an attack_scenario with
 // {entry_point, sink, code_path} or a PoC with {steps, http_requests}). Coerce
@@ -124,6 +126,9 @@ export default function ScanPage() {
             <ExportBtn scanId={scanId!} format="sarif" label="SARIF" />
             <ExportBtn scanId={scanId!} format="csv" label="CSV" />
             <ExportBtn scanId={scanId!} format="endpoints" label="Endpoints" />
+            {scan.summary?.endpoints?.some((e: Endpoint) => e.auth_scope || e.authn) && (
+              <ExportBtn scanId={scanId!} format="access-matrix" label="Access matrix" />
+            )}
           </div>
         )}
       </div>
@@ -148,7 +153,10 @@ export default function ScanPage() {
           <span className="flex-1 text-[11px] text-muted">
             {[
               resumeInfo.completed.review && `${resumeInfo.completed.review} reviewer batches`,
+              resumeInfo.completed.coverage && `${resumeInfo.completed.coverage} coverage chunks`,
+              resumeInfo.completed.access && `${resumeInfo.completed.access} access-control batches`,
               resumeInfo.completed.judge && `${resumeInfo.completed.judge} judge chunks`,
+              resumeInfo.completed.verify && `${resumeInfo.completed.verify} verification batches`,
               resumeInfo.completed.exploit && `${resumeInfo.completed.exploit} exploit batches`,
             ].filter(Boolean).join(" · ")} already done
           </span>
@@ -175,6 +183,8 @@ export default function ScanPage() {
             </div>
           </Card>
 
+          {scan?.summary?.coverage && <CoveragePanel c={scan.summary.coverage as CoverageReport} />}
+
           <FindingsPanel findings={findings} onTriage={triage} />
 
           {scan?.summary?.endpoints?.length > 0 && (
@@ -200,11 +210,12 @@ function groupLabelOf(f: Finding): string {
   return f.category || f.title || f.cwe || "Other";
 }
 
-// Map a finding's raw source to one of the three buckets we surface as tabs.
-type SourceBucket = "all" | "semgrep" | "sonarqube" | "ai";
+// Map a finding's raw source to one of the buckets we surface as tabs.
+type SourceBucket = "all" | "semgrep" | "sonarqube" | "ai" | "access";
 function bucketOf(f: Finding): Exclude<SourceBucket, "all"> {
   if (f.source === "semgrep") return "semgrep";
   if (f.source === "sonarqube") return "sonarqube";
+  if (f.source === "access") return "access";
   return "ai"; // "ai" + "correlated"
 }
 
@@ -213,6 +224,7 @@ const SOURCE_TABS: { key: SourceBucket; label: string }[] = [
   { key: "semgrep", label: "Semgrep" },
   { key: "sonarqube", label: "SonarQube" },
   { key: "ai", label: "AI" },
+  { key: "access", label: "Access control" },
 ];
 
 function FindingsPanel({ findings, onTriage }: {
@@ -222,7 +234,7 @@ function FindingsPanel({ findings, onTriage }: {
   const [tab, setTab] = useState<SourceBucket>("all");
 
   const counts = useMemo(() => {
-    const c = { all: findings.length, semgrep: 0, sonarqube: 0, ai: 0 };
+    const c = { all: findings.length, semgrep: 0, sonarqube: 0, ai: 0, access: 0 };
     for (const f of findings) c[bucketOf(f)]++;
     return c as Record<SourceBucket, number>;
   }, [findings]);
@@ -328,6 +340,23 @@ const SOURCE_STYLE: Record<string, string> = {
   sonarqube: "bg-cyan-500/20 text-cyan-300",
   ai: "bg-emerald-500/20 text-emerald-300",
   correlated: "bg-amber-500/20 text-amber-300",
+  access: "bg-rose-500/20 text-rose-300",
+};
+
+// [label, classes] for the adversarial verifier's verdict.
+const VERDICT_STYLE: Record<string, [string, string]> = {
+  true_positive: ["✓ verified", "bg-emerald-500/15 text-emerald-300"],
+  false_positive: ["✗ verifier: false positive", "bg-slate-500/20 text-slate-300"],
+  uncertain: ["? verifier unsure", "bg-fuchsia-500/15 text-fuchsia-300"],
+  not_verified: ["not verified", "bg-border/60"],
+};
+
+// Only citation problems get a badge; verified/location-only stay quiet.
+const EVIDENCE_LABEL: Record<string, string> = {
+  relocated: "⚠ line corrected",
+  snippet_mismatch: "⚠ quote not found in code",
+  line_out_of_range: "⚠ cited line doesn't exist",
+  file_missing: "⚠ cited file doesn't exist",
 };
 
 function FindingRow({ f, onTriage }: { f: Finding; onTriage: (id: string, s: string) => void }) {
@@ -361,16 +390,52 @@ function FindingRow({ f, onTriage }: { f: Finding; onTriage: (id: string, s: str
         {f.cwe && <span className="text-[11px] text-muted">{f.cwe}</span>}
         <StateBadge state={f.state} />
       </div>
-      <div className="flex items-center gap-2 mt-1 text-[11px] text-muted">
+      <div className="flex flex-wrap items-center gap-2 mt-1 text-[11px] text-muted">
+        {f.raw?.endpoint && (
+          <span className="px-1.5 rounded font-mono bg-rose-500/15 text-rose-200">{f.raw.endpoint}</span>
+        )}
         {f.file_path && <span>{f.file_path}:{f.line_start}</span>}
         {f.raw?.reviewed_by && <span className="px-1.5 rounded bg-border/60">🔍 {f.raw.reviewed_by}</span>}
         {f.raw?.merged_count && f.raw.merged_count > 1 && <span>×{f.raw.merged_count} reviewers</span>}
+        {f.raw?.reviewer_agreement && f.raw.reviewer_agreement.of > 1 && (
+          <span className={`px-1.5 rounded ${f.raw.reviewer_agreement.count > 1 ? "bg-emerald-500/15 text-emerald-300" : "bg-border/60"}`}
+            title="Independent reviewers that reported this issue">
+            {f.raw.reviewer_agreement.count}/{f.raw.reviewer_agreement.of} reviewers agree
+          </span>
+        )}
+        {f.raw?.verification && VERDICT_STYLE[f.raw.verification.verdict] && (
+          <span className={`px-1.5 rounded ${VERDICT_STYLE[f.raw.verification.verdict][1]}`}
+            title={f.raw.verification.reasoning}>
+            {VERDICT_STYLE[f.raw.verification.verdict][0]}
+          </span>
+        )}
+        {f.raw?.evidence && EVIDENCE_LABEL[f.raw.evidence.status] && (
+          <span className="px-1.5 rounded bg-amber-500/15 text-amber-300" title={f.raw.evidence.note}>
+            {EVIDENCE_LABEL[f.raw.evidence.status]}
+          </span>
+        )}
+        {f.raw?.origin === "heuristic" && (
+          <span className="px-1.5 rounded bg-border/60" title="Regex-based access-control flag">heuristic</span>
+        )}
         {f.triaged_by && <span className="px-1.5 rounded bg-border/60">⚖ {f.triaged_by}</span>}
       </div>
       {open && (
         <div className="mt-3 text-sm space-y-2">
           <p className="text-slate-300 whitespace-pre-wrap">{asText(f.description)}</p>
           {f.triage_note && <p className="text-xs text-amber-300/90">⚖ {f.triage_note}</p>}
+          {f.raw?.verification?.reasoning && (
+            <div className="text-xs p-2 rounded border border-border bg-bg/60">
+              <span className="font-medium text-slate-200">
+                Verifier{f.raw.verification.by ? ` (${f.raw.verification.by})` : ""}:
+              </span>{" "}
+              <span className="text-slate-300">{f.raw.verification.reasoning}</span>
+              {f.raw.severity_original && f.raw.severity_original !== f.severity && (
+                <span className="block text-muted mt-0.5">
+                  severity adjusted {f.raw.severity_original} → {f.severity}
+                </span>
+              )}
+            </div>
+          )}
 
           {/* Code view + AI analysis controls */}
           <div className="flex gap-2">
@@ -583,48 +648,175 @@ function ExportBtn({ scanId, format, label }: { scanId: string; format: string; 
   );
 }
 
+const RISK_RANK: Record<string, number> = { high: 0, medium: 1, low: 2 };
+const AUTHN_STYLE: Record<string, string> = {
+  required: "text-emerald-400", public: "text-sky-300", none: "text-rose-400",
+  unclear: "text-amber-300", unassessed: "text-muted",
+};
+const RISK_STYLE: Record<string, string> = {
+  high: "bg-rose-500/20 text-rose-300", medium: "bg-amber-500/20 text-amber-300",
+  low: "bg-border/60 text-muted",
+};
+
 function EndpointsPanel({ endpoints }: { endpoints: Endpoint[] }) {
   const [open, setOpen] = useState(false);
-  const unauthCount = endpoints.filter((e) => e.auth_hints.length === 0).length;
+  const [riskyOnly, setRiskyOnly] = useState(true);
+  const riskOf = (e: Endpoint) => e.risk || e.heuristic_risk || "low";
+  const hasMatrix = endpoints.some((e) => e.authn || e.auth_scope);
+  const unauth = endpoints.filter((e) =>
+    e.authn ? e.authn === "none" : (e.auth_scope ? e.auth_scope === "none" : e.auth_hints.length === 0));
+  const risky = endpoints.filter((e) => riskOf(e) !== "low");
+  const rows = (hasMatrix && riskyOnly ? risky : endpoints).slice()
+    .sort((a, b) => (RISK_RANK[riskOf(a)] ?? 3) - (RISK_RANK[riskOf(b)] ?? 3));
   return (
     <Card className="p-4">
       <button onClick={() => setOpen((o) => !o)}
         className="flex items-center gap-2 w-full text-left">
         <span className="text-sm font-semibold">
-          {open ? "▼" : "▶"} Discovered endpoints ({endpoints.length})
+          {open ? "▼" : "▶"} {hasMatrix ? "Access-control matrix" : "Discovered endpoints"} ({endpoints.length})
         </span>
-        {unauthCount > 0 && (
-          <span className="text-xs text-amber-400">{unauthCount} without auth</span>
+        {unauth.length > 0 && (
+          <span className="text-xs text-rose-400">{unauth.length} without authentication</span>
+        )}
+        {hasMatrix && risky.length > 0 && (
+          <span className="text-xs text-amber-400">{risky.length} medium/high risk</span>
         )}
       </button>
       {open && (
-        <div className="mt-2 max-h-64 overflow-auto">
-          <table className="w-full text-xs">
-            <thead>
-              <tr className="text-muted border-b border-border">
-                <th className="text-left px-2 py-1">Method</th>
-                <th className="text-left px-2 py-1">Path</th>
-                <th className="text-left px-2 py-1">Handler</th>
-                <th className="text-left px-2 py-1">File</th>
-                <th className="text-left px-2 py-1">Auth</th>
-              </tr>
-            </thead>
-            <tbody>
-              {endpoints.map((ep, i) => (
-                <tr key={i} className={`border-b border-border/50 ${ep.auth_hints.length === 0 ? "text-amber-300/80" : ""}`}>
-                  <td className="px-2 py-0.5 font-mono">{ep.method}</td>
-                  <td className="px-2 py-0.5 font-mono">{ep.path}</td>
-                  <td className="px-2 py-0.5 text-muted">{ep.handler}</td>
-                  <td className="px-2 py-0.5 text-muted">{ep.file_path}:{ep.line}</td>
-                  <td className="px-2 py-0.5">
-                    {ep.auth_hints.length > 0
-                      ? <span className="text-emerald-400">{ep.auth_hints.join(", ")}</span>
-                      : <span className="text-amber-400">none</span>}
-                  </td>
+        <>
+          {hasMatrix && (
+            <label className="flex items-center gap-1.5 text-xs text-muted mt-2 cursor-pointer select-none">
+              <input type="checkbox" checked={riskyOnly} onChange={(e) => setRiskyOnly(e.target.checked)} />
+              Only medium/high risk
+            </label>
+          )}
+          <div className="mt-2 max-h-96 overflow-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="text-muted border-b border-border">
+                  <th className="text-left px-2 py-1">Method</th>
+                  <th className="text-left px-2 py-1">Path</th>
+                  {hasMatrix ? (<>
+                    <th className="text-left px-2 py-1">Authn</th>
+                    <th className="text-left px-2 py-1">Authz</th>
+                    <th className="text-left px-2 py-1">Risk</th>
+                  </>) : <th className="text-left px-2 py-1">Auth</th>}
+                  <th className="text-left px-2 py-1">Handler</th>
                 </tr>
+              </thead>
+              <tbody>
+                {rows.map((ep, i) => (
+                  <tr key={ep.id || i} className="border-b border-border/50 align-top">
+                    <td className="px-2 py-0.5 font-mono">{ep.method}</td>
+                    <td className="px-2 py-0.5 font-mono">
+                      {ep.path}
+                      {ep.notes && <div className="font-sans text-[10px] text-muted max-w-xs">{ep.notes}</div>}
+                    </td>
+                    {hasMatrix ? (<>
+                      <td className={`px-2 py-0.5 ${AUTHN_STYLE[ep.authn || ""] || "text-muted"}`}
+                        title={`detected: ${ep.auth_scope ?? "?"}${ep.auth_hints.length ? ` (${ep.auth_hints.join(", ")})` : ""}`}>
+                        {ep.authn || `${ep.auth_scope} (heuristic)`}
+                      </td>
+                      <td className="px-2 py-0.5 text-slate-300"
+                        title={[...(ep.role_hints || []), ...(ep.ownership_hints || [])].join(", ")}>
+                        {ep.authz || (ep.ownership_hints?.length ? "ownership?" : ep.role_hints?.length ? "role?" : "—")}
+                      </td>
+                      <td className="px-2 py-0.5">
+                        <span className={`px-1.5 rounded ${RISK_STYLE[riskOf(ep)]}`}>{riskOf(ep)}</span>
+                      </td>
+                    </>) : (
+                      <td className="px-2 py-0.5">
+                        {ep.auth_hints.length > 0
+                          ? <span className="text-emerald-400">{ep.auth_hints.join(", ")}</span>
+                          : <span className="text-amber-400">none</span>}
+                      </td>
+                    )}
+                    <td className="px-2 py-0.5 text-muted">
+                      {(ep.handler_file || ep.file_path)}:{ep.handler_line || ep.line}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {rows.length === 0 && <div className="text-xs text-muted p-2">No medium/high-risk endpoints.</div>}
+          </div>
+        </>
+      )}
+    </Card>
+  );
+}
+
+function CoveragePanel({ c }: { c: CoverageReport }) {
+  const [showGaps, setShowGaps] = useState(false);
+  const loaded = c.files_loaded ?? 0;
+  const reviewed = loaded - (c.files_unreviewed ?? 0);
+  const staticTotal = c.static_candidates ?? 0;
+  const withVerdict = (c.candidates_addressed_by_review ?? 0) + (c.candidates_triaged ?? 0);
+  const v = c.verification;
+  const ev = c.evidence || {};
+  const evProblems = (ev.snippet_mismatch ?? 0) + (ev.line_out_of_range ?? 0) + (ev.file_missing ?? 0);
+  const gaps = [
+    (c.files_unreviewed ?? 0) > 0 && `${c.files_unreviewed} file(s) no reviewer could read (after retry)`,
+    (c.files_unreadable ?? 0) > 0 && `${c.files_unreadable} file(s) unreadable (binary / too large)`,
+    (c.candidates_over_cap ?? 0) > 0 && `${c.candidates_over_cap} scanner hit(s) over the triage cap`,
+    (c.candidates_triage_missing ?? 0) > 0 && `${c.candidates_triage_missing} scanner hit(s) got no AI verdict (kept as proposed)`,
+    c.checks && !c.checks.coverage && staticTotal > withVerdict &&
+      `${staticTotal - withVerdict} scanner hit(s) not addressed (coverage sweep off)`,
+    (v?.over_cap ?? 0) > 0 && `${v!.over_cap} finding(s) over the verification cap`,
+    c.endpoints && c.endpoints.total > c.endpoints.assessed && c.checks?.access_control &&
+      `${c.endpoints.total - c.endpoints.assessed} endpoint(s) not assessed`,
+  ].filter(Boolean) as string[];
+  const tile = (label: string, value: string, sub?: string, warn?: boolean) => (
+    <div className="rounded-md border border-border p-2">
+      <div className={`text-base font-semibold tabular-nums ${warn ? "text-amber-300" : ""}`}>{value}</div>
+      <div className="text-[11px] text-muted">{label}</div>
+      {sub && <div className="text-[10px] text-muted mt-0.5">{sub}</div>}
+    </div>
+  );
+  return (
+    <Card className="p-4">
+      <div className="flex items-center mb-2">
+        <h2 className="font-semibold text-sm">Coverage & verification</h2>
+        <span className={`ml-2 text-[11px] ${gaps.length ? "text-amber-300" : "text-emerald-400"}`}>
+          {gaps.length ? `${gaps.length} gap(s)` : "no gaps detected"}
+        </span>
+      </div>
+      <div className="grid grid-cols-5 gap-2">
+        {tile("files reviewed", `${reviewed}/${c.files_total ?? loaded}`,
+          (c.batches_recovered ?? 0) > 0 ? `${c.batches_recovered} batch(es) recovered on retry` : undefined,
+          reviewed < (c.files_total ?? loaded))}
+        {tile("scanner hits with AI verdict", `${withVerdict}/${staticTotal}`,
+          c.candidates_triaged ? `${c.candidates_triaged} via coverage sweep` : undefined,
+          withVerdict < staticTotal)}
+        {tile("second look", c.second_look_files != null ? `${c.second_look_files} files` : "off",
+          c.second_look_files != null ? `${c.second_look_findings ?? 0} new findings` : undefined)}
+        {tile("endpoints assessed", c.endpoints ? `${c.endpoints.assessed}/${c.endpoints.total}` : "—",
+          undefined, !!c.endpoints && c.endpoints.assessed < c.endpoints.total)}
+        {tile("FP verification", v ? `${v.eligible ?? 0} checked` : "off",
+          v ? `${v.true_positive ?? 0} confirmed · ${v.false_positive ?? 0} rejected · ${v.uncertain ?? 0} → human` : undefined)}
+      </div>
+      <div className="flex flex-wrap gap-1.5 mt-2 text-[11px]">
+        <span className="text-muted">Citations:</span>
+        {Object.entries(ev).map(([k, n]) => (
+          <span key={k} className={`px-1.5 rounded ${EVIDENCE_LABEL[k] ? "bg-amber-500/15 text-amber-300" : "bg-border/60 text-slate-300"}`}>
+            {k.replace(/_/g, " ")}: {n}
+          </span>
+        ))}
+        {evProblems > 0 && <span className="text-muted">— bad citations were corrected, down-weighted or dismissed</span>}
+      </div>
+      {gaps.length > 0 && (
+        <div className="mt-2 text-[11px]">
+          <button onClick={() => setShowGaps((s) => !s)} className="text-amber-300 hover:underline">
+            {showGaps ? "▾" : "▸"} Coverage gaps
+          </button>
+          {showGaps && (
+            <ul className="mt-1 ml-4 list-disc text-slate-300 space-y-0.5">
+              {gaps.map((g) => <li key={g}>{g}</li>)}
+              {(c.unreviewed_files || []).slice(0, 50).map((p) => (
+                <li key={p} className="font-mono text-muted list-none -ml-4">· {p}</li>
               ))}
-            </tbody>
-          </table>
+            </ul>
+          )}
         </div>
       )}
     </Card>
