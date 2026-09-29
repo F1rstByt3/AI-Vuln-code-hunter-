@@ -122,6 +122,10 @@ async def resume_scan_endpoint(scan_id: str, session: AsyncSession = Depends(get
     """Resume an interrupted scan's AI pipeline, skipping work units already
     checkpointed to the DB (so a crash/Docker-stop mid-review doesn't re-spend)."""
     scan = await get_or_404(session, Scan, scan_id)
+    if scan.status in (ScanStatus.queued, ScanStatus.running):
+        # A second job on the same scan would race the first (duplicate work,
+        # clobbered checkpoints) — only resume a scan that has stopped.
+        raise HTTPException(http_status.HTTP_409_CONFLICT, "scan is already running")
     has_ckpt = (await session.execute(
         select(ScanCheckpoint.id).where(ScanCheckpoint.scan_id == scan_id).limit(1)
     )).first() is not None

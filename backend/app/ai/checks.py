@@ -171,8 +171,8 @@ Return strict JSON: {"verdicts": [{"id", "verdict", "confidence", \
 
 
 async def _complete(client: FoundryClient, role: ModelRole, system: str, user: str,
-                    cache_key: str) -> dict:
-    return await asyncio.wait_for(
+                    cache_key: str, expect: str) -> dict:
+    res = await asyncio.wait_for(
         client.complete_json(
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
             model=role.deployment, transport=role.effective_transport(),
@@ -180,6 +180,9 @@ async def _complete(client: FoundryClient, role: ModelRole, system: str, user: s
         ),
         timeout=_CALL_TIMEOUT,
     )
+    if not isinstance(res, dict) or not isinstance(res.get(expect), list):
+        raise ValueError(f"model returned no parseable {{\"{expect}\": [...]}} JSON")
+    return res
 
 
 async def _robust(call: Callable[[list], Awaitable[list]], items: list, emit: EmitFn,
@@ -540,7 +543,7 @@ async def run_coverage_sweep(
                 f"Give an explicit verdict for each of these {len(payload)} unaddressed "
                 f"static-analysis results.\n\n<<TRIAGE_JSON>>"
                 + json.dumps({"results": payload}) + "<<END>>",
-                "hunter-triage")
+                "hunter-triage", "findings")
             return [f for f in res.get("findings", []) if isinstance(f, dict)]
 
         async with sem:
@@ -738,7 +741,7 @@ async def run_access_review(
             f"Audit access control for these {len(items)} endpoints: give every endpoint "
             f"a verdict and report access-control findings.\n\n<<ACCESS_JSON>>"
             + json.dumps(payload) + "<<END>>",
-            "hunter-access")
+            "hunter-access", "endpoints")
         vs = [v for v in res.get("endpoints", []) if isinstance(v, dict)
               and v.get("id") in ids]
         fs = [f for f in res.get("findings", []) if isinstance(f, dict) and f.get("title")]
@@ -968,7 +971,7 @@ async def run_verification(
             f"Try to disprove each of these {len(payload)} findings and return a verdict "
             f"for every one.\n\n<<VERIFY_JSON>>" + json.dumps({"findings": payload})
             + "<<END>>",
-            "hunter-verify")
+            "hunter-verify", "verdicts")
         return [v for v in res.get("verdicts", []) if isinstance(v, dict)]
 
     async def _do(idx: int, idxs: list[int]) -> None:

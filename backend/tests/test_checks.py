@@ -266,3 +266,30 @@ async def test_nestjs_and_fastify_routes(tmp_path):
     assert by["/users/:id"]["handler"] == "findOne"
     assert by["/reports/:reportId"]["auth_scope"] == "none"
     assert by["/health"]["likely_public"]
+
+
+class _GarbageClient(MockFoundryClient):
+    """A model that never produces the requested JSON (e.g. too small / truncated)."""
+
+    async def complete_json(self, messages, **kw):
+        return {}
+
+
+@pytest.mark.asyncio
+async def test_unparseable_model_output_fails_fast_instead_of_zero_findings(app_dir):
+    saved: list[str] = []
+
+    async def save_chunk(phase, key, items):
+        saved.append(key)
+
+    async def emit(_e):
+        pass
+
+    with pytest.raises(RuntimeError, match="Every review batch failed"):
+        await run_review(
+            client=_GarbageClient(),
+            roles=ReviewRoles(chat=ModelRole("c"), reviewers=[ModelRole("r")], judge=None),
+            instructions=None, files=[{"path": "db.py"}], candidates=[],
+            read_file=_reader(app_dir), emit=emit, save_chunk=save_chunk,
+        )
+    assert saved == []  # garbage batches must not be checkpointed as "done"

@@ -331,7 +331,8 @@ def _parse_json(text: str | None) -> dict:
             try:
                 return json.loads(text[start : end + 1])
             except json.JSONDecodeError:
-                return {}
+                pass
+        log.warning("unparseable model output (%d chars): %r", len(text), text[:400])
         return {}
 
 

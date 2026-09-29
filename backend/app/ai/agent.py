@@ -495,6 +495,15 @@ async def run_review(
 
     reviewer_results = await asyncio.gather(*(run_reviewer(r) for r in roles.reviewers))
     raw_findings = [f for sub in reviewer_results for f in sub]
+    if batches and retry_stats["batches_failed"] >= len(batches) * len(roles.reviewers):
+        await stage("ai_review", "failed")
+        raise RuntimeError(
+            "Every review batch failed: the model returned no usable JSON. Usual causes "
+            "with local models: the model is too small for structured output (try "
+            "qwen2.5-coder:14b or larger), or the server's real context window is "
+            "smaller than the profile's 'Context window' setting so prompts are "
+            "silently truncated (for Ollama set OLLAMA_CONTEXT_LENGTH to match). "
+            "Check the worker log for the raw model output.")
     await stage("ai_review", "done", done=total_units, total=total_units)
 
     # A file is unreviewed only if EVERY reviewer failed on it.
@@ -838,8 +847,13 @@ async def _review_with_adaptive_split(
             reasoning_effort=reviewer.reasoning_effort,
             cache_key="hunter-review",
         )
+        if not isinstance(result, dict) or not isinstance(result.get("findings"), list):
+            # Garbage/empty output parses to {} — that's a failed call, not a
+            # clean batch. Raising keeps it out of the checkpoint so it is
+            # retried (and reported) instead of silently counting as reviewed.
+            raise ValueError("model returned no parseable {\"findings\": [...]} JSON")
         out = []
-        for f in result.get("findings", []):
+        for f in result["findings"]:
             if isinstance(f, dict):
                 out.append({**_shift_finding(f, line_offset),
                             "reviewed_by": reviewer.deployment})
