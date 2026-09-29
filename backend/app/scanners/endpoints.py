@@ -1,6 +1,6 @@
 """Scanner that extracts API endpoints / route definitions from source code.
 
-Supports: FastAPI, Flask, Django, Express, Next.js, Spring, ASP.NET,
+Supports: FastAPI, Flask, Django, Express, Fastify, NestJS, Next.js, Spring, ASP.NET,
 Go net/http, Gin, Rails, and Laravel.
 """
 
@@ -83,12 +83,23 @@ _DJANGO_PATH = re.compile(
 # Server-side router objects only (app, router, usersRouter, server) — not
 # `api.get(...)`, which is usually a client-side axios instance.
 _EXPRESS = re.compile(
-    r"""\b(?:app|router|\w+Router|server)\."""
+    r"""\b(?:app|router|\w+Router|server|fastify|instance|routes)\."""
     r"""(get|post|put|delete|patch|head|options|all)"""
     r"""\(\s*["'`]([^"'`]+)["'`]"""
     r"""(?:\s*,\s*(\w+))?""",
     re.IGNORECASE,
 )
+
+# -- JS/TS: Fastify full declaration  fastify.route({ method, url, handler }) -
+_FASTIFY_ROUTE = re.compile(r"""\b(?:fastify|app|server|instance|router)\.route\(\s*\{?""")
+_ROUTE_METHOD = re.compile(r"""method\s*:\s*\[?\s*["'](\w+)["']""")
+_ROUTE_URL = re.compile(r"""(?:url|path)\s*:\s*["'`]([^"'`]+)["'`]""")
+
+# -- TS: NestJS  @Controller('users') + @Get(':id') ------------------------
+_NEST_CONTROLLER = re.compile(
+    r"""@Controller\(\s*(?:\{[^}]*?path\s*:\s*)?(?:["'`]([^"'`]*)["'`])?""")
+_NEST_METHOD = re.compile(
+    r"""@(Get|Post|Put|Delete|Patch|All|Head|Options)\(\s*(?:["'`]([^"'`]*)["'`])?\s*\)""")
 
 # -- Java: Spring -----------------------------------------------------------
 _SPRING_MAPPING = re.compile(
@@ -159,6 +170,8 @@ _LANG_EXTS: dict[str, str] = {
     ".js": "javascript",
     ".ts": "typescript",
     ".jsx": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
     ".tsx": "typescript",
     ".java": "java",
     ".cs": "csharp",
@@ -172,8 +185,10 @@ _LANG_EXTS: dict[str, str] = {
 # entirely. This avoids full line-by-line regex on ~95% of source files.
 _PRESCREEN: dict[str, tuple[bytes, ...]] = {
     "python": (b"@app.", b"@router.", b"@blueprint.", b"@bp.", b"path(", b"re_path(", b"url("),
-    "javascript": (b"app.", b"outer.", b"server.", b"Route", b"export", b"pages/api"),
-    "typescript": (b"app.", b"outer.", b"server.", b"Route", b"export", b"pages/api"),
+    "javascript": (b"app.", b"outer.", b"server.", b"fastify", b"Route", b"export",
+                   b"pages/api", b"@Controller"),
+    "typescript": (b"app.", b"outer.", b"server.", b"fastify", b"Route", b"export",
+                   b"pages/api", b"@Controller"),
     "java": (b"Mapping",),
     "csharp": (b"Http", b"[Route", b".Map"),
     "go": (b"HandleFunc", b".GET", b".POST", b".PUT", b".DELETE", b".PATCH"),
@@ -339,6 +354,7 @@ def _extract_endpoints_sync(workdir: str) -> list[dict]:
                     })
 
             # --- Line-by-line regex matching ------------------------------
+            nest_prefix = ""  # current NestJS @Controller() path in this file
             for line_idx, line in enumerate(lines):
                 lineno = line_idx + 1
 
@@ -399,8 +415,40 @@ def _extract_endpoints_sync(workdir: str) -> list[dict]:
                         })
                         continue
 
-                # JavaScript/TypeScript: Express
+                # JavaScript/TypeScript: NestJS, Fastify, Express
                 if lang in ("javascript", "typescript"):
+                    m = _NEST_CONTROLLER.search(line)
+                    if m:
+                        nest_prefix = (m.group(1) or "").strip("/")
+                        continue
+                    m = _NEST_METHOD.search(line)
+                    if m:
+                        sub = (m.group(2) or "").strip("/")
+                        path = "/" + "/".join(p for p in (nest_prefix, sub) if p)
+                        results.append({
+                            "method": "ANY" if m.group(1) == "All" else m.group(1).upper(),
+                            "path": path,
+                            "file_path": rel_path,
+                            "line": lineno,
+                            "framework": "nestjs",
+                            "handler": _method_name_below(lines, line_idx),
+                            "auth_hints": _get_auth_hints(lines, line_idx),
+                        })
+                        continue
+                    if _FASTIFY_ROUTE.search(line):
+                        block = "\n".join(lines[line_idx:line_idx + 12])
+                        mm, mu = _ROUTE_METHOD.search(block), _ROUTE_URL.search(block)
+                        if mu:
+                            results.append({
+                                "method": _norm_method(mm.group(1)) if mm else "ANY",
+                                "path": mu.group(1),
+                                "file_path": rel_path,
+                                "line": lineno,
+                                "framework": "fastify",
+                                "handler": None,
+                                "auth_hints": _get_auth_hints(lines, line_idx),
+                            })
+                            continue
                     m = _EXPRESS.search(line)
                     if m:
                         method = _norm_method(m.group(1))
@@ -413,7 +461,7 @@ def _extract_endpoints_sync(workdir: str) -> list[dict]:
                             "path": path,
                             "file_path": rel_path,
                             "line": lineno,
-                            "framework": "express",
+                            "framework": "fastify" if "fastify." in line else "express",
                             "handler": handler,
                             "auth_hints": _get_auth_hints(lines, line_idx),
                         })
@@ -581,6 +629,18 @@ def _extract_endpoints_sync(workdir: str) -> list[dict]:
     logger.info("endpoint extraction: checked %d files, read %d, found %d endpoints",
                 files_checked, files_read, len(results))
     return results
+
+
+def _method_name_below(lines: list[str], decorator_idx: int) -> str | None:
+    """Class-method name under a decorator stack (NestJS: `async findOne(` or
+    `findAll(`), skipping further decorator lines."""
+    for i in range(decorator_idx + 1, min(decorator_idx + 8, len(lines))):
+        s = lines[i].strip()
+        if not s or s.startswith("@"):
+            continue
+        m = re.match(r"(?:public\s+|private\s+|protected\s+)?(?:async\s+)?(\w+)\s*\(", s)
+        return m.group(1) if m else None
+    return None
 
 
 def _extract_handler_below(lines: list[str], decorator_idx: int) -> str | None:

@@ -216,3 +216,53 @@ async def test_checks_can_be_disabled(app_dir):
                if e["type"] == "stage" and e["state"] == "skipped"}
     assert {"ai_coverage", "ai_access", "ai_verify"} <= skipped
     assert "verification" not in result["summary"]["coverage"]
+
+
+NEST_TS = '''\
+import { Controller, Get, Delete, UseGuards } from '@nestjs/common';
+
+@UseGuards(JwtAuthGuard)
+@Controller('users')
+export class UsersController {
+  @Get(':id')
+  findOne(@Param('id') id: string) {
+    return this.users.findById(id);
+  }
+}
+
+@Controller('reports')
+export class ReportsController {
+  @Delete(':reportId')
+  async remove(@Param('reportId') reportId: string) {
+    return this.reports.delete(reportId);
+  }
+}
+'''
+
+FASTIFY_JS = '''\
+fastify.get('/health', async () => ({ ok: true }));
+fastify.route({
+  method: 'POST',
+  url: '/jobs/:jobId/run',
+  handler: runJob,
+});
+'''
+
+
+@pytest.mark.asyncio
+async def test_nestjs_and_fastify_routes(tmp_path):
+    (tmp_path / "users.controller.ts").write_text(NEST_TS)
+    (tmp_path / "server.mjs").write_text(FASTIFY_JS)
+    eps = await extract_endpoints(str(tmp_path))
+    got = {(e["framework"], e["method"], e["path"]) for e in eps}
+    assert ("nestjs", "GET", "/users/:id") in got
+    assert ("nestjs", "DELETE", "/reports/:reportId") in got
+    assert ("fastify", "GET", "/health") in got
+    assert ("fastify", "POST", "/jobs/:jobId/run") in got
+
+    amap = await analyze_endpoints(eps, str(tmp_path))
+    by = {e["path"]: e for e in amap["endpoints"]}
+    assert by["/users/:id"]["auth_scope"] == "file"        # class-level @UseGuards
+    assert by["/users/:id"]["handler"] == "findOne"
+    assert by["/reports/:reportId"]["auth_scope"] == "none"
+    assert by["/health"]["likely_public"]

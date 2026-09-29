@@ -180,7 +180,7 @@ def _analyze_sync(endpoints: list[dict], workdir: str) -> dict:
     all_paths, global_auth = _scan_tree(workdir)
     global_enforced = any(e["enforces"] for e in global_auth)
     cache: dict[str, list[str] | None] = {}
-    fa_cache: dict[str, list[tuple[int, str]]] = {}
+    fa_cache: dict[str, list[tuple[int, int, str]]] = {}
 
     def lines_of(rel: str | None) -> list[str] | None:
         if not rel:
@@ -192,7 +192,7 @@ def _analyze_sync(endpoints: list[dict], workdir: str) -> dict:
     def file_auth_of(rel: str, before_line: int) -> list[str]:
         if rel not in fa_cache:
             fa_cache[rel] = _file_auth_index(lines_of(rel) or [])
-        return _uniq(h for n, h in fa_cache[rel] if n < before_line)
+        return _uniq(h for start, end, h in fa_cache[rel] if start < before_line <= end)
 
     # Route lines per file, so a handler window stops at the next route.
     routes_by_file: dict[str, list[int]] = {}
@@ -510,19 +510,28 @@ def _block_end(lines: list[str], line: int, ext: str, cap: int = 80) -> int:
     return last
 
 
-def _file_auth_index(lines: list[str]) -> list[tuple[int, str]]:
-    """(line, hint) for auth applied to every route declared after it in this
-    file/controller: router deps, router.use(auth), before_action, mixins, and
-    attribute markers that decorate the *class* (not a single method)."""
-    out: list[tuple[int, str]] = []
+def _file_auth_index(lines: list[str]) -> list[tuple[int, int, str]]:
+    """(from_line, to_line, hint) for auth applied to routes declared after it in
+    this file/controller: router deps, router.use(auth), before_action, mixins,
+    and attribute markers that decorate a *class* — those cover only that class
+    (up to the next class declaration), not later controllers in the file."""
+    n_lines = len(lines)
+    class_lines = [i + 1 for i, ln in enumerate(lines) if _CLASS_DECL_RE.search(ln)]
+    out: list[tuple[int, int, str]] = []
     for n, line in enumerate(lines, 1):
         m = _FILE_AUTH_RE.search(line)
         if m:
-            out.append((n, m.group(0).strip()[:80]))
+            out.append((n, n_lines + 1, m.group(0).strip()[:80]))
             continue
         m = _CLASS_ATTR_RE.search(line)
-        if m and any(_CLASS_DECL_RE.search(lines[k]) for k in range(n, min(len(lines), n + 4))):
-            out.append((n, m.group(0).strip()[:80]))
+        if not m:
+            continue
+        decorated = next((c for c in class_lines if n <= c <= n + 4), None)
+        if decorated is None:
+            continue
+        nxt = next((c for c in class_lines if c > decorated), n_lines + 1)
+        # The next class's own decorators sit just above it; stop before them.
+        out.append((n, nxt - 1, m.group(0).strip()[:80]))
     return out
 
 
