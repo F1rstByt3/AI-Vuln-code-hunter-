@@ -356,3 +356,145 @@ async def export_csv(
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="scan_{scan_id}_findings.csv"'},
     )
+
+
+# ---------------------------------------------------------------------------
+# OpenAPI spec for Burp (broken-access-control testing)
+# ---------------------------------------------------------------------------
+
+_OAS_PARAM_RE = None  # compiled lazily (keeps import-time cost off other exports)
+_ANY_METHODS = ("get", "post")  # "ANY" routes: the two methods worth probing first
+_RISK_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+
+def _oas_path(path: str) -> tuple[str, list[str]]:
+    """Normalise framework route syntax to an OpenAPI template:
+    :id / <int:pk> / [id] / {id:int} / (?P<id>...) → {id}."""
+    import re
+
+    global _OAS_PARAM_RE
+    if _OAS_PARAM_RE is None:
+        _OAS_PARAM_RE = re.compile(
+            r"\{([A-Za-z_]\w*)(?::[^}]*)?\}|:([A-Za-z_]\w*)"
+            r"|<(?:\w+:)?([A-Za-z_]\w*)>|\[\.{0,3}([A-Za-z_]\w*)\]|\(\?P<([A-Za-z_]\w*)>[^)]*\)")
+    names: list[str] = []
+
+    def sub(m):
+        name = next(g for g in m.groups() if g)
+        names.append(name)
+        return "{" + name + "}"
+
+    p = _OAS_PARAM_RE.sub(sub, path or "/")
+    p = p.replace("^", "").replace("$", "")
+    if not p.startswith("/"):
+        p = "/" + p
+    return p, list(dict.fromkeys(names))
+
+
+def _bac_tests(ep: dict) -> list[str]:
+    """What a tester should try on this endpoint for broken access control."""
+    tests = []
+    authn = ep.get("authn") or ep.get("auth_scope")
+    if authn not in ("public",) and not ep.get("likely_public"):
+        tests.append("Replay with NO session/token — expect 401/403 (missing authentication).")
+    if ep.get("id_params"):
+        ids = ", ".join(ep["id_params"])
+        tests.append(f"As user A, request user B's object ({ids}) — expect 403/404 (IDOR/BOLA).")
+    if ep.get("privileged") or ep.get("authz") in ("none", "unclear"):
+        tests.append("Replay with a low-privilege user's session — expect 403 "
+                     "(missing function-level authorization).")
+    if ep.get("state_changing"):
+        tests.append("Add privileged fields to the body (role, is_admin, owner_id, "
+                     "tenant_id) — expect them ignored (mass assignment).")
+    return tests
+
+
+@router.get("/scans/{scan_id}/export/openapi")
+async def export_openapi(
+    scan_id: str,
+    base_url: str = "https://target.example",
+    min_risk: str = "low",
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """OpenAPI 3 spec of the scan's endpoints, annotated for access-control
+    testing. Import into Burp (API scan / OpenAPI Parser), Postman, etc.
+    Each operation carries x-access (AI/heuristic verdict), related findings,
+    and concrete BAC test steps; tags group operations by risk."""
+    scan = await get_or_404(session, Scan, scan_id)
+    endpoints = [e for e in (scan.summary or {}).get("endpoints", []) if isinstance(e, dict)]
+    cutoff = _RISK_ORDER.get(min_risk, 2)
+    findings = (await session.execute(
+        select(Finding).where(Finding.scan_id == scan_id))).scalars().all()
+    by_endpoint: dict[str, list[str]] = {}
+    for f in findings:
+        label = (f.raw or {}).get("endpoint")
+        if label and f.state != FindingState.dismissed:
+            by_endpoint.setdefault(" ".join(label.upper().split()), []).append(
+                f"[{f.severity.value}] {f.title}")
+
+    paths: dict[str, dict] = {}
+    for ep in sorted(endpoints, key=lambda e: _RISK_ORDER.get(
+            e.get("risk") or e.get("heuristic_risk") or "low", 2)):
+        risk = ep.get("risk") or ep.get("heuristic_risk") or "low"
+        if _RISK_ORDER.get(risk, 2) > cutoff:
+            continue
+        path, params = _oas_path(ep.get("path") or "/")
+        method = (ep.get("method") or "ANY").upper()
+        methods = _ANY_METHODS if method in ("ANY", "ALL") else (method.lower(),)
+        related = by_endpoint.get(f"{method} {ep.get('path')}".upper(), [])
+        tests = _bac_tests(ep)
+        public = (ep.get("authn") == "public") or (
+            not ep.get("authn") and ep.get("auth_scope") in ("none", "public"))
+        desc = "\n".join(
+            [f"Handler: {ep.get('handler_file') or ep.get('file_path')}:"
+             f"{ep.get('handler_line') or ep.get('line')} ({ep.get('framework')})",
+             f"Auth: authn={ep.get('authn') or ep.get('auth_scope')} "
+             f"authz={ep.get('authz') or 'unassessed'} risk={risk}"]
+            + ([f"Notes: {ep['notes']}"] if ep.get("notes") else [])
+            + (["Related findings:"] + [f"- {r}" for r in related] if related else [])
+            + (["BAC tests:"] + [f"- {t}" for t in tests] if tests else []))
+        for m in methods:
+            op = {
+                "operationId": f"{m}_{ep.get('id') or len(paths)}",
+                "summary": f"[{risk.upper()}] {ep.get('handler') or path}",
+                "description": desc,
+                "tags": [f"risk-{risk}"] + (["has-findings"] if related else []),
+                "parameters": [
+                    {"name": n, "in": "path", "required": True,
+                     "schema": {"type": "string"}, "example": "1"} for n in params],
+                "responses": {"200": {"description": "OK"},
+                              "401": {"description": "Unauthenticated"},
+                              "403": {"description": "Forbidden"}},
+                "security": [] if public else [{"bearerAuth": []}, {"cookieAuth": []}],
+                "x-access": {k: ep.get(k) for k in (
+                    "authn", "authz", "risk", "auth_scope", "heuristic_risk", "role_hints",
+                    "ownership_hints", "id_params", "privileged", "state_changing")
+                    if ep.get(k) not in (None, [], "")},
+                "x-bac-tests": tests,
+            }
+            if m in ("post", "put", "patch"):
+                op["requestBody"] = {"required": False, "content": {
+                    "application/json": {"schema": {"type": "object"}, "example": {}}}}
+            paths.setdefault(path, {})[m] = op
+
+    spec = {
+        "openapi": "3.0.3",
+        "info": {"title": f"AI Vuln Code Hunter — scan {scan_id[:8]} endpoints",
+                 "version": "1.0",
+                 "description": "Generated from source-code analysis for broken "
+                                "access control testing. Operations are tagged by "
+                                "risk; see x-bac-tests on each."},
+        "servers": [{"url": base_url.rstrip("/")}],
+        "tags": [{"name": f"risk-{r}"} for r in ("high", "medium", "low")]
+                + [{"name": "has-findings"}],
+        "paths": paths,
+        "components": {"securitySchemes": {
+            "bearerAuth": {"type": "http", "scheme": "bearer"},
+            "cookieAuth": {"type": "apiKey", "in": "cookie", "name": "session"}}},
+    }
+    return Response(
+        content=json.dumps(spec, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition":
+                 f'attachment; filename="scan_{scan_id}_openapi.json"'},
+    )

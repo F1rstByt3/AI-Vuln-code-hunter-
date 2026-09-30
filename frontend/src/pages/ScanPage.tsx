@@ -129,6 +129,20 @@ export default function ScanPage() {
             {scan.summary?.endpoints?.some((e: Endpoint) => e.auth_scope || e.authn) && (
               <ExportBtn scanId={scanId!} format="access-matrix" label="Access matrix" />
             )}
+            {(scan.summary?.endpoints?.length ?? 0) > 0 && (
+              <button
+                onClick={() => {
+                  const base = prompt("Target base URL for the OpenAPI spec (e.g. https://app.example.com)",
+                    "https://");
+                  if (!base || base === "https://") return;
+                  const url = `${api.exportUrl(scanId!, "openapi")}?base_url=${encodeURIComponent(base)}`;
+                  window.open(url, "_blank");
+                }}
+                title="OpenAPI spec of the endpoints, annotated for broken-access-control testing — import into Burp"
+                className="px-2 py-1 rounded text-xs border border-border hover:bg-border text-slate-300">
+                OpenAPI (Burp)
+              </button>
+            )}
           </div>
         )}
       </div>
