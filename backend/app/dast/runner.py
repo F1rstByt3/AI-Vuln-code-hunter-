@@ -26,7 +26,7 @@ from app.dast.scope import Scope, ScopeError
 from app.db import SessionLocal
 from app.models import (
     DastCredential, DastRun, DastStatus, DastTarget, Finding, FindingSource,
-    FindingState, Scan,
+    FindingState, McpServer, Scan, Severity,
 )
 
 
@@ -118,6 +118,17 @@ async def run_dast(ctx: dict, run_id: str) -> None:
                                 "done": i + 1, "total": total})
                 counts["requests"] = client.count
             await session.commit()
+
+            # Active scan (Burp) — seed the authenticated surface and ingest issues.
+            if run.config.get("active_scan") and target.burp_mcp_id:
+                try:
+                    await _run_active_scan(session, run, scan, target, scope, low, priv,
+                                           emit, counts)
+                except ScanCanceledSignal:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    await emit({"type": "stage", "stage": "dast_active", "state": "failed"})
+                    await emit({"type": "log", "message": f"Active scan error: {exc}"})
             run.status = DastStatus.completed
         except ScanCanceledSignal:
             await session.commit()
@@ -147,6 +158,112 @@ async def run_dast(ctx: dict, run_id: str) -> None:
                     f"{counts['untestable']} untestable · {counts['requests']} requests"})
         await emit({"type": "dast_done", "status": run.status.value, "summary": counts})
         await control.clear_control(run.scan_id + ":dast")
+
+
+async def _run_active_scan(session, run: DastRun, scan: Scan, target: DastTarget,
+                           scope: Scope, low, priv, emit, counts: dict) -> None:
+    """Seed the discovered request surface into Burp, run an active scan, and
+    ingest issues as ``dast`` findings. Gracefully degrades when the Burp MCP
+    server exposes no scan tool (the surface is still seeded)."""
+    from app.dast.burp import BurpClient, issue_to_finding, wait_and_fetch_issues
+
+    server = await session.get(McpServer, target.burp_mcp_id)
+    if server is None:
+        await emit({"type": "log", "message": "Active scan skipped: Burp MCP server not found"})
+        return
+    await emit({"type": "stage", "stage": "dast_active", "state": "running"})
+    await emit({"type": "status", "status": "dast: active scan (Burp)"})
+    burp = BurpClient(server)
+    try:
+        caps = await burp.capabilities()
+    except Exception as exc:  # noqa: BLE001
+        await emit({"type": "stage", "stage": "dast_active", "state": "failed"})
+        await emit({"type": "log", "message":
+                    f"Active scan skipped: Burp MCP unreachable ({exc})"})
+        return
+    if not caps.get("send"):
+        await emit({"type": "stage", "stage": "dast_active", "state": "skipped"})
+        await emit({"type": "log", "message":
+                    "Active scan skipped: Burp MCP exposes no request-sending tool"})
+        return
+
+    # Seed the authenticated surface: every discovered endpoint, using the most
+    # privileged usable identity so Burp scans behind auth.
+    ident = (priv or low or [Identity.anonymous()])[0]
+    base = target.base_url.rstrip("/")
+    seeded_urls: list[str] = []
+    skipped_mut = 0
+    for e in (scan.summary or {}).get("endpoints", []):
+        if not isinstance(e, dict):
+            continue
+        method = (e.get("method") or "GET").upper()
+        if method in ("ANY", "ALL"):
+            method = "GET"
+        if method not in ("GET", "HEAD", "OPTIONS") and not run.allow_mutating:
+            skipped_mut += 1
+            continue
+        url = base + replay.fill_path(e.get("path") or "/", None)
+        if not scope.permits(url):
+            continue
+        if await burp.seed_request(method, url, ident.headers):
+            seeded_urls.append(url)
+    await emit({"type": "log", "message":
+                f"Seeded {len(seeded_urls)} requests into Burp"
+                + (f" ({skipped_mut} mutating skipped)" if skipped_mut else "")})
+
+    if not caps.get("scan"):
+        await emit({"type": "stage", "stage": "dast_active", "state": "done"})
+        await emit({"type": "log", "message":
+                    "Burp has no active-scan tool over MCP — surface seeded; run "
+                    "the active scan inside Burp against the populated site map"})
+        counts["seeded"] = len(seeded_urls)
+        return
+
+    await burp.active_scan(seeded_urls or [base])
+    await emit({"type": "log", "message":
+                f"Burp active scan started on {len(seeded_urls) or 1} URL(s); "
+                f"polling for issues…"})
+
+    async def _canceled():
+        return await control.get_control(run.scan_id + ":dast") == "cancel"
+
+    issues = await wait_and_fetch_issues(burp, is_canceled=_canceled)
+    # Ingest (dedupe against existing dast findings by title+endpoint).
+    existing = {(f.title, (f.raw or {}).get("endpoint")) for f in (await session.execute(
+        select(Finding).where(Finding.scan_id == run.scan_id,
+                              Finding.source == FindingSource.dast)
+    )).scalars().all()}
+    added = 0
+    for issue in issues:
+        fd = issue_to_finding(run.scan_id, issue)
+        if (fd["title"], fd.get("endpoint")) in existing:
+            continue
+        session.add(_dast_finding(run.scan_id, fd))
+        existing.add((fd["title"], fd.get("endpoint")))
+        added += 1
+    await session.commit()
+    counts["active_issues"] = added
+    counts["seeded"] = len(seeded_urls)
+    await emit({"type": "stage", "stage": "dast_active", "state": "done"})
+    await emit({"type": "finding", "finding": {"_dast": True, "active": added}})
+    await emit({"type": "log", "message":
+                f"Burp active scan: ingested {added} issue(s) as findings"})
+
+
+def _dast_finding(scan_id: str, fd: dict) -> Finding:
+    def trunc(v, n):
+        return v[:n] if isinstance(v, str) and len(v) > n else v
+    sev = fd.get("severity", "medium")
+    return Finding(
+        scan_id=scan_id, title=trunc(fd.get("title") or "Burp issue", 300),
+        description=fd.get("description", ""),
+        severity=Severity(sev if sev in {s.value for s in Severity} else "medium"),
+        confidence=fd.get("confidence", 0.7),
+        source=FindingSource.dast, state=FindingState.proposed,
+        cwe=trunc(fd.get("cwe"), 200), category=trunc(fd.get("category"), 200),
+        remediation=fd.get("remediation"), code_snippet=fd.get("code_snippet"),
+        raw={k: v for k, v in fd.items() if k not in ("severity",)},
+    )
 
 
 async def _confirm_one(client, f: Finding, matrix: dict, base: str,

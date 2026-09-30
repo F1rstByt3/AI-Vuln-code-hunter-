@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
-import type { DastRun, DastTarget } from "../lib/types";
+import type { DastRun, DastTarget, McpServer } from "../lib/types";
 import { Button, Card, Input } from "./ui";
 
 const AUTH_KINDS = ["bearer", "cookie", "header"];
@@ -16,8 +16,12 @@ export function DastTargetsCard({ projectId }: { projectId: string }) {
   const [hosts, setHosts] = useState("");
   const [msg, setMsg] = useState("");
 
+  const [mcp, setMcp] = useState<McpServer[]>([]);
   const reload = () => api.listDastTargets(projectId).then(setTargets).catch(() => setTargets([]));
-  useEffect(() => { reload(); }, [projectId]);
+  useEffect(() => {
+    reload();
+    api.listMcp(projectId).then(setMcp).catch(() => setMcp([]));
+  }, [projectId]);
 
   const create = async () => {
     if (!baseUrl.trim()) { setMsg("Base URL required"); return; }
@@ -45,7 +49,7 @@ export function DastTargetsCard({ projectId }: { projectId: string }) {
             users to see whether the app actually enforces the control. Requests only ever
             reach the hosts you allow-list here.
           </p>
-          {targets.map((t) => <TargetRow key={t.id} t={t} onChange={reload} />)}
+          {targets.map((t) => <TargetRow key={t.id} t={t} mcp={mcp} onChange={reload} />)}
 
           <div className="rounded border border-border p-3 space-y-2">
             <div className="text-xs font-medium">Add a target</div>
@@ -65,7 +69,7 @@ export function DastTargetsCard({ projectId }: { projectId: string }) {
   );
 }
 
-function TargetRow({ t, onChange }: { t: DastTarget; onChange: () => void }) {
+function TargetRow({ t, mcp, onChange }: { t: DastTarget; mcp: McpServer[]; onChange: () => void }) {
   const [test, setTest] = useState("");
   const [role, setRole] = useState("userA");
   const [kind, setKind] = useState("bearer");
@@ -114,6 +118,28 @@ function TargetRow({ t, onChange }: { t: DastTarget; onChange: () => void }) {
         {t.credentials.length === 0 && <span className="text-[11px] text-muted">No credentials yet.</span>}
       </div>
 
+      {/* Active scan (Burp over MCP) */}
+      <div className="flex flex-wrap items-center gap-2 text-[11px] border-t border-border pt-2">
+        <label className="flex items-center gap-1.5">
+          <input type="checkbox" checked={t.active_scan_enabled}
+            onChange={(e) => api.updateDastTarget(t.id, { active_scan_enabled: e.target.checked }).then(onChange)} />
+          Active scan (Burp)
+        </label>
+        {t.active_scan_enabled && (
+          <label className="flex items-center gap-1">
+            Burp MCP server:
+            <select value={t.burp_mcp_id || ""}
+              onChange={(e) => api.updateDastTarget(t.id, { burp_mcp_id: e.target.value || null }).then(onChange)}
+              className="px-1.5 py-1 rounded bg-bg border border-border">
+              <option value="">— none —</option>
+              {mcp.map((m) => <option key={m.id} value={m.id}>{m.name} ({m.kind})</option>)}
+            </select>
+          </label>
+        )}
+        {t.active_scan_enabled && !t.burp_mcp_id && (
+          <span className="text-amber-300">register a Burp MCP server in Settings, then select it here</span>
+        )}
+      </div>
       {!t.secrets_available && (
         <div className="text-[11px] text-amber-300">
           Credential storage is off — set DAST_SECRET_KEY on the server to store test-account secrets.
@@ -157,6 +183,7 @@ export function DastLaunch({ scanId, projectId }: { scanId: string; projectId: s
   const [targetId, setTargetId] = useState("");
   const [confirming, setConfirming] = useState(false);
   const [allowMutating, setAllowMutating] = useState(false);
+  const [activeScan, setActiveScan] = useState(false);
   const [msg, setMsg] = useState("");
 
   const reload = () => {
@@ -175,8 +202,9 @@ export function DastLaunch({ scanId, projectId }: { scanId: string; projectId: s
     if (!target) return;
     setMsg("");
     try {
-      await api.launchDast(scanId, { target_id: targetId, authorize: true, allow_mutating: allowMutating });
-      setConfirming(false); setAllowMutating(false); reload();
+      await api.launchDast(scanId, { target_id: targetId, authorize: true,
+        allow_mutating: allowMutating, active_scan: activeScan });
+      setConfirming(false); setAllowMutating(false); setActiveScan(false); reload();
     } catch (e) { setMsg(String(e)); }
   };
 
@@ -208,6 +236,12 @@ export function DastLaunch({ scanId, projectId }: { scanId: string; projectId: s
                 <input type="checkbox" checked={allowMutating} onChange={(e) => setAllowMutating(e.target.checked)} />
                 Allow state-changing requests (POST/PUT/DELETE) — off by default
               </label>
+              {target.active_scan_enabled && target.burp_mcp_id && (
+                <label className="flex items-center gap-1.5">
+                  <input type="checkbox" checked={activeScan} onChange={(e) => setActiveScan(e.target.checked)} />
+                  Run Burp active scan (seeds the authenticated surface, ingests issues)
+                </label>
+              )}
               <div className="flex gap-2">
                 <Button variant="primary" onClick={launch}>I'm authorized — run</Button>
                 <Button variant="ghost" onClick={() => setConfirming(false)}>Cancel</Button>
@@ -234,6 +268,8 @@ function RunRow({ r, onCancel }: { r: DastRun; onCancel: () => void }) {
       <span className="flex-1 text-muted">
         {typeof s.confirmed === "number"
           ? `${s.confirmed} confirmed · ${s.enforced} enforced · ${s.inconclusive} inconclusive · ${s.requests ?? 0} requests`
+            + (typeof s.active_issues === "number" ? ` · ${s.active_issues} Burp issues` : "")
+            + (typeof s.seeded === "number" && s.active_issues == null ? ` · ${s.seeded} seeded` : "")
           : r.error || (live ? "running…" : "")}
       </span>
       {r.authorized_by && <span className="text-muted">by {r.authorized_by}</span>}

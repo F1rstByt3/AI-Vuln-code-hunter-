@@ -299,6 +299,15 @@ All secret-bearing endpoints follow the existing masked-settings pattern
 
 ## 11. Phasing
 
+**Implemented:** Phase 1 (targets + encrypted credentials + smoke test),
+Phase 2 (access-control replay loop, scope guard, authorization gate, findings
+update, UI), and Phase 3 (Burp active scan over MCP: capability discovery,
+authenticated request seeding, scan + issue ingestion as `dast` findings, with
+graceful degradation when Burp exposes no scan tool). Burp integration is
+verified against a mock MCP server, not yet a live Burp. Phase 4 (object-id
+harvesting for IDOR, scripted `login_form`) is still open.
+
+
 1. **Phase 1 — targets & credentials.** Data model, encrypted secret storage,
    CRUD API + UI, connectivity/login "test". No traffic beyond the login test.
 2. **Phase 2 — access-control replay.** The app-native loop (§5), scope guard,

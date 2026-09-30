@@ -234,11 +234,12 @@ function groupLabelOf(f: Finding): string {
 }
 
 // Map a finding's raw source to one of the buckets we surface as tabs.
-type SourceBucket = "all" | "semgrep" | "sonarqube" | "ai" | "access";
+type SourceBucket = "all" | "semgrep" | "sonarqube" | "ai" | "access" | "dast";
 function bucketOf(f: Finding): Exclude<SourceBucket, "all"> {
   if (f.source === "semgrep") return "semgrep";
   if (f.source === "sonarqube") return "sonarqube";
   if (f.source === "access") return "access";
+  if (f.source === "dast") return "dast";
   return "ai"; // "ai" + "correlated"
 }
 
@@ -248,6 +249,7 @@ const SOURCE_TABS: { key: SourceBucket; label: string }[] = [
   { key: "sonarqube", label: "SonarQube" },
   { key: "ai", label: "AI" },
   { key: "access", label: "Access control" },
+  { key: "dast", label: "Live (DAST)" },
 ];
 
 function FindingsPanel({ findings, onTriage }: {
@@ -257,7 +259,7 @@ function FindingsPanel({ findings, onTriage }: {
   const [tab, setTab] = useState<SourceBucket>("all");
 
   const counts = useMemo(() => {
-    const c = { all: findings.length, semgrep: 0, sonarqube: 0, ai: 0, access: 0 };
+    const c = { all: findings.length, semgrep: 0, sonarqube: 0, ai: 0, access: 0, dast: 0 };
     for (const f of findings) c[bucketOf(f)]++;
     return c as Record<SourceBucket, number>;
   }, [findings]);
@@ -364,6 +366,7 @@ const SOURCE_STYLE: Record<string, string> = {
   ai: "bg-emerald-500/20 text-emerald-300",
   correlated: "bg-amber-500/20 text-amber-300",
   access: "bg-rose-500/20 text-rose-300",
+  dast: "bg-fuchsia-500/20 text-fuchsia-300",
 };
 
 // [label, classes] for the adversarial verifier's verdict.
