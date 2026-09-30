@@ -3,7 +3,17 @@ import { api } from "../lib/api";
 import type { DastRun, DastTarget, McpServer } from "../lib/types";
 import { Button, Card, Input } from "./ui";
 
-const AUTH_KINDS = ["bearer", "cookie", "header"];
+const AUTH_KINDS = ["bearer", "cookie", "header", "login_form"];
+
+const LOGIN_SPEC_EXAMPLE = `{
+  "url": "/api/login",
+  "method": "POST",
+  "content": "json",
+  "body": {"username": "a@x.com", "password": "..."},
+  "apply": "cookie",
+  "token_path": "data.token",
+  "header_name": "Authorization"
+}`;
 
 // ---------------------------------------------------------------------------
 // Project page: manage live-test targets + their per-role credentials
@@ -117,6 +127,9 @@ function TargetRow({ t, mcp, onChange }: { t: DastTarget; mcp: McpServer[]; onCh
         ))}
         {t.credentials.length === 0 && <span className="text-[11px] text-muted">No credentials yet.</span>}
       </div>
+      <div className="text-[10px] text-muted">
+        IDOR: sample object ids are auto-harvested from list endpoints as each role during a run.
+      </div>
 
       {/* Active scan (Burp over MCP) */}
       <div className="flex flex-wrap items-center gap-2 text-[11px] border-t border-border pt-2">
@@ -160,10 +173,18 @@ function TargetRow({ t, mcp, onChange }: { t: DastTarget; mcp: McpServer[]; onCh
             <Input className="!py-1 !w-28" value={headerName} onChange={(e) => setHeaderName(e.target.value)} />
           </label>
         )}
-        <label className="text-[11px] flex-1 min-w-[10rem]">secret (token / cookie value)
-          <Input type="password" className="!py-1" value={secret} onChange={(e) => setSecret(e.target.value)}
-            disabled={!t.secrets_available} />
-        </label>
+        {kind === "login_form" ? (
+          <label className="text-[11px] flex-1 min-w-[16rem]">login spec (JSON)
+            <textarea className="w-full mt-1 px-2 py-1 rounded-md bg-bg border border-border text-xs font-mono h-28"
+              value={secret} onChange={(e) => setSecret(e.target.value)} disabled={!t.secrets_available}
+              placeholder={LOGIN_SPEC_EXAMPLE} />
+          </label>
+        ) : (
+          <label className="text-[11px] flex-1 min-w-[10rem]">secret (token / cookie value)
+            <Input type="password" className="!py-1" value={secret} onChange={(e) => setSecret(e.target.value)}
+              disabled={!t.secrets_available} />
+          </label>
+        )}
         <label className="text-[11px] flex items-center gap-1 pb-2">
           <input type="checkbox" checked={priv} onChange={(e) => setPriv(e.target.checked)} /> admin/priv
         </label>

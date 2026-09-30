@@ -303,9 +303,12 @@ All secret-bearing endpoints follow the existing masked-settings pattern
 Phase 2 (access-control replay loop, scope guard, authorization gate, findings
 update, UI), and Phase 3 (Burp active scan over MCP: capability discovery,
 authenticated request seeding, scan + issue ingestion as `dast` findings, with
-graceful degradation when Burp exposes no scan tool). Burp integration is
-verified against a mock MCP server, not yet a live Burp. Phase 4 (object-id
-harvesting for IDOR, scripted `login_form`) is still open.
+graceful degradation when Burp exposes no scan tool), and Phase 4 (scripted
+`login_form` credentials — POST login, capture cookie or extract a token from
+JSON; and IDOR object-id harvesting — read ids from list endpoints per role,
+merged with operator seeds). Burp integration is verified against a mock MCP
+server, not yet a live Burp. Remaining: MFA-protected logins and OAuth flows
+are out of scope (use a test account without them).
 
 
 1. **Phase 1 — targets & credentials.** Data model, encrypted secret storage,

@@ -76,6 +76,25 @@ class LiveClient:
                 await asyncio.sleep(wait)
         self._last = time.monotonic()
 
+    async def raw(self, method: str, url: str, identity: Identity, *,
+                  json_body=None, data=None, allow_login: bool = False):
+        """Send and return the full httpx.Response, for INTERNAL use (scripted
+        login, id harvesting) where the body/cookies are needed. Never used to
+        build evidence — callers must not leak the body. Same scope/rate/cap
+        guards apply. ``allow_login`` permits a POST even when the run forbids
+        mutating traffic (authenticating is not a target mutation)."""
+        method = method.upper()
+        if method not in SAFE_METHODS and not self.allow_mutating and not allow_login:
+            raise RuntimeError(f"{method} requires allow_mutating")
+        self.scope.check(url)
+        if self._count >= self._max_requests:
+            raise RequestCapExceeded(f"request cap {self._max_requests} reached")
+        await self._throttle()
+        self._count += 1
+        return await self._client.request(
+            method, url, headers=identity.headers or None,
+            cookies=identity.cookies or None, json=json_body, data=data)
+
     async def send(self, method: str, url: str, identity: Identity,
                    *, json_body=None) -> LiveResponse:
         method = method.upper()
@@ -120,15 +139,24 @@ async def smoke_test(base_url: str, scope: Scope,
                      identities: list[Identity]) -> dict:
     """Connectivity + credential smoke test. Sends ONE GET to the base URL per
     identity (and anonymous) and reports status — no scanning, no path probing.
+    Scripted logins (login_form) are performed so their result is validated too.
 
     Confirms the target is reachable and the credentials are accepted at the
     transport level. It cannot prove authorization without a known-protected
     endpoint (that is what a full run does)."""
+    from app.dast.login import perform_login
+
     results: list[dict] = []
     ok = True
     try:
         async with LiveClient(scope, max_rps=settings.dast_default_max_rps,
-                              allow_mutating=False, max_requests=len(identities) + 2) as client:
+                              allow_mutating=False,
+                              max_requests=len(identities) * 2 + 2) as client:
+            # Resolve scripted logins before probing.
+            for idx, ident in enumerate(identities):
+                if ident.login_spec:
+                    identities[idx] = await perform_login(
+                        client, base_url, ident.role, ident.is_privileged, ident.login_spec)
             for ident in [Identity.anonymous(), *identities]:
                 if not ident.usable and ident.role != "none":
                     results.append({"role": ident.role, "ok": False, "detail": ident.note})

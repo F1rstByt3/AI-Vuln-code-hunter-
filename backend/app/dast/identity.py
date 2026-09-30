@@ -29,6 +29,8 @@ class Identity:
     cookies: dict[str, str] = field(default_factory=dict)
     usable: bool = True
     note: str = ""
+    # For login_form credentials: the parsed login spec to resolve at run time.
+    login_spec: dict | None = None
 
     @classmethod
     def anonymous(cls) -> Identity:
@@ -54,8 +56,14 @@ class Identity:
             else:                        # a raw Cookie header value ("a=1; b=2")
                 headers["Cookie"] = secret
         elif kind == "login_form":
+            from app.dast.login import parse_spec
+            spec = parse_spec(secret)
+            if spec is None:
+                return cls(role=c.role_label, is_privileged=c.is_privileged,
+                           usable=False, note="login_form secret is not a valid JSON spec")
+            # Resolved by the runner via perform_login before probing.
             return cls(role=c.role_label, is_privileged=c.is_privileged,
-                       usable=False, note="login_form not yet supported")
+                       usable=False, note="pending login", login_spec=spec)
         else:
             return cls(role=c.role_label, is_privileged=c.is_privileged,
                        usable=False, note=f"unknown auth_kind {kind!r}")

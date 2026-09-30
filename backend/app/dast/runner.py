@@ -66,13 +66,6 @@ async def run_dast(ctx: dict, run_id: str) -> None:
             select(DastCredential).where(DastCredential.target_id == target.id)
         )).scalars().all()
         identities = [Identity.from_credential(c) for c in creds]
-        usable = [i for i in identities if i.usable]
-        low = [i for i in usable if not i.is_privileged]
-        priv = [i for i in usable if i.is_privileged]
-        if len(usable) < len(identities):
-            await emit({"type": "log", "message":
-                        f"{len(identities) - len(usable)} credential(s) unusable "
-                        f"(secret missing or unsupported kind) — skipped"})
 
         # Endpoint matrix from the source scan, keyed for finding lookup.
         matrix = {e.get("id"): e for e in (scan.summary or {}).get("endpoints", [])
@@ -99,11 +92,31 @@ async def run_dast(ctx: dict, run_id: str) -> None:
             async with LiveClient(scope, max_rps=target.max_rps or settings.dast_default_max_rps,
                                   allow_mutating=run.allow_mutating,
                                   capture_bodies=False) as client:
+                # Resolve scripted logins (login_form) now that we have a client.
+                from app.dast.login import perform_login
+                for idx, ident in enumerate(identities):
+                    if ident.login_spec:
+                        identities[idx] = await perform_login(
+                            client, base, ident.role, ident.is_privileged, ident.login_spec)
+                usable = [i for i in identities if i.usable]
+                low = [i for i in usable if not i.is_privileged]
+                priv = [i for i in usable if i.is_privileged]
+                if len(usable) < len(identities):
+                    await emit({"type": "log", "message":
+                                f"{len(identities) - len(usable)} credential(s) unusable "
+                                f"(login failed / secret missing / unsupported) — skipped"})
+
+                # Harvest object ids for IDOR from list endpoints (GET only),
+                # merged with operator-provided seeds (operator wins).
+                from app.dast.harvest import harvest_object_ids, merge_seeds
+                harvested = await harvest_object_ids(
+                    client, base, list(matrix.values()), usable, emit=emit)
+                seeds = merge_seeds(target.object_seeds or {}, harvested)
+
                 for i, f in enumerate(findings):
                     if await control.get_control(run.scan_id + ":dast") == "cancel":
                         raise ScanCanceledSignal()
-                    verdict = await _confirm_one(client, f, matrix, base, low, priv,
-                                                 target.object_seeds or {})
+                    verdict = await _confirm_one(client, f, matrix, base, low, priv, seeds)
                     if verdict is None:
                         counts["untestable"] += 1
                     else:
