@@ -40,6 +40,14 @@ from app.schemas import (
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
+# A miniature review task: the model must return a findings list as JSON.
+_JSON_PROBE_SYSTEM = (
+    "You are a code security reviewer. Return strict JSON only: "
+    '{"findings": [{"title", "severity", "file_path", "line_start"}]}.')
+_JSON_PROBE_USER = (
+    'Review this file (app.py):\n1: import os\n2: def run(cmd):\n'
+    '3:     os.system("ping " + cmd)\nReport the vulnerability.')
+
 
 @router.get("/foundry", response_model=FoundrySettingsOut)
 async def get_foundry(session: AsyncSession = Depends(get_session)):
@@ -160,6 +168,22 @@ async def _test_config(cfg: FoundryConfig) -> ConnectionTest:
                     model=role.deployment, transport=role.effective_transport(local=cfg.is_local),
                 ):
                     break  # one token is enough
+                # Replying isn't enough: scans need structured JSON. Probe it,
+                # so a model that can chat but can't do the job fails here
+                # instead of hours into a scan.
+                probe = await client.complete_json(
+                    [{"role": "system", "content": _JSON_PROBE_SYSTEM},
+                     {"role": "user", "content": _JSON_PROBE_USER}],
+                    model=role.deployment,
+                    transport=role.effective_transport(local=cfg.is_local),
+                )
+                items = probe.get("findings") if isinstance(probe, dict) else None
+                if not isinstance(items, list) or not items:
+                    ok = False
+                    results.append(f"{label}:{role.deployment}✗ replies, but can't return "
+                                   f"the structured JSON scans need — use a stronger model "
+                                   f"(e.g. qwen2.5-coder:14b)")
+                    continue
                 results.append(f"{label}:{role.deployment}✓")
             except Exception as exc:  # noqa: BLE001
                 ok = False
