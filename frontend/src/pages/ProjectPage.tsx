@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import JSZip from "jszip";
+import { DastTargetsCard } from "../components/DastPanel";
 import FileTree from "../components/FileTree";
 import { Button, Card, Input, Spinner } from "../components/ui";
 import { api } from "../lib/api";
@@ -264,6 +265,8 @@ export default function ProjectPage() {
           </div>
         </Card>
       </div>
+
+      {projectId && <div className="mt-6"><DastTargetsCard projectId={projectId} /></div>}
 
       {artifactId && (
         <Card className="p-4 mt-6">

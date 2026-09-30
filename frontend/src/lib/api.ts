@@ -1,6 +1,6 @@
 import type {
-  AiProfile, Artifact, ArtifactFile, ChatMessage, Client, Dashboard, Finding,
-  FindingCode, FoundrySettings, McpServer, Project, Scan, ScanChecks, ScannerSettings,
+  AiProfile, Artifact, ArtifactFile, ChatMessage, Client, Dashboard, DastRun, DastTarget,
+  Finding, FindingCode, FoundrySettings, McpServer, Project, Scan, ScanChecks, ScannerSettings,
 } from "./types";
 
 const _env_base = (import.meta as any).env?.VITE_API_BASE_URL;
@@ -100,6 +100,23 @@ export const api = {
   getScanners: () => req<ScannerSettings>("/settings/scanners"),
   updateScanners: (b: Record<string, any>) => req<ScannerSettings>("/settings/scanners", { method: "PUT", body: JSON.stringify(b) }),
   testSonar: () => req<{ ok: boolean; detail: string }>("/settings/scanners/sonar-test", { method: "POST" }),
+
+  // DAST (live access-control confirmation)
+  listDastTargets: (projectId: string) => req<DastTarget[]>(`/projects/${projectId}/dast-targets`),
+  createDastTarget: (projectId: string, b: Record<string, any>) =>
+    req<DastTarget>(`/projects/${projectId}/dast-targets`, { method: "POST", body: JSON.stringify(b) }),
+  updateDastTarget: (id: string, b: Record<string, any>) =>
+    req<DastTarget>(`/dast-targets/${id}`, { method: "PUT", body: JSON.stringify(b) }),
+  deleteDastTarget: (id: string) => req<void>(`/dast-targets/${id}`, { method: "DELETE" }),
+  testDastTarget: (id: string) =>
+    req<{ ok: boolean; detail: string; roles?: any[] }>(`/dast-targets/${id}/test`, { method: "POST" }),
+  addDastCredential: (targetId: string, b: Record<string, any>) =>
+    req<any>(`/dast-targets/${targetId}/credentials`, { method: "POST", body: JSON.stringify(b) }),
+  deleteDastCredential: (id: string) => req<void>(`/dast-credentials/${id}`, { method: "DELETE" }),
+  launchDast: (scanId: string, b: { target_id: string; authorize: boolean; allow_mutating?: boolean; active_scan?: boolean }) =>
+    req<DastRun>(`/scans/${scanId}/dast`, { method: "POST", body: JSON.stringify(b) }),
+  listDastRuns: (scanId: string) => req<DastRun[]>(`/scans/${scanId}/dast-runs`),
+  cancelDastRun: (id: string) => req<DastRun>(`/dast-runs/${id}/cancel`, { method: "POST" }),
 
   exportUrl: (scanId: string, format: string) =>
     `${BASE}/api/scans/${scanId}/export/${format}`,

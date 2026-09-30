@@ -32,7 +32,28 @@ export interface Finding {
     reviewer_agreement?: { count: number; of: number };
     verification?: { verdict: string; confidence?: number | null; reasoning?: string; by?: string };
     severity_original?: string; endpoint?: string; origin?: string; rule?: string;
+    dast?: { verdict: string; evidence?: DastEvidence; tested_at?: string; by?: string; run_id?: string };
   } & Record<string, any>;
+}
+export interface DastEvidence {
+  reason?: string; url?: string; method?: string;
+  requests?: { role: string; status: number; length?: number; ms?: number; error?: string; owner?: string; target?: string }[];
+}
+export interface DastCredential {
+  id: string; role_label: string; auth_kind: string; header_name?: string | null;
+  is_privileged: boolean; secret_set: boolean;
+}
+export interface DastTarget {
+  id: string; project_id: string; label: string; base_url: string;
+  allowed_hosts: string[]; active_scan_enabled: boolean; burp_mcp_id?: string | null;
+  max_rps: number; enabled: boolean; object_seeds: Record<string, any>;
+  secrets_available: boolean; credentials: DastCredential[];
+}
+export interface DastRun {
+  id: string; scan_id: string; target_id: string; status: string;
+  authorized_by?: string | null; authorized_at?: string | null; allow_mutating: boolean;
+  config: Record<string, any>; summary: Record<string, any>; error?: string | null;
+  started_at?: string | null; finished_at?: string | null;
 }
 export interface FindingCode {
   file_path?: string; line_start?: number; line_end?: number;

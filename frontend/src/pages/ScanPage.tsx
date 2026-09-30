@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { Button, Card, SeverityBadge, Spinner, StateBadge } from "../components/ui";
+import { DastLaunch } from "../components/DastPanel";
 import { useScanEvents } from "../hooks/useScanEvents";
 import { api } from "../lib/api";
 import type {
@@ -50,6 +51,8 @@ export default function ScanPage() {
   const lastType = events[events.length - 1]?.type;
   useEffect(() => {
     if (lastType === "done" || lastType === "failed") {
+      refresh();
+    } else if (lastType === "dast_done") {
       refresh();
     } else if (lastType === "finding") {
       clearTimeout(refreshTimer.current);
@@ -200,6 +203,10 @@ export default function ScanPage() {
           </Card>
 
           {scan?.summary?.coverage && <CoveragePanel c={scan.summary.coverage as CoverageReport} />}
+
+          {scan && !busy && scan.project_id && (
+            <DastLaunch scanId={scanId!} projectId={scan.project_id} />
+          )}
 
           <FindingsPanel findings={findings} onTriage={triage} />
 
@@ -367,6 +374,13 @@ const VERDICT_STYLE: Record<string, [string, string]> = {
   not_verified: ["not verified", "bg-border/60"],
 };
 
+// Live (DAST) confirmation verdict.
+const DAST_VERDICT_STYLE: Record<string, [string, string]> = {
+  confirmed_vuln: ["🎯 confirmed live", "bg-rose-500/20 text-rose-200"],
+  enforced: ["🛡 enforced by app", "bg-emerald-500/15 text-emerald-300"],
+  inconclusive: ["live: inconclusive", "bg-border/60 text-slate-300"],
+};
+
 // Only citation problems get a badge; verified/location-only stay quiet.
 const EVIDENCE_LABEL: Record<string, string> = {
   relocated: "⚠ line corrected",
@@ -433,12 +447,40 @@ function FindingRow({ f, onTriage }: { f: Finding; onTriage: (id: string, s: str
         {f.raw?.origin === "heuristic" && (
           <span className="px-1.5 rounded bg-border/60" title="Regex-based access-control flag">heuristic</span>
         )}
+        {f.raw?.dast && DAST_VERDICT_STYLE[f.raw.dast.verdict] && (
+          <span className={`px-1.5 rounded ${DAST_VERDICT_STYLE[f.raw.dast.verdict][1]}`}
+            title={f.raw.dast.evidence?.reason}>
+            {DAST_VERDICT_STYLE[f.raw.dast.verdict][0]}
+          </span>
+        )}
         {f.triaged_by && <span className="px-1.5 rounded bg-border/60">⚖ {f.triaged_by}</span>}
       </div>
       {open && (
         <div className="mt-3 text-sm space-y-2">
           <p className="text-slate-300 whitespace-pre-wrap">{asText(f.description)}</p>
           {f.triage_note && <p className="text-xs text-amber-300/90">⚖ {f.triage_note}</p>}
+          {f.raw?.dast && (
+            <div className="text-xs p-2 rounded border border-rose-500/30 bg-rose-500/5">
+              <span className="font-medium text-slate-200">
+                Live test ({f.raw.dast.by || "access-replay"}):
+              </span>{" "}
+              <span className="text-slate-300">{f.raw.dast.evidence?.reason}</span>
+              {f.raw.dast.evidence?.requests && f.raw.dast.evidence.requests.length > 0 && (
+                <table className="mt-1 text-[11px] text-muted">
+                  <tbody>
+                    {f.raw.dast.evidence.requests.map((rq, i) => (
+                      <tr key={i}>
+                        <td className="pr-2 font-mono">{rq.role}</td>
+                        <td className="pr-2">{rq.error ? rq.error : `HTTP ${rq.status}`}</td>
+                        <td className="pr-2 font-mono truncate max-w-xs">{rq.target || ""}</td>
+                        {rq.owner && <td className="text-muted">owner: {rq.owner}</td>}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
           {f.raw?.verification?.reasoning && (
             <div className="text-xs p-2 rounded border border-border bg-bg/60">
               <span className="font-medium text-slate-200">
