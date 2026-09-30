@@ -94,7 +94,16 @@ async def _gather_with_control(coros, checkpoint, stage: str):
             work.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise wd.exception()
-        return await work
+        try:
+            return await work
+        except BaseException:
+            # One unit failed hard (e.g. the circuit breaker) — don't leave its
+            # siblings running in the background.
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
     finally:
         stop.set()
         if not wd.done():
@@ -282,6 +291,17 @@ def _estimate_tokens(text: str) -> int:
 
 DEFAULT_CHECKS = {"coverage": True, "verify": True, "access_control": True}
 
+# Circuit breaker: if the first N reviewer batches ALL fail, the model can't do
+# the job (too small / truncated context) — stop instead of grinding for hours.
+_EARLY_FAIL_BATCHES = 8
+_UNUSABLE_MODEL_HELP = (
+    "The model returned no usable JSON. Usual causes with local models: the model is "
+    "too small for structured output (try qwen2.5-coder:14b or larger), or the "
+    "server's real context window is smaller than the profile's 'Context window' "
+    "setting so prompts are silently truncated (for Ollama set OLLAMA_CONTEXT_LENGTH "
+    "to match, or lower the profile's Context window). The worker log shows the raw "
+    "model output ('unparseable model output').")
+
 
 async def run_review(
     *,
@@ -408,6 +428,7 @@ async def run_review(
                     f"done — skipping them"})
     await stage("ai_review", "running", done=len(reviewed_done), total=total_units)
     failed_paths_by_reviewer: dict[str, set[str]] = {}
+    health = {"done": 0, "failed": 0}  # fresh (non-resumed) batches, all reviewers
     retry_stats = {"batches_errored": 0, "batches_recovered": 0, "batches_failed": 0}
 
     async def run_reviewer(reviewer: ModelRole) -> list[dict]:
@@ -440,9 +461,17 @@ async def run_review(
                     client, reviewer, batch, i, len(batches), instructions, emit,
                     failed=fails)
                 results[i] = bf
+                health["done"] += 1
                 if fails:
                     # Not checkpointed: retried below, and again on resume.
                     errored.append(i)
+                    health["failed"] += 1
+                    if (health["done"] >= _EARLY_FAIL_BATCHES
+                            and health["failed"] == health["done"]):
+                        await stage("ai_review", "failed")
+                        raise RuntimeError(
+                            f"Stopped early: the first {health['done']} review batches "
+                            f"all failed. " + _UNUSABLE_MODEL_HELP)
                 else:
                     await save_chunk("review", key, bf)
                 await _publish(bf)
@@ -497,13 +526,7 @@ async def run_review(
     raw_findings = [f for sub in reviewer_results for f in sub]
     if batches and retry_stats["batches_failed"] >= len(batches) * len(roles.reviewers):
         await stage("ai_review", "failed")
-        raise RuntimeError(
-            "Every review batch failed: the model returned no usable JSON. Usual causes "
-            "with local models: the model is too small for structured output (try "
-            "qwen2.5-coder:14b or larger), or the server's real context window is "
-            "smaller than the profile's 'Context window' setting so prompts are "
-            "silently truncated (for Ollama set OLLAMA_CONTEXT_LENGTH to match). "
-            "Check the worker log for the raw model output.")
+        raise RuntimeError("Every review batch failed. " + _UNUSABLE_MODEL_HELP)
     await stage("ai_review", "done", done=total_units, total=total_units)
 
     # A file is unreviewed only if EVERY reviewer failed on it.

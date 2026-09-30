@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from app.ai.agent import run_review
@@ -293,3 +295,29 @@ async def test_unparseable_model_output_fails_fast_instead_of_zero_findings(app_
             read_file=_reader(app_dir), emit=emit, save_chunk=save_chunk,
         )
     assert saved == []  # garbage batches must not be checkpointed as "done"
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_stops_after_first_failing_batches(app_dir):
+    calls = {"n": 0}
+
+    class _Counting(_GarbageClient):
+        async def complete_json(self, messages, **kw):
+            calls["n"] += 1
+            await asyncio.sleep(0.01)  # like a real network call: yields control
+            return {}
+
+    files = [{"path": f"f{i}.py"} for i in range(40)]
+
+    async def read_file(path):
+        return "value = compute(1)\n" * 400
+
+    async def emit(_e):
+        pass
+
+    roles = ReviewRoles(chat=ModelRole("c"), reviewers=[ModelRole("r")], judge=None,
+                        context_tokens=2_500, concurrency=1)
+    with pytest.raises(RuntimeError, match="Stopped early"):
+        await run_review(client=_Counting(), roles=roles, instructions=None, files=files,
+                         candidates=[], read_file=read_file, emit=emit)
+    assert calls["n"] <= 12  # stopped after ~8 batches, not all 40 + retries
