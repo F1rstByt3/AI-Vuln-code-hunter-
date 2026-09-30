@@ -54,26 +54,25 @@ def _ids_from(obj, depth: int = 0) -> list[str]:
 async def harvest_object_ids(client, base_url: str, endpoints: list[dict],
                              identities: list[Identity], *, per_role_cap: int = 20,
                              emit=None) -> dict:
-    """Return {role_label: {param: [ids]}} discovered from list endpoints."""
+    """Discover object ids per role and per collection.
+
+    Returns ``{role: {collection_path: {param: [ids]}}}`` — keyed by collection
+    so two endpoints that both use a param called ``id`` for different object
+    types don't share an id pool (which would cross-wire IDOR probes)."""
     # Collection paths worth listing: those that have an id-param sibling.
-    collections: set[str] = set()
     params_by_collection: dict[str, set[str]] = {}
     for e in endpoints:
-        if not isinstance(e, dict) or not (e.get("id_params")):
+        if not isinstance(e, dict) or not e.get("id_params"):
             continue
         coll = collection_path(e.get("path") or "")
         if coll and not _PARAM_SEG_RE.search(coll):   # a concrete list path
-            collections.add(coll)
             params_by_collection.setdefault(coll, set()).update(e["id_params"])
 
-    seeds: dict[str, dict[str, list[str]]] = {}
+    seeds: dict[str, dict[str, dict[str, list[str]]]] = {}
     for ident in identities:
         if not ident.usable:
             continue
-        found: list[str] = []
-        for coll in sorted(collections):
-            if len(found) >= per_role_cap:
-                break
+        for coll, params in sorted(params_by_collection.items()):
             url = base_url.rstrip("/") + coll
             try:
                 resp = await client.raw("GET", url, ident)
@@ -82,27 +81,37 @@ async def harvest_object_ids(client, base_url: str, endpoints: list[dict],
             if resp.status_code >= 300:
                 continue
             try:
-                found.extend(_ids_from(resp.json()))
+                ids = list(dict.fromkeys(_ids_from(resp.json())))[:per_role_cap]
             except Exception:  # noqa: BLE001
                 continue
-        uniq = list(dict.fromkeys(found))[:per_role_cap]
-        if uniq:
-            # Map the same id pool to every id-param name (best-effort).
-            all_params = {p for ps in params_by_collection.values() for p in ps}
-            seeds[ident.role] = {p: uniq for p in all_params}
+            if ids:
+                seeds.setdefault(ident.role, {})[coll] = {p: ids for p in params}
     if emit and seeds:
-        await emit({"type": "log", "message":
-                    "Harvested object ids for IDOR: "
-                    + ", ".join(f"{r}={sum(len(v) for v in d.values()) // max(1, len(d))}"
-                                for r, d in seeds.items())})
+        parts = []
+        for role, colls in seeds.items():
+            n = sum(len(next(iter(c.values()), [])) for c in colls.values())
+            parts.append(f"{role}={n} across {len(colls)} collection(s)")
+        await emit({"type": "log",
+                    "message": "Harvested object ids for IDOR: " + ", ".join(parts)})
     return seeds
 
 
-def merge_seeds(operator: dict, harvested: dict) -> dict:
-    """Operator-provided seeds take precedence over harvested ones."""
-    out = {r: dict(v) for r, v in (harvested or {}).items()}
-    for role, params in (operator or {}).items():
-        out.setdefault(role, {})
-        for param, ids in (params or {}).items():
-            out[role][param] = ids
+def endpoint_seeds(harvested: dict, operator: dict, collection: str | None) -> dict:
+    """Resolve the ``{role: {param: [ids]}}`` usable for one endpoint.
+
+    Endpoint-specific harvested ids win for that endpoint; operator-provided
+    flat seeds (``{role: {param: [ids]}}`` on the target) act as a fallback and
+    also seed roles/params nothing was harvested for. Operator seeds may also be
+    nested per collection (``{role: {"/coll": {param: [ids]}}}``) to pin a
+    specific endpoint; those take top precedence."""
+    roles = set(harvested or {}) | set(operator or {})
+    out: dict[str, dict[str, list[str]]] = {}
+    for role in roles:
+        op = (operator or {}).get(role, {}) or {}
+        flat = {k: v for k, v in op.items() if not str(k).startswith("/")}
+        op_nested = op.get(collection, {}) if isinstance(op.get(collection), dict) else {}
+        harv = (harvested or {}).get(role, {}).get(collection, {}) if collection else {}
+        merged = {**flat, **harv, **op_nested}
+        if merged:
+            out[role] = merged
     return out

@@ -307,8 +307,10 @@ graceful degradation when Burp exposes no scan tool), and Phase 4 (scripted
 `login_form` credentials — POST login, capture cookie or extract a token from
 JSON; and IDOR object-id harvesting — read ids from list endpoints per role,
 merged with operator seeds). Burp integration is verified against a mock MCP
-server, not yet a live Burp. Remaining: MFA-protected logins and OAuth flows
-are out of scope (use a test account without them).
+server, not yet a live Burp. Object-id harvesting is keyed per collection (so
+endpoints sharing a param name don't cross-wire), with operator seeds as a flat
+or per-collection fallback. Remaining: MFA-protected logins and OAuth flows are
+out of scope (use a test account without them).
 
 
 1. **Phase 1 — targets & credentials.** Data model, encrypted secret storage,

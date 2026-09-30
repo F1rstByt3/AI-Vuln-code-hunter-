@@ -11,7 +11,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from app.dast.client import LiveClient
-from app.dast.harvest import collection_path, harvest_object_ids, merge_seeds
+from app.dast.harvest import collection_path, endpoint_seeds, harvest_object_ids
 from app.dast.identity import Identity
 from app.dast.login import parse_spec, perform_login
 from app.dast.scope import Scope
@@ -84,12 +84,28 @@ async def test_login_form_cookie_and_failure():
 
 
 @pytest.mark.asyncio
-async def test_harvest_object_ids_from_list_endpoint():
+async def test_harvest_object_ids_keyed_per_collection():
     idA = Identity(role="userA", headers={"Authorization": "Bearer TOK-A"})
     endpoints = [{"id": "e0", "method": "GET", "path": "/users/{id}", "id_params": ["id"]}]
     async with _client() as c:
         seeds = await harvest_object_ids(c, "http://app.test", endpoints, [idA])
-    assert seeds["userA"]["id"] == ["101", "102", "103"]
+    # keyed by collection path now, not flat by param
+    assert seeds["userA"]["/users"]["id"] == ["101", "102", "103"]
 
-    merged = merge_seeds({"userA": {"id": ["999"]}}, seeds)
-    assert merged["userA"]["id"] == ["999"]   # operator overrides harvested
+
+def test_endpoint_seeds_resolution_no_cross_wiring():
+    harvested = {
+        "userB": {
+            "/users": {"id": ["101", "102"]},
+            "/orders": {"id": ["9"]},
+        }
+    }
+    operator = {"userB": {"id": ["fallback"]}}          # flat per-role fallback
+    # each endpoint gets its own ids — no cross-wiring between /users and /orders
+    assert endpoint_seeds(harvested, operator, "/users")["userB"]["id"] == ["101", "102"]
+    assert endpoint_seeds(harvested, operator, "/orders")["userB"]["id"] == ["9"]
+    # an endpoint with nothing harvested falls back to the operator's flat pool
+    assert endpoint_seeds(harvested, operator, "/invoices")["userB"]["id"] == ["fallback"]
+    # a nested operator seed pins a specific collection (top precedence)
+    op_nested = {"userB": {"/users": {"id": ["pinned"]}}}
+    assert endpoint_seeds(harvested, op_nested, "/users")["userB"]["id"] == ["pinned"]

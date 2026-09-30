@@ -120,12 +120,14 @@ finding to see the per-role request/response evidence (auth redacted).
 - **IDOR confirmation** requires the attacker's response body to match the
   owner's own response for the same object (byte-for-byte). A 2xx whose body
   differs is reported *inconclusive*, not confirmed — verify those by hand.
-- **IDOR needs sample object ids.** They are auto-harvested from list endpoints
-  per role; if none are found, set `object_seeds` on the target
-  (`{"userB": {"id": ["7"]}}`) via the API, or the finding stays inconclusive.
-- Object ids are shared per (role, param-name) across endpoints. If two
-  endpoints use the param `id` for different object types, prefer harvesting or
-  per-endpoint operator seeds to avoid cross-wiring.
+- **IDOR needs sample object ids.** They are auto-harvested from each list
+  endpoint per role and **keyed by collection**, so two endpoints that both use
+  a param called `id` for different object types never share an id pool. If
+  nothing is harvested for an endpoint, set `object_seeds` on the target as a
+  fallback — either flat per role (`{"userB": {"id": ["7"]}}`, applies to any
+  endpoint) or pinned to a collection
+  (`{"userB": {"/orders": {"id": ["7"]}}}`, top precedence). Otherwise the
+  finding stays inconclusive.
 - A canceled run keeps the verdicts it already wrote.
 
 ## 8. Limits

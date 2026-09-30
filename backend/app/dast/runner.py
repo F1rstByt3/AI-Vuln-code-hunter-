@@ -110,18 +110,18 @@ async def run_dast(ctx: dict, run_id: str) -> None:
                                 f"(login failed / secret missing / unsupported) — skipped"})
 
                 # Harvest object ids for IDOR from list endpoints (GET only),
-                # merged with operator-provided seeds (operator wins).
-                from app.dast.harvest import harvest_object_ids, merge_seeds
+                # keyed per collection; resolved per-endpoint in _confirm_one.
+                from app.dast.harvest import harvest_object_ids
                 harvested = await harvest_object_ids(
                     client, base, list(matrix.values()), usable, emit=emit)
-                seeds = merge_seeds(target.object_seeds or {}, harvested)
+                operator_seeds = target.object_seeds or {}
 
                 by_role = {i.role: i for i in usable}
                 for i, f in enumerate(findings):
                     if await control.get_control(run.scan_id + ":dast") == "cancel":
                         raise ScanCanceledSignal()
                     verdict = await _confirm_one(client, f, matrix, base, low, priv,
-                                                 seeds, by_role)
+                                                 harvested, operator_seeds, by_role)
                     if verdict is None:
                         counts["untestable"] += 1
                     else:
@@ -285,8 +285,8 @@ def _dast_finding(scan_id: str, fd: dict) -> Finding:
 
 
 async def _confirm_one(client, f: Finding, matrix: dict, base: str,
-                       low: list[Identity], priv: list[Identity], seeds: dict,
-                       by_role: dict | None = None):
+                       low: list[Identity], priv: list[Identity], harvested: dict,
+                       operator_seeds: dict, by_role: dict | None = None):
     """Return (verdict, evidence) or None if the finding isn't live-testable."""
     raw = f.raw or {}
     kind = replay.classify({"rule": raw.get("rule"), "cwe": f.cwe, "raw": raw})
@@ -307,7 +307,9 @@ async def _confirm_one(client, f: Finding, matrix: dict, base: str,
         url = base + replay.fill_path(path, None)
         return await replay.probe_bfla(client, url, method, low, priv)
     if kind == "idor":
+        from app.dast.harvest import collection_path, endpoint_seeds
         actors = low or priv
+        seeds = endpoint_seeds(harvested, operator_seeds, collection_path(path))
         return await replay.probe_idor(client, path, method, base, id_params,
                                         seeds, actors, by_role)
     return None
