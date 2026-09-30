@@ -498,3 +498,24 @@ async def export_openapi(
         headers={"Content-Disposition":
                  f'attachment; filename="scan_{scan_id}_openapi.json"'},
     )
+
+
+@router.get("/scans/{scan_id}/export/report")
+async def export_report(
+    scan_id: str,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """A self-contained HTML security report for the scan (print to PDF to share)."""
+    from app.models import Project
+    from app.reporting import build_report_html
+
+    scan = await get_or_404(session, Scan, scan_id)
+    project = await session.get(Project, scan.project_id)
+    findings = (await session.execute(
+        select(Finding).where(Finding.scan_id == scan_id)
+    )).scalars().all()
+    html = build_report_html(scan, project, findings)
+    return Response(
+        content=html, media_type="text/html; charset=utf-8",
+        headers={"Content-Disposition": f'inline; filename="scan_{scan_id}_report.html"'},
+    )

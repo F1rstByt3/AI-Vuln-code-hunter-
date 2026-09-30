@@ -125,6 +125,10 @@ export default function ScanPage() {
         )}
         {scan?.status && !["queued", "running"].includes(scan.status) && (
           <div className="flex gap-1 ml-auto">
+            <a href={api.exportUrl(scanId!, "report")} target="_blank" rel="noreferrer"
+              className="px-2 py-1 rounded text-xs font-medium bg-accent text-white hover:opacity-90">
+              📄 Report
+            </a>
             <ExportBtn scanId={scanId!} format="burp" label="Burp XML" />
             <ExportBtn scanId={scanId!} format="sarif" label="SARIF" />
             <ExportBtn scanId={scanId!} format="csv" label="CSV" />
