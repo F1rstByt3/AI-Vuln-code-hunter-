@@ -100,6 +100,38 @@ async def rerun_scan_stage(
     return scan
 
 
+@router.get("/scans/{scan_id}/diff")
+async def scan_diff(scan_id: str, against: str | None = None,
+                    session: AsyncSession = Depends(get_session)):
+    """Diff this scan's findings against an earlier scan's — new / fixed /
+    still-open issues, for tracking remediation. Baseline defaults to the most
+    recent earlier scan of the same project (override with ?against=<scan_id>)."""
+    from app.diffing import diff_findings
+
+    scan = await get_or_404(session, Scan, scan_id)
+    if against:
+        baseline = await get_or_404(session, Scan, against)
+    else:
+        baseline = (await session.execute(
+            select(Scan).where(
+                Scan.project_id == scan.project_id,
+                Scan.id != scan.id,
+                Scan.created_at < scan.created_at,
+            ).order_by(Scan.created_at.desc()).limit(1)
+        )).scalar_one_or_none()
+    if baseline is None:
+        return {"baseline": None, "counts": {"new": 0, "fixed": 0, "still_open": 0},
+                "new": [], "fixed": [], "still_open": []}
+    cur = (await session.execute(
+        select(Finding).where(Finding.scan_id == scan.id))).scalars().all()
+    base = (await session.execute(
+        select(Finding).where(Finding.scan_id == baseline.id))).scalars().all()
+    result = diff_findings(cur, base)
+    result["baseline"] = {"id": baseline.id, "created_at": baseline.created_at.isoformat()
+                          if baseline.created_at else None}
+    return result
+
+
 @router.get("/scans/{scan_id}/resumable")
 async def scan_resumable(scan_id: str, session: AsyncSession = Depends(get_session)):
     """Report whether an interrupted scan has durable checkpoints to resume from,

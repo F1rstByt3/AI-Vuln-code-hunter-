@@ -61,6 +61,16 @@ export interface FindingCode {
   lines: { n: number; text: string }[];
   snippet?: string;
 }
+export interface DiffItem {
+  id: string; fingerprint: string; title: string; severity: Severity; state: string;
+  source: string; cwe?: string | null; file_path?: string | null; line_start?: number | null;
+  endpoint?: string | null; severity_changed_from?: string;
+}
+export interface ScanDiff {
+  baseline: { id: string; created_at?: string | null } | null;
+  counts: { new: number; fixed: number; still_open: number };
+  new: DiffItem[]; fixed: DiffItem[]; still_open: DiffItem[];
+}
 export interface McpServer {
   id: string; project_id?: string; name: string; kind: string; transport: string;
   url?: string; enabled: boolean;

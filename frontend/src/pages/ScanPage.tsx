@@ -5,7 +5,8 @@ import { DastLaunch } from "../components/DastPanel";
 import { useScanEvents } from "../hooks/useScanEvents";
 import { api } from "../lib/api";
 import type {
-  ChatMessage, CoverageReport, Endpoint, Finding, FindingCode, Scan, StageInfo, TokenUsage,
+  ChatMessage, CoverageReport, Endpoint, Finding, FindingCode, Scan, ScanDiff,
+  StageInfo, TokenUsage,
 } from "../lib/types";
 
 // Some AI-produced raw fields can be objects (e.g. an attack_scenario with
@@ -205,6 +206,8 @@ export default function ScanPage() {
               ))}
             </div>
           </Card>
+
+          {scan && !busy && <DiffPanel scanId={scanId!} />}
 
           {scan?.summary?.coverage && <CoveragePanel c={scan.summary.coverage as CoverageReport} />}
 
@@ -810,6 +813,58 @@ function EndpointsPanel({ endpoints }: { endpoints: Endpoint[] }) {
     </Card>
   );
 }
+
+function DiffPanel({ scanId }: { scanId: string }) {
+  const [diff, setDiff] = useState<ScanDiff | null>(null);
+  const [open, setOpen] = useState(false);
+  useEffect(() => { api.scanDiff(scanId).then(setDiff).catch(() => setDiff(null)); }, [scanId]);
+  if (!diff || !diff.baseline) return null;
+  const { counts } = diff;
+  const when = diff.baseline.created_at
+    ? new Date(diff.baseline.created_at).toLocaleDateString() : "previous scan";
+  const row = (label: string, items: typeof diff.new, color: string) => items.length > 0 && (
+    <div className="mt-2">
+      <div className={`text-xs font-medium ${color}`}>{label} ({items.length})</div>
+      <ul className="mt-1 space-y-0.5">
+        {items.slice(0, 40).map((it) => (
+          <li key={it.fingerprint} className="text-[11px] text-muted flex items-center gap-2">
+            <span className={`uppercase ${SEV_TEXT[it.severity] || ""}`}>{it.severity}</span>
+            <span className="text-slate-300">{it.title}</span>
+            {it.severity_changed_from && <span className="text-amber-400">↑ was {it.severity_changed_from}</span>}
+            {(it.file_path || it.endpoint) && <span className="font-mono">{it.file_path || it.endpoint}</span>}
+          </li>
+        ))}
+        {items.length > 40 && <li className="text-[11px] text-muted">…and {items.length - 40} more</li>}
+      </ul>
+    </div>
+  );
+  return (
+    <Card className="p-4">
+      <button onClick={() => setOpen((o) => !o)} className="flex items-center gap-2 w-full text-left">
+        <span className="font-semibold text-sm">{open ? "▼" : "▶"} Changes since {when}</span>
+        <span className="text-[11px] flex gap-2">
+          <span className="text-rose-300">+{counts.new} new</span>
+          <span className="text-emerald-300">−{counts.fixed} fixed</span>
+          <span className="text-muted">{counts.still_open} still open</span>
+        </span>
+      </button>
+      {open && (
+        <div>
+          {row("🆕 New issues", diff.new, "text-rose-300")}
+          {row("✅ Fixed since baseline", diff.fixed, "text-emerald-300")}
+          {row("↔ Still open", diff.still_open, "text-slate-300")}
+          {counts.new + counts.fixed + counts.still_open === 0 &&
+            <div className="text-[11px] text-muted mt-2">No open issues in either scan.</div>}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+const SEV_TEXT: Record<string, string> = {
+  critical: "text-red-400", high: "text-orange-400", medium: "text-amber-400",
+  low: "text-sky-400", info: "text-slate-400",
+};
 
 function CoveragePanel({ c }: { c: CoverageReport }) {
   const [showGaps, setShowGaps] = useState(false);

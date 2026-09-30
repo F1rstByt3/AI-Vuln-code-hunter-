@@ -58,6 +58,7 @@ export const api = {
   rerunStage: (id: string, stage: string) =>
     req<Scan>(`/scans/${id}/rerun`, { method: "POST", body: JSON.stringify({ stage }) }),
   resumeScan: (id: string) => req<Scan>(`/scans/${id}/resume`, { method: "POST" }),
+  scanDiff: (id: string) => req<import("./types").ScanDiff>(`/scans/${id}/diff`),
   scanResumable: (id: string) =>
     req<{ resumable: boolean; completed: Record<string, number> }>(`/scans/${id}/resumable`),
   listFindings: (scanId: string) => req<Finding[]>(`/scans/${scanId}/findings`),
