@@ -321,3 +321,11 @@ async def test_circuit_breaker_stops_after_first_failing_batches(app_dir):
         await run_review(client=_Counting(), roles=roles, instructions=None, files=files,
                          candidates=[], read_file=read_file, emit=emit)
     assert calls["n"] <= 12  # stopped after ~8 batches, not all 40 + retries
+
+
+def test_parse_json_ignores_visible_reasoning():
+    from app.ai.foundry import _parse_json
+    out = _parse_json('<think>maybe {"findings": 1}? let me check {x}</think>\n'
+                      '{"findings": [{"title": "SQLi"}]}')
+    assert out == {"findings": [{"title": "SQLi"}]}
+    assert _parse_json('reasoning {a} </think> {"findings": []}') == {"findings": []}

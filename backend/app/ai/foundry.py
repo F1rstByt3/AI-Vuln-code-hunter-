@@ -316,10 +316,18 @@ def _split_messages(messages: list[dict]) -> tuple[str, list[dict]]:
     return instructions, inp
 
 
+# Reasoning models served locally (Qwen3, DeepSeek-R1, gpt-oss via some
+# servers) can prefix their answer with visible chain-of-thought, which often
+# contains braces that would derail the JSON extraction below.
+_THINK_RE = re.compile(r"<(think|thinking|reasoning)>.*?</\1>", re.DOTALL | re.IGNORECASE)
+
+
 def _parse_json(text: str | None) -> dict:
     if not text:
         return {}
-    text = text.strip()
+    text = _THINK_RE.sub("", text).strip()
+    if "</think>" in text:  # opening tag was stripped by the server
+        text = text.split("</think>", 1)[1].strip()
     fence = _JSON_FENCE_RE.search(text)
     if fence:
         text = fence.group(1).strip()
