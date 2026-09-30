@@ -287,6 +287,82 @@ class ModelsOut(BaseModel):
     mock: bool
 
 
+# ---- DAST (live access-control confirmation) ----
+class DastCredentialIn(BaseModel):
+    role_label: str = Field(max_length=60)
+    auth_kind: str = "bearer"                 # bearer | cookie | header | login_form
+    header_name: str | None = None
+    secret: str | None = None                 # write-only; blank keeps existing
+    is_privileged: bool = False
+
+
+class DastCredentialOut(BaseModel):
+    id: str
+    role_label: str
+    auth_kind: str
+    header_name: str | None = None
+    is_privileged: bool = False
+    secret_set: bool = False
+
+
+class DastTargetIn(BaseModel):
+    label: str | None = None
+    base_url: str
+    allowed_hosts: list[str] | None = None
+    active_scan_enabled: bool = False
+    burp_mcp_id: str | None = None
+    object_seeds: dict = Field(default_factory=dict)
+    max_rps: float | None = None
+
+
+class DastTargetUpdate(BaseModel):
+    label: str | None = None
+    base_url: str | None = None
+    allowed_hosts: list[str] | None = None
+    active_scan_enabled: bool | None = None
+    burp_mcp_id: str | None = None
+    object_seeds: dict | None = None
+    max_rps: float | None = None
+    enabled: bool | None = None
+
+
+class DastTargetOut(BaseModel):
+    id: str
+    project_id: str
+    label: str
+    base_url: str
+    allowed_hosts: list[str] = Field(default_factory=list)
+    active_scan_enabled: bool = False
+    burp_mcp_id: str | None = None
+    max_rps: float = 5.0
+    enabled: bool = True
+    object_seeds: dict = Field(default_factory=dict)
+    secrets_available: bool = False
+    credentials: list[DastCredentialOut] = Field(default_factory=list)
+
+
+class DastRunCreate(BaseModel):
+    target_id: str
+    # Explicit authorization: the operator attests they may test this host.
+    authorize: bool = False
+    allow_mutating: bool = False
+    active_scan: bool = False
+
+
+class DastRunOut(ORMModel):
+    scan_id: str
+    target_id: str
+    status: str
+    authorized_by: str | None = None
+    authorized_at: datetime | None = None
+    allow_mutating: bool = False
+    config: dict = {}
+    summary: dict = {}
+    error: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
 class ConnectionTest(BaseModel):
     ok: bool
     detail: str

@@ -111,6 +111,8 @@ _STAGE_LABELS = {
     "ai_verify": "FP verification",
     "ai_exploit": "Exploit analyst",
     "persist": "Persist findings",
+    "dast_access": "Live access-control confirmation",
+    "dast_active": "Active scan",
 }
 _STAGE_ORDER = list(_STAGE_LABELS.keys())
 
@@ -1047,8 +1049,11 @@ async def _startup(ctx: dict) -> None:
     await init_models()
 
 
+from app.dast.runner import run_dast  # noqa: E402
+
+
 class WorkerSettings:
-    functions = [run_scan, rerun_stage, resume_scan]
+    functions = [run_scan, rerun_stage, resume_scan, run_dast]
     on_startup = _startup
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
     max_jobs = 4

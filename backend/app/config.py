@@ -88,6 +88,15 @@ class Settings(BaseSettings):
     # Access-control review: endpoints per AI call.
     ai_access_endpoints_per_batch: int = 40
 
+    # ---- DAST (live access-control confirmation + active scan) ----
+    # Key for encrypting stored test-account credentials. Unset => credential
+    # storage disabled (per-run in-memory creds still work). In prod: Key Vault.
+    dast_secret_key: str | None = None
+    secret_key: str | None = None            # generic fallback key material
+    dast_default_max_rps: float = 5.0        # client-side rate limit per run
+    dast_request_timeout: float = 20.0       # seconds per live request
+    dast_max_requests_per_run: int = 5000    # hard cap on outbound requests
+
     @property
     def foundry_mock(self) -> bool:
         """No endpoint configured => run the agent against the deterministic mock."""

@@ -57,8 +57,9 @@ async def init_models() -> None:
         # harmless, so swallow that race.
         async with engine.connect() as conn:
             conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
-            try:
-                await conn.execute(sa_text(
-                    "ALTER TYPE findingsource ADD VALUE IF NOT EXISTS 'access'"))
-            except Exception:  # noqa: BLE001
-                pass
+            for value in ("access", "dast"):
+                try:
+                    await conn.execute(sa_text(
+                        f"ALTER TYPE findingsource ADD VALUE IF NOT EXISTS '{value}'"))
+                except Exception:  # noqa: BLE001
+                    pass

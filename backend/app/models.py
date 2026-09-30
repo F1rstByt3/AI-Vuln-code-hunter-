@@ -62,6 +62,7 @@ class FindingSource(str, enum.Enum):
     ai = "ai"
     correlated = "correlated"      # AI-confirmed a static-tool candidate
     access = "access"              # endpoint access-control analysis (heuristic + AI)
+    dast = "dast"                  # live dynamic testing (replay / active scan)
 
 
 class Role(str, enum.Enum):
@@ -257,6 +258,78 @@ class AiProfile(Base):
     name: Mapped[str] = mapped_column(String(120), unique=True, index=True)
     description: Mapped[str | None] = mapped_column(Text)
     config: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class DastStatus(str, enum.Enum):
+    queued = "queued"
+    running = "running"
+    completed = "completed"
+    failed = "failed"
+    canceled = "canceled"
+
+
+class DastTarget(Base):
+    """A live target the operator has declared they are authorized to test.
+
+    Runs are scoped to this target's host allow-list; nothing outside it is ever
+    contacted. The optional Burp MCP server drives the active-scan step."""
+
+    __tablename__ = "dast_targets"
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    label: Mapped[str] = mapped_column(String(200))
+    base_url: Mapped[str] = mapped_column(String(1000))
+    # JSON list of hostnames requests may reach; defaults to base_url's host.
+    allowed_hosts: Mapped[list] = mapped_column(JSON, default=list)
+    active_scan_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    burp_mcp_id: Mapped[str | None] = mapped_column(
+        ForeignKey("mcp_servers.id", ondelete="SET NULL")
+    )
+    # Sample object ids per role, for IDOR testing (e.g. {"userB": {"id": ["7"]}}).
+    object_seeds: Mapped[dict] = mapped_column(JSON, default=dict)
+    max_rps: Mapped[float] = mapped_column(Float, default=5.0)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    credentials: Mapped[list[DastCredential]] = relationship(
+        back_populates="target", cascade="all, delete-orphan"
+    )
+
+
+class DastCredential(Base):
+    """A test-account identity used to probe access control. The secret
+    (token / cookie / header value / scripted login) is ENCRYPTED at rest and
+    never returned by the API."""
+
+    __tablename__ = "dast_credentials"
+    target_id: Mapped[str] = mapped_column(
+        ForeignKey("dast_targets.id", ondelete="CASCADE"), index=True
+    )
+    role_label: Mapped[str] = mapped_column(String(60))     # userA | userB | admin
+    auth_kind: Mapped[str] = mapped_column(String(20))      # bearer|cookie|header|login_form
+    header_name: Mapped[str | None] = mapped_column(String(120))  # for auth_kind=header/cookie
+    secret_enc: Mapped[str | None] = mapped_column(Text)    # encrypted; write-only via API
+    is_privileged: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    target: Mapped[DastTarget] = relationship(back_populates="credentials")
+
+
+class DastRun(Base):
+    """One authorized live-testing run confirming a source scan's findings."""
+
+    __tablename__ = "dast_runs"
+    scan_id: Mapped[str] = mapped_column(ForeignKey("scans.id", ondelete="CASCADE"), index=True)
+    target_id: Mapped[str] = mapped_column(ForeignKey("dast_targets.id", ondelete="CASCADE"))
+    status: Mapped[DastStatus] = mapped_column(Enum(DastStatus), default=DastStatus.queued)
+    # Explicit authorization record (required to start): who attested, when.
+    authorized_by: Mapped[str | None] = mapped_column(String(320))
+    authorized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    allow_mutating: Mapped[bool] = mapped_column(Boolean, default=False)
+    config: Mapped[dict] = mapped_column(JSON, default=dict)   # checks toggled, roles used
+    summary: Mapped[dict] = mapped_column(JSON, default=dict)  # confirmed/enforced/… counts
+    error: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class AgentEvent(Base):
