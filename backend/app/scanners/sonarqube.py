@@ -122,7 +122,12 @@ class SonarScanner:
                 *cmd, cwd=workdir,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
-            _stdout, stderr = await proc.communicate()
+            try:
+                _stdout, stderr = await proc.communicate()
+            except asyncio.CancelledError:
+                proc.kill()  # scan canceled: don't leave the scanner running
+                await proc.wait()
+                raise
             if proc.returncode == 0:
                 return
             last_err = (stderr or b"").decode("utf-8", "replace")[-500:]

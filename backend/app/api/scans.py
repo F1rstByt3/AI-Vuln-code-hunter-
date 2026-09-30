@@ -167,8 +167,9 @@ async def control_scan(
 
     await control.set_control(scan_id, action)
     await events.publish(scan_id, {"type": "control", "control": action})
-    # A queued (not-yet-started) scan won't reach a checkpoint, so cancel it now.
-    if action == "cancel" and scan.status == ScanStatus.queued:
+    # Mark it canceled now (queued scans never reach a checkpoint; running ones
+    # are interrupted by the worker's cancel watcher within ~2s).
+    if action == "cancel":
         scan.status = ScanStatus.canceled
         scan.finished_at = datetime.now(timezone.utc)
         await session.commit()

@@ -53,6 +53,38 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+_CANCEL_POLL_SECONDS = 2.0
+
+
+async def _interruptible(scan_id: str, body) -> None:
+    """Run a scan job while a watcher polls the cancel flag every ~2s.
+
+    Cooperative checkpoints only fire *between* units of work; a single local
+    model call or a Semgrep/SonarQube run can take many minutes. On cancel the
+    watcher interrupts the job immediately (the job's handler records the scan
+    as canceled; scanner subprocesses are killed)."""
+    task = asyncio.ensure_future(body)
+
+    async def _watch() -> None:
+        while not task.done():
+            await asyncio.sleep(_CANCEL_POLL_SECONDS)
+            try:
+                if await control.get_control(scan_id) == "cancel":
+                    task.cancel()
+                    return
+            except Exception:  # noqa: BLE001  (Redis blip: keep watching)
+                continue
+
+    watcher = asyncio.ensure_future(_watch())
+    try:
+        await task
+    except asyncio.CancelledError:
+        if not task.cancelled():
+            raise  # arq itself cancelled us (timeout / shutdown)
+    finally:
+        watcher.cancel()
+
+
 # Default pipeline when a scan doesn't specify: all static scanners + AI review.
 # Each is independently gated (semgrep/sonarqube need their app-level enable too).
 _DEFAULT_SCANNERS = ["semgrep", "sonarqube", "mcp", "ai"]
@@ -335,6 +367,10 @@ async def _ai_review(session, scan: Scan, artifact: Artifact, workdir: str,
 
 
 async def run_scan(ctx: dict, scan_id: str) -> None:
+    await _interruptible(scan_id, _run_scan(ctx, scan_id))
+
+
+async def _run_scan(ctx: dict, scan_id: str) -> None:
     async with SessionLocal() as session:
         scan = await session.get(Scan, scan_id)
         if scan is None:
@@ -390,6 +426,7 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
             await store.clear()  # clean finish — no resume needed
             await emit({"type": "done", "status": final_status.value, "summary": scan.summary})
 
+        canceled = False
         try:
             artifact = await session.get(Artifact, scan.artifact_id)
             await controller.checkpoint("ingest")
@@ -495,7 +532,8 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
                             f"(no AI review requested)"})
                 await finalize(ScanStatus.completed,
                                {**static_summary, "endpoints": endpoints}, False)
-        except ScanCanceledSignal:
+        except (ScanCanceledSignal, asyncio.CancelledError):
+            canceled = True
             await session.rollback()
             scan.status = ScanStatus.canceled
             scan.summary = {**(scan.summary or {}), "stages": stages.snapshot(),
@@ -514,7 +552,8 @@ async def run_scan(ctx: dict, scan_id: str) -> None:
             await emit({"type": "failed", "error": scan.error})
             raise
         finally:
-            await control.clear_control(scan_id)
+            if not canceled:  # leave "cancel" set so any duplicate job stops too
+                await control.clear_control(scan_id)
 
 
 async def _ingest(session, artifact: Artifact, emit) -> str:
@@ -837,6 +876,10 @@ async def resume_scan(ctx: dict, scan_id: str) -> None:
 
 
 async def rerun_stage(ctx: dict, scan_id: str, stage: str, resume: bool = False) -> None:
+    await _interruptible(scan_id, _rerun_stage(ctx, scan_id, stage, resume))
+
+
+async def _rerun_stage(ctx: dict, scan_id: str, stage: str, resume: bool = False) -> None:
     """Re-run a single pipeline stage on an existing scan, replacing just that
     stage's findings. Triggered by the per-stage UI buttons. When *resume* is
     set (AI stage only), prior checkpoints are kept so completed work is skipped."""
@@ -872,6 +915,7 @@ async def rerun_stage(ctx: dict, scan_id: str, stage: str, resume: bool = False)
         await emit({"type": "status", "status": f"{verb} {stage}"})
         await emit({"type": "log", "message": f"{verb.capitalize()} stage: {stage}"})
 
+        canceled = False
         try:
             artifact = await session.get(Artifact, scan.artifact_id)
             workdir = await _ensure_workdir(session, artifact, emit)
@@ -958,7 +1002,9 @@ async def rerun_stage(ctx: dict, scan_id: str, stage: str, resume: bool = False)
             scan.finished_at = _now()
             await session.commit()
             await emit({"type": "done", "status": scan.status.value, "summary": scan.summary})
-        except ScanCanceledSignal:
+        except (ScanCanceledSignal, asyncio.CancelledError):
+            canceled = True
+            await session.rollback()
             scan.status = ScanStatus.canceled
             scan.finished_at = _now()
             await session.commit()
@@ -978,7 +1024,8 @@ async def rerun_stage(ctx: dict, scan_id: str, stage: str, resume: bool = False)
             await emit({"type": "failed", "error": scan.error})
             raise
         finally:
-            await control.clear_control(scan_id)
+            if not canceled:  # leave "cancel" set so any duplicate job stops too
+                await control.clear_control(scan_id)
 
 
 def _safe_read(workdir: str, rel: str) -> str | None:

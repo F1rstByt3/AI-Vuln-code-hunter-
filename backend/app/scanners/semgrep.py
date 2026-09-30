@@ -58,7 +58,12 @@ class SemgrepScanner:
             stderr=asyncio.subprocess.PIPE,
             env={**os.environ, "SEMGREP_SEND_METRICS": "off"},
         )
-        stdout, stderr = await proc.communicate()
+        try:
+            stdout, stderr = await proc.communicate()
+        except asyncio.CancelledError:
+            proc.kill()  # scan canceled: don't leave the scanner running
+            await proc.wait()
+            raise
         stderr_text = (stderr or b"").decode("utf-8", "replace").strip()
         if stderr_text:
             logger.info("semgrep stderr (rc=%d): %s", proc.returncode,
