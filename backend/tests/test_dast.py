@@ -73,10 +73,16 @@ def _target_app():
             return JSONResponse({"error": "forbidden"}, status_code=403)
         return JSONResponse({"id": r.path_params["id"], "owner": owner})
 
+    async def get_doc(r: Request):            # BUG: authenticated but no ownership check
+        if not r.headers.get("authorization"):
+            return JSONResponse({"error": "unauthenticated"}, status_code=401)
+        return JSONResponse({"id": r.path_params["id"], "body": f"contents of {r.path_params['id']}"})
+
     return Starlette(routes=[
         Route("/public", public),
         Route("/admin/stats", admin_stats),
         Route("/orders/{id}", get_order),
+        Route("/docs/{id}", get_doc),
     ])
 
 
@@ -109,6 +115,34 @@ async def test_probe_confirms_idor_and_enforcement():
             c, "/orders/{id}", "GET", "http://app.test", ["id"], seeds, [idA])
     assert verdict == "enforced"
     assert any(r["status"] == 403 for r in ev["requests"])
+
+
+@pytest.mark.asyncio
+async def test_probe_confirms_idor_by_body_match():
+    # /docs/{id} has no ownership check: userA reads userB's doc, identical body.
+    idA = Identity(role="userA", headers={"Authorization": "Bearer tokenA"})
+    idB = Identity(role="userB", headers={"Authorization": "Bearer tokenB"})
+    seeds = {"userB": {"id": ["77"]}}
+    by_role = {"userA": idA, "userB": idB}
+    async with _client_for(_target_app()) as c:
+        verdict, ev = await replay.probe_idor(
+            c, "/docs/{id}", "GET", "http://app.test", ["id"], seeds, [idA], by_role)
+    assert verdict == "confirmed_vuln"
+    assert "byte-for-byte" in ev["reason"]
+    assert any(r.get("baseline") for r in ev["requests"])  # owner baseline captured
+
+
+@pytest.mark.asyncio
+async def test_idor_2xx_without_body_match_is_inconclusive():
+    # A 200 whose body differs from the owner's must NOT auto-confirm.
+    idA = Identity(role="userA", headers={"Authorization": "Bearer tokenA"})
+    idB = Identity(role="userB", headers={"Authorization": "Bearer tokenB"})
+    seeds = {"userB": {"id": ["2"]}}       # /orders/2 is B's; A gets 403 there
+    by_role = {"userA": idA, "userB": idB}
+    async with _client_for(_target_app()) as c:
+        verdict, _ = await replay.probe_idor(
+            c, "/orders/{id}", "GET", "http://app.test", ["id"], seeds, [idA], by_role)
+    assert verdict == "enforced"           # A denied → enforced, not confirmed
 
 
 @pytest.mark.asyncio

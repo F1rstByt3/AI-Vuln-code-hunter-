@@ -131,6 +131,16 @@ async def launch_run(scan_id: str, body: DastRunCreate,
             f"{target.base_url} before launching a live run")
     if body.active_scan and not target.active_scan_enabled:
         raise HTTPException(400, "active scan is not enabled for this target")
+    # One live run per scan at a time: concurrent runs would race the same
+    # findings and double the outbound traffic.
+    active = (await session.execute(
+        select(DastRun).where(
+            DastRun.scan_id == scan_id,
+            DastRun.status.in_([DastStatus.queued, DastStatus.running]),
+        ).limit(1)
+    )).scalar_one_or_none()
+    if active is not None:
+        raise HTTPException(409, "a live run is already in progress for this scan")
 
     run = DastRun(
         scan_id=scan_id, target_id=target.id, status=DastStatus.queued,

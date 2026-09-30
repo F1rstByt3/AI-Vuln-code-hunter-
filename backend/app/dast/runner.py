@@ -5,8 +5,9 @@ under the configured identities, and updates the finding to confirmed /
 dismissed / inconclusive with sanitized evidence. Progress streams to the
 scan's event channel so the existing scan page shows it live.
 
-Active scanning (Burp) is a later phase; this runner covers the app-native
-access-control confirmation, which needs no Burp.
+Flow: resolve identities (including scripted logins) -> harvest object ids for
+IDOR -> confirm each access finding -> optionally run a Burp active scan and
+ingest its issues as ``dast`` findings.
 """
 
 from __future__ import annotations
@@ -82,6 +83,8 @@ async def run_dast(ctx: dict, run_id: str) -> None:
 
         counts = {"confirmed": 0, "enforced": 0, "inconclusive": 0,
                   "untestable": 0, "requests": 0}
+        low: list = []
+        priv: list = []
         scope = Scope(target.allowed_hosts or [])
         base = target.base_url.rstrip("/")
         total = len(findings)
@@ -113,10 +116,12 @@ async def run_dast(ctx: dict, run_id: str) -> None:
                     client, base, list(matrix.values()), usable, emit=emit)
                 seeds = merge_seeds(target.object_seeds or {}, harvested)
 
+                by_role = {i.role: i for i in usable}
                 for i, f in enumerate(findings):
                     if await control.get_control(run.scan_id + ":dast") == "cancel":
                         raise ScanCanceledSignal()
-                    verdict = await _confirm_one(client, f, matrix, base, low, priv, seeds)
+                    verdict = await _confirm_one(client, f, matrix, base, low, priv,
+                                                 seeds, by_role)
                     if verdict is None:
                         counts["untestable"] += 1
                     else:
@@ -280,7 +285,8 @@ def _dast_finding(scan_id: str, fd: dict) -> Finding:
 
 
 async def _confirm_one(client, f: Finding, matrix: dict, base: str,
-                       low: list[Identity], priv: list[Identity], seeds: dict):
+                       low: list[Identity], priv: list[Identity], seeds: dict,
+                       by_role: dict | None = None):
     """Return (verdict, evidence) or None if the finding isn't live-testable."""
     raw = f.raw or {}
     kind = replay.classify({"rule": raw.get("rule"), "cwe": f.cwe, "raw": raw})
@@ -303,7 +309,7 @@ async def _confirm_one(client, f: Finding, matrix: dict, base: str,
     if kind == "idor":
         actors = low or priv
         return await replay.probe_idor(client, path, method, base, id_params,
-                                        seeds, actors)
+                                        seeds, actors, by_role)
     return None
 
 

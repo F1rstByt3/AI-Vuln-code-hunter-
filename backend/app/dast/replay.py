@@ -62,6 +62,8 @@ def fill_path(path: str, values: dict[str, str] | None) -> str:
 
 def _ev(role: str, r: LiveResponse, ident: Identity | None = None) -> dict:
     e = {"role": role, "status": r.status, "length": r.length, "ms": r.elapsed_ms}
+    if r.body_hash:
+        e["body_hash"] = r.body_hash
     if r.error:
         e["error"] = r.error
     if ident is not None:
@@ -108,35 +110,62 @@ async def probe_bfla(client: LiveClient, url: str, method: str,
 
 async def probe_idor(client: LiveClient, path: str, method: str, base_url: str,
                      id_params: list[str], seeds: dict, actors: list[Identity],
+                     by_role: dict[str, Identity] | None = None,
                      ) -> tuple[str, dict]:
     """Confirmed if one user can read another user's object by id.
 
     Needs a sample object id owned by a *different* role than the caller. Without
     seeds we cannot safely pick ids, so we report inconclusive rather than guess.
+
+    To avoid false positives when ids come from a *global* (non-scoped) list,
+    confirmation is strongest when the attacker's response body is byte-identical
+    to the owner's own response for the same object: that proves the attacker
+    actually retrieved the owner's data, not just any 200. A 200 whose body
+    differs from the owner's (or where the owner baseline is unavailable) is
+    reported as needing review, not auto-confirmed.
     """
+    by_role = by_role or {}
     # seeds: {role_label: {param: [ids]}}
     owners = {r: v for r, v in (seeds or {}).items() if v}
     if not owners or len(actors) < 1:
         return "inconclusive", {"url": base_url + path, "method": method,
             "reason": "no sample object ids provided (set object_seeds to test IDOR)"}
     reqs = []
+    soft_hit = False
     for actor in actors:
         for owner_role, pmap in owners.items():
             if owner_role == actor.role:
                 continue  # need someone else's object
-            values = {p: (pmap.get(p) or ["1"])[0] for p in id_params}
             if not any(p in pmap for p in id_params):
                 continue
+            values = {p: (pmap.get(p) or ["1"])[0] for p in id_params}
             url = base_url + fill_path(path, values)
             r = await client.send(method, url, actor)
-            reqs.append({**_ev(actor.role, r, actor), "owner": owner_role,
-                         "target": url})
-            if not r.error and _is_success(r.status):
-                return "confirmed_vuln", {"requests": reqs, "method": method,
-                    "reason": f"{actor.role} read {owner_role}'s object ({r.status})"}
+            reqs.append({**_ev(actor.role, r, actor), "owner": owner_role, "target": url})
+            if r.error or not _is_success(r.status):
+                continue
+            # Baseline: what the owner themselves gets for the same object.
+            owner_ident = by_role.get(owner_role)
+            if owner_ident is not None:
+                base_r = await client.send(method, url, owner_ident)
+                reqs.append({**_ev(owner_role, base_r, owner_ident),
+                             "owner": owner_role, "target": url, "baseline": True})
+                if (_is_success(base_r.status) and base_r.body_hash
+                        and base_r.body_hash == r.body_hash):
+                    return "confirmed_vuln", {"requests": reqs, "method": method,
+                        "reason": f"{actor.role} retrieved {owner_role}'s object "
+                                  f"byte-for-byte ({r.status}, identical body)"}
+                # 200 but body differs from owner's → not sound proof.
+                soft_hit = True
+            else:
+                soft_hit = True   # no baseline available to compare against
     if not reqs:
         return "inconclusive", {"method": method,
             "reason": "no cross-user object id pair available"}
+    if soft_hit:
+        return "inconclusive", {"requests": reqs, "method": method,
+            "reason": "attacker got 2xx but the body did not match the owner's "
+                      "response (or no owner baseline) — verify manually"}
     if all(_is_denied(x.get("status", 0)) for x in reqs):
         return "enforced", {"requests": reqs, "method": method,
             "reason": "cross-user object access denied (401/403)"}
