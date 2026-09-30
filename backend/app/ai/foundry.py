@@ -69,9 +69,15 @@ def _auto_transport(model: str | None, local: bool = False) -> str:
     return "chat"
 
 
+# Local open-weight models that think before answering.
+_LOCAL_REASONING_HINTS = ("gpt-oss", "qwen3", "deepseek-r1", "magistral", "phi4-reasoning",
+                          "qwq", "-thinking")
+
+
 def _is_reasoning(model: str | None) -> bool:
     m = (model or "").lower()
-    return "codex" in m or m.startswith(("o1", "o3", "o4")) or "gpt-5" in m
+    return ("codex" in m or m.startswith(("o1", "o3", "o4")) or "gpt-5" in m
+            or any(h in m for h in _LOCAL_REASONING_HINTS))
 
 
 @dataclass
@@ -470,11 +476,14 @@ class InferenceClient(FoundryClient):
             self.usage.add(deployment, *_usage_pair(getattr(resp, "usage", None)))
             return _parse_json(getattr(resp, "output_text", None))
 
-        # Chat Completions — try json_object mode, fall back to plain if unsupported
+        # Chat Completions — try json_object mode, fall back to plain if unsupported.
+        # reasoning_effort: honoured by reasoning models on local servers
+        # (Ollama maps it for gpt-oss / Qwen3 thinking); dropped if refused.
+        extra = {"reasoning_effort": reasoning_effort} if reasoning_effort else {}
         try:
-            resp = await self._client.chat.completions.create(
+            resp = await self._chat_create(
                 model=deployment, messages=messages, temperature=temperature,
-                response_format={"type": "json_object"}, **self._cache_kw(cache_key),
+                response_format={"type": "json_object"}, **extra, **self._cache_kw(cache_key),
             )
             self.usage.add(deployment, *_usage_pair(getattr(resp, "usage", None)))
             return _parse_json(resp.choices[0].message.content)
@@ -482,11 +491,24 @@ class InferenceClient(FoundryClient):
             if self._local and "json" in str(e).lower():
                 # Model doesn't support json_object mode; retry without it
                 log.warning("json_object mode unsupported by %s, retrying plain", deployment)
-                resp = await self._client.chat.completions.create(
-                    model=deployment, messages=messages, temperature=temperature,
+                resp = await self._chat_create(
+                    model=deployment, messages=messages, temperature=temperature, **extra,
                 )
                 self.usage.add(deployment, *_usage_pair(getattr(resp, "usage", None)))
                 return _parse_json(resp.choices[0].message.content)
+            raise
+
+    async def _chat_create(self, **kwargs):
+        """chat.completions.create, retrying without reasoning_effort if the
+        server/model rejects that parameter."""
+        try:
+            return await self._client.chat.completions.create(**kwargs)
+        except Exception as e:
+            if "reasoning_effort" in kwargs and "reasoning" in str(e).lower():
+                log.warning("reasoning_effort not supported by %s; retrying without",
+                            kwargs.get("model"))
+                kwargs.pop("reasoning_effort")
+                return await self._client.chat.completions.create(**kwargs)
             raise
 
     async def _responses_stream(self, messages, deployment, reasoning_effort, cache_key=None):

@@ -506,7 +506,9 @@ function RoleEditor({ role, models, onChange, removable, onRemove }: {
   role: ModelRole; models: string[]; onChange: (r: ModelRole) => void;
   removable?: boolean; onRemove?: () => void;
 }) {
-  const isReasoning = /codex|^o[134]|gpt-5/i.test(role.deployment);
+  // Cloud reasoning models + local ones that think (gpt-oss, Qwen3, DeepSeek-R1…).
+  const isReasoning = /codex|^o[134]|gpt-5|gpt-oss|qwen3|deepseek-r1|magistral|qwq|reasoning|thinking/i
+    .test(role.deployment);
   return (
     <div className="flex items-end gap-2">
       <label className="text-xs flex-1">deployment
