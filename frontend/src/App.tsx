@@ -1,4 +1,5 @@
 import { NavLink, Route, Routes } from "react-router-dom";
+import { SidebarTree } from "./components/SidebarTree";
 import ClientsPage from "./pages/ClientsPage";
 import ProjectPage from "./pages/ProjectPage";
 import ScanPage from "./pages/ScanPage";
@@ -24,13 +25,19 @@ function Nav() {
       </div>
       <nav className="space-y-1">
         <NavLink to="/" className={cls} end>
-          <span>📁</span> Clients &amp; Projects
+          <span>📁</span> All clients
         </NavLink>
+      </nav>
+      <div className="mt-3 flex-1 min-h-0 overflow-y-auto -mx-1 px-1">
+        <div className="text-[10px] uppercase tracking-wide text-muted px-2 mb-1">Projects</div>
+        <SidebarTree />
+      </div>
+      <nav className="mt-3 space-y-1">
         <NavLink to="/settings" className={cls}>
           <span>⚙️</span> Settings
         </NavLink>
       </nav>
-      <div className="mt-auto text-[11px] text-muted pt-4 border-t border-border leading-relaxed">
+      <div className="mt-3 text-[11px] text-muted pt-4 border-t border-border leading-relaxed">
         <div className="font-medium text-slate-400 mb-0.5">SAST · DAST · AI</div>
         static analysis, AI review, and live confirmation
       </div>
