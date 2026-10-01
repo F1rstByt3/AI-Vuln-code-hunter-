@@ -522,9 +522,9 @@ async def _run_scan(ctx: dict, scan_id: str) -> None:
                     )
                     # Replace incremental AI findings (and the heuristic access
                     # flags, which the AI confirmed/rejected) with the final
-                    # canonical set: judge/verifier states, exploit PoCs.
-                    await _delete_findings_by_source(session, scan.id, _AI_SOURCES)
-                    await _persist_findings(session, scan, result["findings"])
+                    # canonical set: judge/verifier states, exploit PoCs. Atomic
+                    # swap so a failure here can't leave the scan empty.
+                    await _swap_findings(session, scan, _AI_SOURCES, result["findings"])
                     await emit({"type": "finding", "finding": {"_final": True}})
                     await set_stage("persist", "done")
                     await finalize(ScanStatus.completed,
@@ -835,6 +835,24 @@ async def _persist_findings(session, scan: Scan, findings: list[dict]) -> None:
     await session.commit()
 
 
+async def _swap_findings(session, scan: Scan, sources: set[str],
+                         findings: list[dict]) -> None:
+    """Atomically replace a source-set's findings: delete the old rows and
+    insert the final ones in ONE transaction, committed together. If building
+    or inserting the new set fails, the transaction is rolled back by the
+    caller and the OLD findings are left intact — so a failed/partial AI run
+    can never wipe a scan's findings and leave nothing in their place."""
+    from sqlalchemy import delete as sql_delete
+
+    await session.execute(sql_delete(Finding).where(
+        Finding.scan_id == scan.id,
+        Finding.source.in_([FindingSource(s) for s in sources]),
+    ))
+    for f in findings:
+        session.add(_finding_from_dict(scan.id, f))
+    await session.commit()   # delete + inserts commit as one unit
+
+
 # --------------------------------------------------------------------------- re-run
 def _candidate_to_finding(c: dict) -> dict:
     """Turn a raw static-scanner Candidate into a persistable finding dict."""
@@ -1026,8 +1044,10 @@ async def _rerun_stage(ctx: dict, scan_id: str, stage: str, resume: bool = False
                 await emit({"type": "log", "message":
                             f"AI {'resume' if resume else 're-run'} over "
                             f"{len(candidates)} existing static candidates"})
-                # Delete prior AI findings upfront so incremental ones appear cleanly.
-                await _delete_findings_by_source(session, scan_id, _AI_SOURCES)
+                # NOTE: do NOT delete the existing AI findings here. They stay in
+                # place until the new run produces its final set, which is swapped
+                # in atomically at the end — so a failed/cancelled re-run keeps
+                # the previous findings instead of wiping them.
 
                 # Rebuild the access-control map (cheap, deterministic) unless a
                 # resume will reuse the frozen one.
@@ -1037,11 +1057,13 @@ async def _rerun_stage(ctx: dict, scan_id: str, stage: str, resume: bool = False
                         and not (resume and await store.has_any()):
                     access_map = await _build_access_map(endpoints, workdir, emit)
 
-                async def _on_findings_rerun(_phase: str, batch: list[dict]) -> None:
-                    async with emit_lock:
-                        for f in batch:
-                            session.add(_finding_from_dict(scan.id, f))
-                        await session.commit()
+                # Don't persist incremental findings during a re-run: that would
+                # require deleting the old ones first (losing them on failure).
+                # The old findings stay in the DB; live progress still streams via
+                # the pipeline's own "finding" events; the final set is swapped in
+                # atomically below.
+                async def _on_findings_rerun(_phase: str, _batch: list[dict]) -> None:
+                    return None
 
                 result = await _ai_review(session, scan, artifact, workdir, candidates, emit,
                                           checkpoint=controller.checkpoint,
@@ -1049,11 +1071,11 @@ async def _rerun_stage(ctx: dict, scan_id: str, stage: str, resume: bool = False
                                           on_findings=_on_findings_rerun,
                                           access_map=access_map)
                 await store.clear()  # completed — no resume needed
-                # Same as a full scan: swap the incremental rows (reviewer, judge,
-                # coverage, access…) for the final canonical set — verifier
-                # verdicts, carried heuristic flags and exploit PoCs included.
-                await _delete_findings_by_source(session, scan_id, _AI_SOURCES)
-                await _persist_findings(session, scan, result["findings"])
+                # Atomic swap: delete the old AI findings and insert the final
+                # canonical set (judge/verifier states, exploit PoCs) in one
+                # transaction. Only reached on success, so the previous findings
+                # survive any failure/cancel above.
+                await _swap_findings(session, scan, _AI_SOURCES, result["findings"])
                 await emit({"type": "finding", "finding": {"_final": True}})
                 needs_review = bool(result["summary"].get("needs_review"))
                 ai_summary = {k: result["summary"][k]
@@ -1097,8 +1119,7 @@ async def _rerun_stage(ctx: dict, scan_id: str, stage: str, resume: bool = False
                 await store.clear()
                 from app.ai.agent import _normalize
                 final = [n for n in (_normalize(f, None) for f in acc) if n]
-                await _delete_findings_by_source(session, scan_id, {"access"})
-                await _persist_findings(session, scan, final)
+                await _swap_findings(session, scan, {"access"}, final)
                 await emit({"type": "finding", "finding": {"_final": True}})
                 ai_summary = {"endpoints": eps, "access_control": {
                     **(access_map.get("stats") or {}), **astats,
@@ -1138,11 +1159,16 @@ async def _rerun_stage(ctx: dict, scan_id: str, stage: str, resume: bool = False
             await emit({"type": "done", "status": scan.status.value,
                         "summary": scan.summary or {}})
         except Exception as exc:  # noqa: BLE001
-            scan.status = ScanStatus.failed
-            scan.error = str(exc)[:2000]
-            scan.finished_at = _now()
-            await session.commit()
-            await emit({"type": "failed", "error": scan.error})
+            # Discard any half-applied swap (e.g. a DELETE not yet committed) so
+            # a failed re-run can't commit the deletion and leave no findings.
+            await session.rollback()
+            scan = await session.get(Scan, scan_id)
+            if scan is not None:
+                scan.status = ScanStatus.failed
+                scan.error = str(exc)[:2000]
+                scan.finished_at = _now()
+                await session.commit()
+            await emit({"type": "failed", "error": str(exc)[:2000]})
             raise
         finally:
             if not canceled:  # leave "cancel" set so any duplicate job stops too
