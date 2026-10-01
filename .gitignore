@@ -37,3 +37,7 @@ scan-workdir/
 .idea/
 .vscode/
 *.swp
+
+# Redis snapshot (stray from local runs)
+dump.rdb
+*.rdb
