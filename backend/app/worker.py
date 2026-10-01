@@ -610,7 +610,7 @@ async def _ingest(session, artifact: Artifact, emit) -> str:
     artifact.meta = {**(artifact.meta or {}), "workdir": workdir}
     await session.commit()
     await emit({"type": "log", "message": f"Indexed {len(result.files)} files, "
-                                          f"{result.analysable} analyzable"})
+                                          f"{result.analyzable} analysable"})
     return workdir
 
 
