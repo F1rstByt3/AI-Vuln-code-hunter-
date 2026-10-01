@@ -137,7 +137,12 @@ class SonarScanner:
                                "retrying in %ds", proc.returncode, attempt + 1,
                                1 + retries, wait)
                 await asyncio.sleep(wait)
-        raise RuntimeError(f"sonar-scanner failed (rc={proc.returncode}): {last_err}")
+        raise RuntimeError(
+            f"sonar-scanner failed (rc={proc.returncode}). Common causes: the "
+            f"SonarQube server at {self.host or '(unset)'} is unreachable or still "
+            f"starting, the token is wrong, or analysis hit a memory/Java limit. "
+            f"SonarQube is optional — disable it in Settings → Scanners if you "
+            f"don't need it (Semgrep + the AI review still run). Detail: {last_err}")
 
     async def _await_analysis(self, project_key: str, timeout_s: int = 300) -> None:
         """Poll the most recent CE task for this project until it completes."""

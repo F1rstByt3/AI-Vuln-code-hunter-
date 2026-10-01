@@ -20,10 +20,23 @@ _EXCLUDES = ["node_modules", "vendor", ".git", "dist", "build", "*.min.js", "*.l
 _RULES_DIR = str(Path(__file__).parent / "rules")
 
 
+_OOM_MARKERS = ("engine was killed", "used too much memory", "out of memory",
+                "maximum memory", "oom")
+_OOM_HELP = (
+    "⚠ Semgrep ran out of memory and skipped rules/files — its findings are "
+    "incomplete (the AI review still ran). Give Docker more RAM (Docker Desktop "
+    "→ Settings → Resources, 8GB+), or lower SEMGREP_MAX_MEMORY_MB / keep "
+    "SEMGREP_JOBS=1 in .env. The AI reviewers cover what Semgrep missed.")
+
+
 class SemgrepScanner:
     name = "semgrep"
 
-    async def scan(self, workdir: str) -> list[Candidate]:
+    async def scan(self, workdir: str, emit=None) -> list[Candidate]:
+        async def _note(msg: str) -> None:
+            if emit:
+                await emit({"type": "log", "message": msg})
+
         ruleset = settings.semgrep_ruleset
         # "auto" requires `semgrep login`; fall back to p/default if not logged in.
         if ruleset == "auto":
@@ -43,10 +56,14 @@ class SemgrepScanner:
             "--json", "--quiet", "--no-git-ignore",
             "--max-target-bytes", str(settings.max_file_bytes_for_ai * 5),
             "--timeout", "120",
+            # Memory bounds so the engine isn't OOM-killed on big repos / low RAM.
+            "--jobs", str(max(1, settings.semgrep_jobs)),
             "--severity", "INFO",
             "--severity", "WARNING",
             "--severity", "ERROR",
         ]
+        if settings.semgrep_max_memory_mb and settings.semgrep_max_memory_mb > 0:
+            cmd += ["--max-memory", str(settings.semgrep_max_memory_mb)]
         for ex in _EXCLUDES:
             cmd += ["--exclude", ex]
         cmd.append(".")
@@ -70,6 +87,8 @@ class SemgrepScanner:
                         stderr_text[-1000:])
         if not stdout:
             logger.warning("semgrep returned no stdout (rc=%d)", proc.returncode)
+            if any(m in stderr_text.lower() for m in _OOM_MARKERS):
+                await _note(_OOM_HELP)
             return []
         try:
             data = json.loads(stdout)
@@ -81,6 +100,10 @@ class SemgrepScanner:
         if errors:
             logger.warning("semgrep reported %d errors: %s", len(errors),
                            json.dumps(errors[:3])[:500])
+            blob = (json.dumps(errors) + " " + stderr_text).lower()
+            if any(m in blob for m in _OOM_MARKERS):
+                # Partial run: some rules/files were skipped for memory.
+                await _note(_OOM_HELP)
         logger.info("semgrep: %d results, %d errors, rc=%d",
                     len(results), len(errors), proc.returncode)
         return [self._to_candidate(r, workdir) for r in results]

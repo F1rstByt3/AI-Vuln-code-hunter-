@@ -643,7 +643,7 @@ async def _static_scan(session, scan: Scan, artifact: Artifact, workdir: str, em
             await _stage("semgrep", "running")
             await emit({"type": "status", "status": "semgrep"})
             try:
-                sem = await SemgrepScanner().scan(workdir)
+                sem = await SemgrepScanner().scan(workdir, emit=emit)
                 candidates.extend(sem)
                 await emit({"type": "log", "message": f"Semgrep: {len(sem)} candidates"})
                 await _stage("semgrep", "done")

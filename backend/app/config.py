@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     # ---- Scanners ----
     semgrep_enabled: bool = True
     semgrep_ruleset: str = "auto"
+    # Memory controls — Semgrep's engine is OOM-killed on large repos / low-RAM
+    # Docker. jobs=1 keeps peak memory to one worker; max_memory caps per-rule MB
+    # so a heavy rule is skipped instead of killing the whole run. Raise jobs if
+    # you have RAM and cores to spare.
+    semgrep_jobs: int = 1
+    semgrep_max_memory_mb: int = 2000
     sonarqube_enabled: bool = False
     sonarqube_url: str | None = None
     sonarqube_token: str | None = None
