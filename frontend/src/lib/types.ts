@@ -47,7 +47,22 @@ export interface DastTarget {
   id: string; project_id: string; label: string; base_url: string;
   allowed_hosts: string[]; active_scan_enabled: boolean; burp_mcp_id?: string | null;
   max_rps: number; enabled: boolean; object_seeds: Record<string, any>;
-  secrets_available: boolean; credentials: DastCredential[];
+  mode_config: DastMode; secrets_available: boolean; credentials: DastCredential[];
+}
+export interface DastMode {
+  auto_run: boolean; auto_run_active: boolean; require_approval: boolean;
+  allowed_checks: string[];
+}
+export interface DastControlDoc {
+  status: string; max_rps: number | null; allow_mutating: boolean | null;
+  exclude_paths: string[]; intercept: string;
+}
+export interface DastPending {
+  seq: number; method: string; url: string; purpose: string; role: string;
+  mutating: boolean; ts: number;
+}
+export interface DastControlState {
+  run_id: string; status: string; control: DastControlDoc; pending: DastPending[];
 }
 export interface DastRun {
   id: string; scan_id: string; target_id: string; status: string;

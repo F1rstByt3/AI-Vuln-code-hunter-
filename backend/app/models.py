@@ -261,11 +261,13 @@ class AiProfile(Base):
 
 
 class DastStatus(str, enum.Enum):
+    pending_approval = "pending_approval"   # created, awaiting a second admin's OK
     queued = "queued"
     running = "running"
     completed = "completed"
     failed = "failed"
     canceled = "canceled"
+    rejected = "rejected"                    # approval refused; never ran
 
 
 class DastTarget(Base):
@@ -290,6 +292,10 @@ class DastTarget(Base):
     object_seeds: Mapped[dict] = mapped_column(JSON, default=dict)
     max_rps: Mapped[float] = mapped_column(Float, default=5.0)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # How runs against this target are initiated (auto-run after a scan,
+    # approval queue, schedule, allowed checks). Editable any time; applies to
+    # the NEXT run, never a run already in flight. See DEFAULT_DAST_MODE.
+    mode_config: Mapped[dict] = mapped_column(JSON, default=dict)
 
     credentials: Mapped[list[DastCredential]] = relationship(
         back_populates="target", cascade="all, delete-orphan"

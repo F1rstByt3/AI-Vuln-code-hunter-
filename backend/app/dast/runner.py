@@ -12,7 +12,7 @@ ingest its issues as ``dast`` findings.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,19 +20,28 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import control, events
 from app.config import settings
 from app.control import ScanCanceledSignal
-from app.dast import replay
+from app.dast import live_control, replay
 from app.dast.client import LiveClient
 from app.dast.identity import Identity
+from app.dast.live_control import LiveControl
 from app.dast.scope import Scope, ScopeError
 from app.db import SessionLocal
 from app.models import (
-    DastCredential, DastRun, DastStatus, DastTarget, Finding, FindingSource,
-    FindingState, McpServer, Scan, Severity,
+    DastCredential,
+    DastRun,
+    DastStatus,
+    DastTarget,
+    Finding,
+    FindingSource,
+    FindingState,
+    McpServer,
+    Scan,
+    Severity,
 )
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 async def run_dast(ctx: dict, run_id: str) -> None:
@@ -53,6 +62,14 @@ async def run_dast(ctx: dict, run_id: str) -> None:
                                                "dast_run": run_id, **event})
 
         await control.clear_control(run.scan_id + ":dast")
+        await live_control.clear(run_id)
+        # Seed the live-control doc from the run's launch config so the UI
+        # reflects the starting state and the launch rate is the hard ceiling.
+        launch_rps = target.max_rps or settings.dast_default_max_rps
+        ctl = LiveControl(run_id, run.scan_id, emit, launch_max_rps=launch_rps)
+        await live_control.write_patch(
+            run_id, {"status": "running", "intercept": run.config.get("intercept") or "off"},
+            launch_max_rps=launch_rps)
         run.status = DastStatus.running
         run.started_at = _now()
         await session.commit()
@@ -123,9 +140,9 @@ async def run_dast(ctx: dict, run_id: str) -> None:
                     "done": 0, "total": total})
 
         try:
-            async with LiveClient(scope, max_rps=target.max_rps or settings.dast_default_max_rps,
+            async with LiveClient(scope, max_rps=launch_rps,
                                   allow_mutating=run.allow_mutating,
-                                  capture_bodies=False) as client:
+                                  capture_bodies=False, control=ctl) as client:
                 # Resolve scripted logins (login_form) now that we have a client.
                 from app.dast.login import perform_login
                 for idx, ident in enumerate(identities):
@@ -172,7 +189,7 @@ async def run_dast(ctx: dict, run_id: str) -> None:
             if do_active:
                 try:
                     await _run_active_scan(session, run, scan, target, scope, low, priv,
-                                           emit, counts, all_eps, absorb)
+                                           emit, counts, all_eps, absorb, ctl)
                 except ScanCanceledSignal:
                     raise
                 except Exception as exc:  # noqa: BLE001
@@ -211,11 +228,12 @@ async def run_dast(ctx: dict, run_id: str) -> None:
                     f"{counts['untestable']} untestable · {counts['requests']} requests"})
         await emit({"type": "dast_done", "status": run.status.value, "summary": counts})
         await control.clear_control(run.scan_id + ":dast")
+        await live_control.clear(run_id)
 
 
 async def _run_active_scan(session, run: DastRun, scan: Scan, target: DastTarget,
                            scope: Scope, low, priv, emit, counts: dict,
-                           endpoints: list, absorb) -> None:
+                           endpoints: list, absorb, ctl=None) -> None:
     """Native active checks (needs no Burp) over *endpoints*, then — if a Burp
     MCP server is attached — seed the surface into Burp and ingest its issues."""
     from app.config import settings as cfg
@@ -232,7 +250,8 @@ async def _run_active_scan(session, run: DastRun, scan: Scan, target: DastTarget
     # --- native active scan (always; no Burp required) ---
     try:
         async with LiveClient(scope, max_rps=target.max_rps or cfg.dast_default_max_rps,
-                              allow_mutating=run.allow_mutating, capture_bodies=True) as nclient:
+                              allow_mutating=run.allow_mutating, capture_bodies=True,
+                              control=ctl) as nclient:
             native = await native_active_scan(nclient, base, endpoints, ident, emit,
                                               is_canceled=_canceled)
         absorb(nclient)

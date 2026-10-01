@@ -49,6 +49,10 @@ async def init_models() -> None:
                 await conn.execute(
                     sa_text(f"ALTER TABLE {table} ALTER COLUMN size_bytes TYPE bigint")
                 )
+            # Per-target DAST mode config added later; backfill on existing DBs.
+            await conn.execute(sa_text(
+                "ALTER TABLE dast_targets ADD COLUMN IF NOT EXISTS "
+                "mode_config JSON DEFAULT '{}'::json"))
 
     if engine.dialect.name == "postgresql":
         # Enum values added after the type was first created. ADD VALUE must be
@@ -61,5 +65,12 @@ async def init_models() -> None:
                 try:
                     await conn.execute(sa_text(
                         f"ALTER TYPE findingsource ADD VALUE IF NOT EXISTS '{value}'"))
+                except Exception:  # noqa: BLE001
+                    pass
+            # DastStatus gained approval states after the enum was created.
+            for value in ("pending_approval", "rejected"):
+                try:
+                    await conn.execute(sa_text(
+                        f"ALTER TYPE daststatus ADD VALUE IF NOT EXISTS '{value}'"))
                 except Exception:  # noqa: BLE001
                     pass

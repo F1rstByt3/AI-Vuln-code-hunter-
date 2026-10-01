@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import secrets
 from app.config import settings
+from app.dast.modes import normalize_mode
 from app.dast.scope import host_of, normalize_hosts
 from app.models import DastCredential, DastTarget
 
@@ -31,6 +32,7 @@ def target_out(t: DastTarget, creds: list[DastCredential] | None = None) -> dict
         "max_rps": t.max_rps,
         "enabled": t.enabled,
         "object_seeds": t.object_seeds or {},
+        "mode_config": normalize_mode(t.mode_config),
         "secrets_available": secrets.secrets_available(),
         "credentials": [cred_out(c) for c in (creds if creds is not None else t.credentials)],
     }
@@ -102,6 +104,8 @@ async def update_target(session: AsyncSession, t: DastTarget, body: dict) -> dic
         t.max_rps = float(body["max_rps"])
     if body.get("object_seeds") is not None:
         t.object_seeds = body["object_seeds"] or {}
+    if body.get("mode_config") is not None:
+        t.mode_config = normalize_mode(body["mode_config"])
     await session.commit()
     await session.refresh(t)
     return target_out(t)

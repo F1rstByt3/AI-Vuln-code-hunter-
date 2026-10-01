@@ -21,16 +21,17 @@ from sqlalchemy import select
 from app import control, events
 from app.ai.agent import DEFAULT_CHECKS, run_review
 from app.ai.foundry import get_foundry_client
+from app.api.deps import get_arq
 from app.config import settings
 from app.control import Controller, ScanCanceledSignal, StageSkippedSignal
 from app.db import SessionLocal, init_models
 from app.ingestion import index_files, materialize, resolve_rel
 from app.models import (
+    AgentEvent,
     AiProfile,
     Artifact,
     ArtifactFile,
     ArtifactStatus,
-    AgentEvent,
     Finding,
     FindingSource,
     FindingState,
@@ -427,6 +428,8 @@ async def _run_scan(ctx: dict, scan_id: str) -> None:
             await session.commit()
             await store.clear()  # clean finish — no resume needed
             await emit({"type": "done", "status": final_status.value, "summary": scan.summary})
+            if final_status in (ScanStatus.completed, ScanStatus.needs_review):
+                await _maybe_autorun_dast(session, scan, emit)
 
         canceled = False
         try:
@@ -763,6 +766,47 @@ def _finding_from_dict(scan_id: str, f: dict) -> Finding:
         triaged_by=f.get("triaged_by"),
         raw=f,
     )
+
+
+async def _maybe_autorun_dast(session, scan: Scan, emit) -> None:
+    """After a scan finishes, auto-queue a DAST run for any enabled target on
+    this project whose mode says auto_run. Automation stays on the safe subset
+    (access-control only, non-mutating) unless the mode explicitly opts into
+    active scanning. Honours the approval queue. Best-effort — never fails the
+    scan."""
+    from app.dast import launch
+    from app.dast.modes import normalize_mode
+    from app.models import DastStatus, DastTarget
+
+    try:
+        targets = (await session.execute(
+            select(DastTarget).where(DastTarget.project_id == scan.project_id,
+                                     DastTarget.enabled.is_(True))
+        )).scalars().all()
+        for t in targets:
+            mode = normalize_mode(t.mode_config)
+            if not mode["auto_run"]:
+                continue
+            if await launch.has_active_run(session, scan.id):
+                continue
+            active = mode["auto_run_active"] and t.active_scan_enabled \
+                and "active_scan" in mode["allowed_checks"]
+            run = await launch.create_run(
+                session, scan, t, authorized_by="auto (mode_config)",
+                allow_mutating=False, access_control=True, active_scan=active,
+                source="auto")
+            if run.status == DastStatus.queued:
+                arq = await get_arq()
+                await arq.enqueue_job("run_dast", run.id)
+                await emit({"type": "log", "message":
+                            f"Auto-queued a DAST run against {t.base_url} "
+                            f"(access-control{' + active' if active else ''}, non-mutating)"})
+            else:
+                await emit({"type": "log", "message":
+                            f"Auto-run against {t.base_url} is awaiting approval "
+                            f"(mode: approval required)"})
+    except Exception as exc:  # noqa: BLE001
+        await emit({"type": "log", "message": f"Auto-run check skipped: {exc}"})
 
 
 def _mark_unverified(f: dict) -> dict:

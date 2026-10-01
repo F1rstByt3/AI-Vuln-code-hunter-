@@ -122,6 +122,15 @@ export const api = {
   }) => req<DastRun>(`/scans/${scanId}/dast`, { method: "POST", body: JSON.stringify(b) }),
   listDastRuns: (scanId: string) => req<DastRun[]>(`/scans/${scanId}/dast-runs`),
   cancelDastRun: (id: string) => req<DastRun>(`/dast-runs/${id}/cancel`, { method: "POST" }),
+  // Live, in-flight control of a running DAST run.
+  getRunControl: (id: string) =>
+    req<import("./types").DastControlState>(`/dast-runs/${id}/control`),
+  patchRunControl: (id: string, b: Record<string, any>) =>
+    req<any>(`/dast-runs/${id}/control`, { method: "POST", body: JSON.stringify(b) }),
+  decideIntercept: (id: string, seq: number, verdict: string) =>
+    req<any>(`/dast-runs/${id}/intercept/${seq}`, { method: "POST", body: JSON.stringify({ verdict }) }),
+  approveDastRun: (id: string) => req<DastRun>(`/dast-runs/${id}/approve`, { method: "POST" }),
+  rejectDastRun: (id: string) => req<DastRun>(`/dast-runs/${id}/reject`, { method: "POST" }),
 
   // Burp manual testing (Repeater / Intruder)
   burpPackUrl: (scanId: string, o: { base_url?: string; min_risk?: string; with_findings_only?: boolean } = {}) => {

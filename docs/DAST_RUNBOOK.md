@@ -181,3 +181,49 @@ role check, IDOR). These are hints, not findings:
 For an existing scan with a flood of old flags, use **↻ Access control
 (AI-verify)** on the scan page: it re-runs only this step and replaces only
 the access-control findings.
+
+## Run modes: automatic, approved, and monitored
+
+A DAST run can be started three ways, and steered while it runs.
+
+### How a run starts (per-target "Run policy", editable any time)
+On a target (Project page → Live testing (DAST) targets) the **Run policy**
+applies to the *next* run, never one in flight:
+
+- **Auto-run after each scan** — when a scan on this project finishes, a run is
+  queued automatically. Auto-runs are always **non-mutating and
+  access-control only** (add "Auto-run includes active scan" to widen, which
+  also needs "Allow active scan").
+- **Require approval before running** — new runs enter **pending approval** and
+  send no traffic until an admin clicks **approve** (or **reject**). Applies to
+  manual and auto-runs alike.
+- **Allow active scan** — gate that must be on before any run against this
+  target may scan actively.
+
+### Approving / rejecting
+A pending run shows **approve** / **reject** on the scan page. Approve launches
+it; reject marks it rejected and it never runs.
+
+### Steering a run while it is live (monitored)
+Every in-flight run shows a **Live control** bar. All edits are **tighten-only**
+— you can pause or make a run safer, never loosen it (to loosen, start a new,
+freshly-authorised run):
+
+- **pause / resume** — stops sending requests at the next request; resume
+  continues.
+- **slow down** — lower the request rate on the fly (cannot exceed the launch
+  rate).
+- **stop mutating** — turn state-changing requests off for the rest of the run.
+- **add exclusion** — add a path prefix to skip from here on.
+- **cancel run** — stop the whole run.
+
+### Intercept (per-request approval)
+Set **intercept** at launch (or live) to `mutating` or `all`. The run then
+**holds before each matching request** and surfaces it in the Live control bar;
+you **allow** or **skip** each one, or **allow/skip & stop intercepting** to
+release the rest. An un-answered hold times out to *skip* (safe) after 15
+minutes so a run can't hang forever.
+
+Everything a run sends is still recorded in the per-request audit log
+("requests" on the run row), so "monitored" covers both live steering and the
+after-the-fact trail.

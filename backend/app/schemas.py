@@ -324,6 +324,7 @@ class DastTargetUpdate(BaseModel):
     object_seeds: dict | None = None
     max_rps: float | None = None
     enabled: bool | None = None
+    mode_config: dict | None = None
 
 
 class DastTargetOut(BaseModel):
@@ -337,6 +338,7 @@ class DastTargetOut(BaseModel):
     max_rps: float = 5.0
     enabled: bool = True
     object_seeds: dict = Field(default_factory=dict)
+    mode_config: dict = Field(default_factory=dict)
     secrets_available: bool = False
     credentials: list[DastCredentialOut] = Field(default_factory=list)
 
@@ -350,6 +352,21 @@ class DastRunCreate(BaseModel):
     active_scan: bool = False            # native active checks (+ Burp if attached)
     include_paths: list[str] | None = None   # only test paths starting with these
     exclude_paths: list[str] | None = None   # never test paths starting with these
+    intercept: str = "off"                    # off | mutating | all — hold before requests
+
+
+class DastControlPatch(BaseModel):
+    """Live edits to an in-flight run. Tighten-only: the server ignores any
+    attempt to loosen (raise rate above launch, re-enable mutating)."""
+    status: str | None = None                 # running | paused | canceled
+    max_rps: float | None = None              # lowered on the fly (<= launch rate)
+    allow_mutating: bool | None = None        # only False is honoured (turn off)
+    exclude_paths: list[str] | None = None    # additive path-prefix skips
+    intercept: str | None = None              # off | mutating | all
+
+
+class DastInterceptDecision(BaseModel):
+    verdict: str                              # allow | skip | allow_rest | skip_rest
 
 
 class DastPlanRequest(BaseModel):

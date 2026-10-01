@@ -46,11 +46,15 @@ class RequestCapExceeded(RuntimeError):
 class LiveClient:
     def __init__(self, scope: Scope, *, max_rps: float, allow_mutating: bool,
                  max_requests: int | None = None, capture_bodies: bool = False,
-                 log_cap: int = 3000) -> None:
+                 log_cap: int = 3000, control=None) -> None:
         self.scope = scope
         self.allow_mutating = allow_mutating
         self._min_interval = 1.0 / max_rps if max_rps and max_rps > 0 else 0.0
         self._last = 0.0
+        # Optional live-control gate (pause / throttle / tighten / intercept).
+        self.control = control
+        if control is not None:
+            control.attach(self)
         self._max_requests = max_requests or settings.dast_max_requests_per_run
         self._count = 0
         self._capture = capture_bodies
@@ -84,12 +88,22 @@ class LiveClient:
     async def __aexit__(self, *exc) -> None:
         await self._client.aclose()
 
+    def set_rps(self, rps: float) -> None:
+        """Live rate override (used by the control gate). 0/None removes it."""
+        self._min_interval = 1.0 / rps if rps and rps > 0 else 0.0
+
     async def _throttle(self) -> None:
         if self._min_interval:
             wait = self._min_interval - (time.monotonic() - self._last)
             if wait > 0:
                 await asyncio.sleep(wait)
         self._last = time.monotonic()
+
+    async def _gate(self, method: str, url: str, purpose: str, role: str,
+                    mutating: bool) -> str:
+        if self.control is None:
+            return "send"
+        return await self.control.gate(method, url, purpose, role, mutating)
 
     async def raw(self, method: str, url: str, identity: Identity, *,
                   json_body=None, data=None, allow_login: bool = False,
@@ -100,6 +114,11 @@ class LiveClient:
         guards apply. ``allow_login`` permits a POST even when the run forbids
         mutating traffic (authenticating is not a target mutation)."""
         method = method.upper()
+        # Live control still applies to internal traffic for pause / cancel /
+        # throttle; it never *skips* an internal (login/harvest) request.
+        if await self._gate(method, url, purpose, identity.role,
+                            method not in SAFE_METHODS) == "skip":
+            raise RuntimeError("request skipped by live control")
         if method not in SAFE_METHODS and not self.allow_mutating and not allow_login:
             raise RuntimeError(f"{method} requires allow_mutating")
         self.scope.check(url)
@@ -118,7 +137,13 @@ class LiveClient:
     async def send(self, method: str, url: str, identity: Identity,
                    *, json_body=None, purpose: str = "probe") -> LiveResponse:
         method = method.upper()
-        if method not in SAFE_METHODS and not self.allow_mutating:
+        mutating = method not in SAFE_METHODS
+        # Live-control gate: pause/throttle happen inside; may skip this request.
+        if await self._gate(method, url, purpose, identity.role, mutating) == "skip":
+            self._record(purpose, method, url, identity.role, None, 0,
+                         note="skipped: live control")
+            return LiveResponse(0, 0, 0, "", "", error="skipped by live control")
+        if mutating and not self.allow_mutating:
             self._record(purpose, method, url, identity.role, None, 0,
                          note="blocked: mutating not allowed")
             return LiveResponse(0, 0, 0, "", "",

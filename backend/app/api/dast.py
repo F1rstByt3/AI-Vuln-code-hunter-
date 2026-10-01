@@ -7,26 +7,43 @@ authorization attestation that is recorded on the run (who + when).
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import events
 from app.api.deps import get_arq, get_or_404
 from app.auth import CurrentUser, require_role
-from app.dast import store
+from app.dast import launch, store
 from app.dast.client import smoke_test
 from app.dast.identity import Identity
 from app.dast.scope import Scope
 from app.db import get_session
 from app.models import (
-    DastCredential, DastRun, DastStatus, DastTarget, Finding, FindingSource,
-    FindingState, Project, Role, Scan,
+    DastCredential,
+    DastRun,
+    DastStatus,
+    DastTarget,
+    Finding,
+    FindingSource,
+    FindingState,
+    Project,
+    Role,
+    Scan,
 )
 from app.schemas import (
-    DastCredentialIn, DastCredentialOut, DastPlanRequest, DastRunCreate, DastRunOut,
-    DastTargetIn, DastTargetOut, DastTargetUpdate,
+    DastControlPatch,
+    DastCredentialIn,
+    DastCredentialOut,
+    DastInterceptDecision,
+    DastPlanRequest,
+    DastRunCreate,
+    DastRunOut,
+    DastTargetIn,
+    DastTargetOut,
+    DastTargetUpdate,
 )
 
 router = APIRouter(tags=["dast"])
@@ -133,33 +150,50 @@ async def launch_run(scan_id: str, body: DastRunCreate,
     if body.active_scan and not target.active_scan_enabled:
         raise HTTPException(400, "active scan is not enabled for this target")
     # One live run per scan at a time: concurrent runs would race the same
-    # findings and double the outbound traffic.
-    active = (await session.execute(
-        select(DastRun).where(
-            DastRun.scan_id == scan_id,
-            DastRun.status.in_([DastStatus.queued, DastStatus.running]),
-        ).limit(1)
-    )).scalar_one_or_none()
-    if active is not None:
-        raise HTTPException(409, "a live run is already in progress for this scan")
+    # findings and double the outbound traffic (pending-approval runs count).
+    if await launch.has_active_run(session, scan_id):
+        raise HTTPException(409, "a live run is already in progress or awaiting approval "
+                                 "for this scan")
+    try:
+        run = await launch.create_run(
+            session, scan, target, authorized_by=user.email,
+            allow_mutating=body.allow_mutating, access_control=body.access_control,
+            active_scan=body.active_scan, include_paths=body.include_paths,
+            exclude_paths=body.exclude_paths, intercept=body.intercept, source="manual")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
-    run = DastRun(
-        scan_id=scan_id, target_id=target.id, status=DastStatus.queued,
-        authorized_by=user.email, authorized_at=datetime.now(timezone.utc),
-        allow_mutating=bool(body.allow_mutating),
-        config={"active_scan": bool(body.active_scan),
-                "checks": {"access_control": bool(body.access_control),
-                           "active_scan": bool(body.active_scan)},
-                "include_paths": body.include_paths or [],
-                "exclude_paths": body.exclude_paths or [],
-                "allowed_hosts": target.allowed_hosts or []},
-    )
-    session.add(run)
-    await session.commit()
-    await session.refresh(run)
+    if run.status == DastStatus.queued:
+        arq = await get_arq()
+        await arq.enqueue_job("run_dast", run.id)
+    return run
 
+
+@router.post("/dast-runs/{run_id}/approve", response_model=DastRunOut,
+             dependencies=[Depends(require_role(Role.admin))])
+async def approve_run_ep(run_id: str, session: AsyncSession = Depends(get_session),
+                         user: CurrentUser = Depends(require_role(Role.admin))):
+    """Approve a run waiting in the approval queue, then launch it."""
+    run = await get_or_404(session, DastRun, run_id)
+    if run.status != DastStatus.pending_approval:
+        raise HTTPException(409, "run is not awaiting approval")
+    run = await launch.approve_run(session, run, user.email)
     arq = await get_arq()
     await arq.enqueue_job("run_dast", run.id)
+    return run
+
+
+@router.post("/dast-runs/{run_id}/reject", response_model=DastRunOut,
+             dependencies=[Depends(require_role(Role.admin))])
+async def reject_run_ep(run_id: str, session: AsyncSession = Depends(get_session)):
+    """Refuse a run waiting in the approval queue; it never runs."""
+    run = await get_or_404(session, DastRun, run_id)
+    if run.status != DastStatus.pending_approval:
+        raise HTTPException(409, "run is not awaiting approval")
+    run.status = DastStatus.rejected
+    run.finished_at = datetime.now(UTC)
+    await session.commit()
+    await session.refresh(run)
     return run
 
 
@@ -240,10 +274,57 @@ async def cancel_run(run_id: str, session: AsyncSession = Depends(get_session)):
     if run.status in (DastStatus.queued, DastStatus.running):
         await control.set_control(run.scan_id + ":dast", "cancel")
         run.status = DastStatus.canceled
-        run.finished_at = datetime.now(timezone.utc)
+        run.finished_at = datetime.now(UTC)
         await session.commit()
         await session.refresh(run)
     return run
+
+
+@router.get("/dast-runs/{run_id}/control")
+async def get_run_control(run_id: str, session: AsyncSession = Depends(get_session)):
+    """Current live-control state of a run + any requests held for a decision."""
+    from app.dast import live_control
+    run = await get_or_404(session, DastRun, run_id)
+    doc = await live_control.read_doc(run_id)
+    pending = await live_control.list_pending(run_id) if run.status == DastStatus.running else []
+    return {"run_id": run_id, "status": run.status.value, "control": doc, "pending": pending}
+
+
+@router.post("/dast-runs/{run_id}/control",
+             dependencies=[Depends(require_role(Role.reviewer))])
+async def patch_run_control(run_id: str, body: DastControlPatch,
+                            session: AsyncSession = Depends(get_session)):
+    """Steer an in-flight run: pause/resume, lower the rate, turn mutating off,
+    add path exclusions, or change intercept mode. Tighten-only — loosening is
+    ignored. ``status: "canceled"`` cancels the run."""
+    from app.dast import live_control
+    run = await get_or_404(session, DastRun, run_id)
+    if run.status not in (DastStatus.queued, DastStatus.running):
+        raise HTTPException(409, "run is not active")
+    target = await session.get(DastTarget, run.target_id)
+    ceiling = (target.max_rps if target else None)
+    doc = await live_control.write_patch(
+        run_id, body.model_dump(exclude_none=True), launch_max_rps=ceiling)
+    if body.status == "canceled":
+        from app import control
+        await control.set_control(run.scan_id + ":dast", "cancel")
+    await events.publish(run.scan_id, {"type": "dast_control", "dast_run": run_id,
+                                       "control": doc})
+    return {"run_id": run_id, "control": doc}
+
+
+@router.post("/dast-runs/{run_id}/intercept/{seq}",
+             dependencies=[Depends(require_role(Role.reviewer))])
+async def decide_intercept(run_id: str, seq: int, body: DastInterceptDecision,
+                           session: AsyncSession = Depends(get_session)):
+    """Approve or skip a held (intercepted) request. ``allow_rest``/``skip_rest``
+    also turn intercept off so the run stops holding."""
+    from app.dast import live_control
+    if body.verdict not in ("allow", "skip", "allow_rest", "skip_rest"):
+        raise HTTPException(400, "verdict must be allow | skip | allow_rest | skip_rest")
+    await get_or_404(session, DastRun, run_id)
+    await live_control.set_decision(run_id, seq, body.verdict)
+    return {"ok": True}
 
 
 @router.get("/scans/{scan_id}/dast-runs", response_model=list[DastRunOut])
