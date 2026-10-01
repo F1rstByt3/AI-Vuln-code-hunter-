@@ -114,8 +114,12 @@ export const api = {
   addDastCredential: (targetId: string, b: Record<string, any>) =>
     req<any>(`/dast-targets/${targetId}/credentials`, { method: "POST", body: JSON.stringify(b) }),
   deleteDastCredential: (id: string) => req<void>(`/dast-credentials/${id}`, { method: "DELETE" }),
-  launchDast: (scanId: string, b: { target_id: string; authorize: boolean; allow_mutating?: boolean; active_scan?: boolean }) =>
-    req<DastRun>(`/scans/${scanId}/dast`, { method: "POST", body: JSON.stringify(b) }),
+  dastPlan: (scanId: string, b: Record<string, any>) =>
+    req<any>(`/scans/${scanId}/dast/plan`, { method: "POST", body: JSON.stringify(b) }),
+  launchDast: (scanId: string, b: {
+    target_id: string; authorize: boolean; allow_mutating?: boolean; active_scan?: boolean;
+    access_control?: boolean; include_paths?: string[]; exclude_paths?: string[];
+  }) => req<DastRun>(`/scans/${scanId}/dast`, { method: "POST", body: JSON.stringify(b) }),
   listDastRuns: (scanId: string) => req<DastRun[]>(`/scans/${scanId}/dast-runs`),
   cancelDastRun: (id: string) => req<DastRun>(`/dast-runs/${id}/cancel`, { method: "POST" }),
 

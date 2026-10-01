@@ -2,23 +2,62 @@ import React from "react";
 import type { Severity } from "../lib/types";
 
 export function Card({ children, className = "" }: { children: React.ReactNode; className?: string }) {
-  return <div className={`rounded-lg border border-border bg-panel ${className}`}>{children}</div>;
+  return <div className={`rounded-xl border border-border bg-panel shadow-card ${className}`}>{children}</div>;
+}
+
+export function PageHeader({ title, subtitle, actions }: {
+  title: React.ReactNode; subtitle?: React.ReactNode; actions?: React.ReactNode;
+}) {
+  return (
+    <div className="flex items-start justify-between gap-4 mb-6">
+      <div>
+        <h1 className="text-2xl font-bold tracking-tight">{title}</h1>
+        {subtitle && <p className="text-sm text-muted mt-1">{subtitle}</p>}
+      </div>
+      {actions && <div className="flex items-center gap-2 shrink-0">{actions}</div>}
+    </div>
+  );
+}
+
+export function Tabs({ tabs, active, onChange }: {
+  tabs: { key: string; label: React.ReactNode; badge?: React.ReactNode }[];
+  active: string; onChange: (k: string) => void;
+}) {
+  return (
+    <div className="flex gap-1 border-b border-border mb-6 overflow-x-auto">
+      {tabs.map((t) => (
+        <button key={t.key} onClick={() => onChange(t.key)}
+          className={`px-4 py-2.5 text-sm -mb-px border-b-2 whitespace-nowrap transition ${
+            active === t.key
+              ? "border-accent text-slate-100 font-semibold"
+              : "border-transparent text-muted hover:text-slate-300"}`}>
+          {t.label}
+          {t.badge != null && (
+            <span className="ml-1.5 text-[11px] px-1.5 py-0.5 rounded-full bg-border/70 tabular-nums">
+              {t.badge}
+            </span>
+          )}
+        </button>
+      ))}
+    </div>
+  );
 }
 
 export function Button({
   children, onClick, variant = "primary", type = "button", disabled,
 }: {
   children: React.ReactNode; onClick?: () => void;
-  variant?: "primary" | "ghost" | "danger"; type?: "button" | "submit"; disabled?: boolean;
+  variant?: "primary" | "accent" | "ghost" | "danger"; type?: "button" | "submit"; disabled?: boolean;
 }) {
   const styles = {
-    primary: "bg-emerald-600 hover:bg-emerald-500 text-white",
+    primary: "bg-emerald-600 hover:bg-emerald-500 text-white shadow-sm",
+    accent: "bg-accent hover:bg-accent-hover text-white shadow-sm",
     ghost: "bg-transparent hover:bg-border text-slate-200 border border-border",
     danger: "bg-red-600/80 hover:bg-red-600 text-white",
   }[variant];
   return (
     <button type={type} onClick={onClick} disabled={disabled}
-      className={`px-3 py-1.5 rounded-md text-sm font-medium transition disabled:opacity-40 ${styles}`}>
+      className={`px-3 py-1.5 rounded-lg text-sm font-medium transition disabled:opacity-40 ${styles}`}>
       {children}
     </button>
   );

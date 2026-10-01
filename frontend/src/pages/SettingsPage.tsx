@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Button, Card, Input } from "../components/ui";
+import { Button, Card, Input, PageHeader, Tabs } from "../components/ui";
 import { api } from "../lib/api";
 import type {
   AiProfile, FoundrySettings, McpServer, ModelRole, ModelRoles, ProfileKind, ScannerSettings,
@@ -9,14 +9,12 @@ const emptyRole = (deployment = ""): ModelRole => ({ deployment, transport: "aut
 
 const NO_ROLES = { chat: null, reviewers: [], judge: null, exploit: null, verifier: null };
 
-// Starting points for a new profile. "current" snapshots the saved settings
-// (API key included, server-side); the rest are local/cloud presets.
 const TEMPLATES: Record<string, { label: string; fromCurrent?: boolean; settings?: Record<string, any> }> = {
   current: { label: "Current settings (incl. API key)", fromCurrent: true },
   ollama: {
     label: "Local · Ollama",
     settings: { endpoint: "http://host.docker.internal:11434", api_style: "local", api_version: "",
-      deployment: "qwen2.5-coder:32b", context_tokens: 32768, concurrency: 1, roles: NO_ROLES },
+      deployment: "qwen3-coder:30b", context_tokens: 32768, concurrency: 1, roles: NO_ROLES },
   },
   lmstudio: {
     label: "Local · LM Studio / vLLM",
@@ -45,7 +43,10 @@ const toNum = (s: string): number | null => {
   return Number.isFinite(n) && n > 0 ? n : null;
 };
 
+const selectCls = "w-full mt-1 px-3 py-2 rounded-lg bg-bg border border-border text-sm outline-none focus:border-accent";
+
 export default function SettingsPage() {
+  const [tab, setTab] = useState("connection");
   const [fs, setFs] = useState<FoundrySettings>();
   const [endpoint, setEndpoint] = useState("");
   const [apiKey, setApiKey] = useState("");
@@ -58,7 +59,6 @@ export default function SettingsPage() {
   const [models, setModels] = useState<string[]>([]);
   const [test, setTest] = useState<string>("");
   const [mcp, setMcp] = useState<McpServer[]>([]);
-  const [newMcp, setNewMcp] = useState({ name: "", kind: "semgrep", transport: "http", url: "" });
   const [msg, setMsg] = useState("");
   const [scanners, setScanners] = useState<ScannerSettings>();
   const [sonarUrl, setSonarUrl] = useState("");
@@ -92,13 +92,11 @@ export default function SettingsPage() {
       setScanners(sc); setSonarToken(""); setScanMsg("Saved ✓");
     } catch (e) { setScanMsg(String(e)); }
   };
-
   const saveSonar = () => {
     const patch: Record<string, any> = { sonarqube_url: sonarUrl };
     if (sonarToken) patch.sonarqube_token = sonarToken;
     return patchScanners(patch);
   };
-
   const runSonarTest = async () => {
     setSonarTest("testing…");
     try { const r = await api.testSonar(); setSonarTest(`${r.ok ? "✓" : "✗"} ${r.detail}`); }
@@ -125,257 +123,285 @@ export default function SettingsPage() {
 
   const runTest = async () => {
     setTest("testing…");
-    const r = await api.testFoundry();
-    setTest(`${r.ok ? "✓" : "✗"} ${r.detail}${r.models.length ? ` · models: ${r.models.join(", ")}` : ""}`);
-    if (r.models.length) setModels(r.models);
+    try {
+      const r = await api.testFoundry();
+      setTest(`${r.ok ? "✓" : "✗"} ${r.detail}${r.models.length ? ` · models: ${r.models.join(", ")}` : ""}`);
+      if (r.models.length) setModels(r.models);
+    } catch (e) { setTest(String(e)); }
   };
 
-  const addMcp = async () => {
-    if (!newMcp.name) return;
-    await api.createMcp(newMcp);
-    setNewMcp({ name: "", kind: "semgrep", transport: "http", url: "" });
-    api.listMcp().then(setMcp);
+  const saveLabel = fs?.active_profile_name ? `Save to “${fs.active_profile_name}”` : "Save";
+
+  return (
+    <div>
+      <PageHeader
+        title="Settings"
+        subtitle="Configure the AI, scanners, and integrations used by scans."
+        actions={fs && (
+          <span className={`text-xs px-2.5 py-1 rounded-full border ${fs.mock_mode ? "border-amber-500/40 text-amber-300" : "border-emerald-500/40 text-emerald-300"}`}>
+            {fs.mock_mode ? "MOCK MODE" : `${fs.kind ?? "connected"} · ${fs.auth_mode}`}
+            {fs.active_profile_name ? ` · ${fs.active_profile_name}` : ""}
+          </span>
+        )}
+      />
+
+      <Tabs active={tab} onChange={setTab} tabs={[
+        { key: "connection", label: "AI Connection" },
+        { key: "roles", label: "Model roles" },
+        { key: "profiles", label: "Profiles" },
+        { key: "scanners", label: "Scanners" },
+        { key: "integrations", label: "Integrations", badge: mcp.length || undefined },
+      ]} />
+
+      {tab === "connection" && (
+        <Card className="p-5">
+          <div className="text-[11px] text-muted mb-4">
+            {fs?.active_profile_name
+              ? <>Editing profile <span className="text-slate-200 font-medium">{fs.active_profile_name}</span> — saving updates it.</>
+              : "Active settings (not saved as a profile)."}
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <label className="text-sm">Endpoint URL
+              <Input value={endpoint} onChange={(e) => setEndpoint(e.target.value)}
+                placeholder="http://host.docker.internal:11434 or https://my-foundry…" />
+            </label>
+            <label className="text-sm">API key {fs?.api_key_set && <span className="text-emerald-400 text-xs">(set)</span>}
+              <Input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)}
+                placeholder={fs?.api_key_set ? "•••••• (unchanged)" : "paste key — not needed for local"} />
+            </label>
+            <label className="text-sm">Model / deployment name
+              <Input value={deployment} onChange={(e) => setDeployment(e.target.value)}
+                placeholder="e.g. qwen3-coder:30b, gpt-5-codex" list="models-list" />
+              <datalist id="models-list">{models.map((m) => <option key={m} value={m} />)}</datalist>
+              {models.length > 0 && <div className="text-[11px] text-muted mt-1">Discovered: {models.join(", ")}</div>}
+            </label>
+            <label className="text-sm">API version
+              <Input value={apiVersion} onChange={(e) => setApiVersion(e.target.value)} placeholder="preview" />
+            </label>
+            <label className="text-sm">API style
+              <select value={apiStyle} onChange={(e) => setApiStyle(e.target.value)} className={selectCls}>
+                <option value="v1">v1 — Azure Foundry Models API</option>
+                <option value="local">local — Ollama / vLLM / LM Studio / llama.cpp</option>
+                <option value="azure">azure — legacy Azure (deployments + api-version)</option>
+              </select>
+              <div className="text-[11px] text-muted mt-1">
+                {apiStyle === "local" ? "Any OpenAI-compatible local server at /v1. No API key needed."
+                  : apiStyle === "azure" ? "Legacy Azure path: /openai/deployments/…?api-version=…"
+                  : "Azure Foundry v1: /openai/v1/. Auto-detects local endpoints."}
+              </div>
+            </label>
+            <div className="grid grid-cols-2 gap-4">
+              <label className="text-sm">Context window
+                <Input value={contextTokens} inputMode="numeric"
+                  onChange={(e) => setContextTokens(e.target.value.replace(/\D/g, ""))} placeholder="auto" />
+              </label>
+              <label className="text-sm">Parallel requests
+                <Input value={concurrency} inputMode="numeric"
+                  onChange={(e) => setConcurrency(e.target.value.replace(/\D/g, ""))} placeholder="4" />
+              </label>
+            </div>
+          </div>
+          <p className="text-[11px] text-muted mt-2">
+            Local models: set the context window your server actually loads (Ollama <code className="mx-0.5">OLLAMA_CONTEXT_LENGTH</code>)
+            and 1 parallel request. Leave the endpoint blank for mock mode.
+          </p>
+          <div className="flex items-center gap-3 mt-5">
+            <Button onClick={save}>{saveLabel}</Button>
+            <Button variant="ghost" onClick={runTest}>Test connection</Button>
+            {msg && <span className="text-sm text-muted">{msg}</span>}
+            {test && <span className="text-sm text-muted break-all">{test}</span>}
+          </div>
+        </Card>
+      )}
+
+      {tab === "roles" && (
+        <Card className="p-5">
+          <p className="text-xs text-muted mb-4">
+            Assign models to each stage. Reviewers run in parallel (an ensemble); the judge
+            dedupes and cuts false positives; the verifier tries to disprove each finding;
+            the exploit analyst writes PoCs. Leave a role blank to use the model above.
+          </p>
+          <div className="space-y-5">
+            <RoleBlock title="Chat / reasoning">
+              <RoleEditor role={roles.chat ?? emptyRole()} models={models}
+                onChange={(r) => setRoles({ ...roles, chat: r })} />
+            </RoleBlock>
+            <RoleBlock title="Reviewers (vulnerability analysis)"
+              action={<Button variant="ghost" onClick={() => setRoles({ ...roles, reviewers: [...roles.reviewers, emptyRole()] })}>+ Add reviewer</Button>}>
+              <div className="space-y-2">
+                {roles.reviewers.map((r, i) => (
+                  <RoleEditor key={i} role={r} models={models} removable
+                    onRemove={() => setRoles({ ...roles, reviewers: roles.reviewers.filter((_, j) => j !== i) })}
+                    onChange={(nr) => setRoles({ ...roles, reviewers: roles.reviewers.map((x, j) => (j === i ? nr : x)) })} />
+                ))}
+                {roles.reviewers.length === 0 && <div className="text-xs text-muted">No reviewers set — the model above is used.</div>}
+              </div>
+            </RoleBlock>
+            <RoleBlock title="Judge / validator (optional)" hint="Blank = skip adjudication, keep raw reviewer findings.">
+              <RoleEditor role={roles.judge ?? emptyRole()} models={models} onChange={(r) => setRoles({ ...roles, judge: r })} />
+            </RoleBlock>
+            <RoleBlock title="False-positive verifier (optional)" hint="Tries to disprove each medium+ finding. A different model family gives the most independent second opinion.">
+              <RoleEditor role={roles.verifier ?? emptyRole()} models={models} onChange={(r) => setRoles({ ...roles, verifier: r })} />
+            </RoleBlock>
+            <RoleBlock title="Exploit analyst (optional)" hint="On confirmed findings: writes where-to-look, a non-destructive PoC, risk, and a fix.">
+              <RoleEditor role={roles.exploit ?? emptyRole()} models={models} onChange={(r) => setRoles({ ...roles, exploit: r })} />
+            </RoleBlock>
+          </div>
+          <div className="mt-5 flex items-center gap-3">
+            <Button onClick={save}>Save roles</Button>
+            {msg && <span className="text-sm text-muted">{msg}</span>}
+          </div>
+        </Card>
+      )}
+
+      {tab === "profiles" && (
+        <ProfilesCard activeId={fs?.active_profile_id ?? null}
+          onActivated={() => load().catch((e) => setMsg(String(e)))} />
+      )}
+
+      {tab === "scanners" && (
+        <Card className="p-5">
+          <p className="text-xs text-muted mb-4">
+            The high-recall sweep before the AI reviews code. Semgrep runs on the worker;
+            SonarQube uploads to a server and pulls issues back. Both normalise into the
+            same findings the AI judge then validates.
+          </p>
+          <div className="flex items-center justify-between py-3 border-b border-border">
+            <div>
+              <div className="text-sm font-medium">Semgrep</div>
+              <div className="text-[11px] text-muted">ruleset: <code>{scanners?.semgrep_ruleset || "auto"}</code> · runs locally</div>
+            </div>
+            <Toggle on={!!scanners?.semgrep_enabled} onChange={(v) => patchScanners({ semgrep_enabled: v })} />
+          </div>
+          <div className="py-3">
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-sm font-medium">SonarQube</div>
+                <div className="text-[11px] text-muted">needs a server · <code>docker compose --profile sonar up</code></div>
+              </div>
+              <Toggle on={!!scanners?.sonarqube_enabled} onChange={(v) => patchScanners({ sonarqube_enabled: v })} />
+            </div>
+            {scanners?.sonarqube_enabled && (
+              <div className="mt-3 grid grid-cols-2 gap-4">
+                <label className="text-sm">Server URL
+                  <Input value={sonarUrl} onChange={(e) => setSonarUrl(e.target.value)} placeholder="http://sonarqube:9000" />
+                </label>
+                <label className="text-sm">Token {scanners?.sonarqube_token_set && <span className="text-emerald-400 text-xs">(set)</span>}
+                  <Input type="password" value={sonarToken} onChange={(e) => setSonarToken(e.target.value)}
+                    placeholder={scanners?.sonarqube_token_set ? "•••••• (unchanged)" : "squ_…"} />
+                </label>
+                <div className="col-span-2 flex items-center gap-3">
+                  <Button onClick={saveSonar}>Save</Button>
+                  <Button variant="ghost" onClick={runSonarTest}>Test connection</Button>
+                  {scanMsg && <span className="text-sm text-muted">{scanMsg}</span>}
+                  {sonarTest && <span className="text-sm text-muted">{sonarTest}</span>}
+                </div>
+              </div>
+            )}
+          </div>
+        </Card>
+      )}
+
+      {tab === "integrations" && (
+        <IntegrationsTab mcp={mcp} reload={() => api.listMcp().then(setMcp)} />
+      )}
+    </div>
+  );
+}
+
+function RoleBlock({ title, hint, action, children }: {
+  title: string; hint?: string; action?: React.ReactNode; children: React.ReactNode;
+}) {
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-1.5">
+        <div className="text-sm font-medium">{title}</div>
+        {action}
+      </div>
+      {children}
+      {hint && <div className="text-[11px] text-muted mt-1">{hint}</div>}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------- Integrations
+function IntegrationsTab({ mcp, reload }: { mcp: McpServer[]; reload: () => Promise<any> }) {
+  const [newMcp, setNewMcp] = useState({ name: "", kind: "custom", transport: "sse", url: "" });
+  const [msg, setMsg] = useState("");
+
+  const add = async () => {
+    if (!newMcp.name || !newMcp.url) { setMsg("name and url required"); return; }
+    setMsg("");
+    try {
+      await api.createMcp(newMcp);
+      setNewMcp({ name: "", kind: "custom", transport: "sse", url: "" });
+      await reload();
+    } catch (e) { setMsg(String(e)); }
   };
+  const burpPreset = () => setNewMcp({ name: "burp", kind: "burp", transport: "sse",
+    url: "http://host.docker.internal:9876/sse" });
+
+  const burp = mcp.find((m) => m.kind === "burp");
 
   return (
     <div className="space-y-6">
-      <h1 className="text-2xl font-bold">Settings</h1>
-
-      <ProfilesCard activeId={fs?.active_profile_id ?? null}
-        onActivated={() => load().catch((e) => setMsg(String(e)))} />
-
-      <Card className="p-4">
-        <div className="flex items-center justify-between mb-3">
-          <div>
-            <h2 className="font-semibold">AI reviewer connection</h2>
-            <div className="text-[11px] text-muted mt-0.5">
-              {fs?.active_profile_name
-                ? <>Editing profile <span className="text-slate-200 font-medium">{fs.active_profile_name}</span> — saving updates it.</>
-                : "Active settings (not saved as a profile)."}
-            </div>
+      <Card className="p-5">
+        <h2 className="font-semibold mb-1">Burp Suite (for live DAST active scanning)</h2>
+        <p className="text-xs text-muted mb-3">
+          Connect Burp so a DAST run can seed the authenticated request surface and ingest
+          its active-scan issues. Install Burp's <b>MCP Server</b> extension (Burp 2025.x,
+          Pro for active scanning), note its URL, then register it below. Access-control
+          confirmation needs no Burp — this only adds the broad injection/XSS scanning.
+        </p>
+        {burp ? (
+          <div className="flex items-center gap-2 text-sm px-3 py-2 rounded-lg border border-emerald-500/40 bg-emerald-500/5">
+            <span className="text-emerald-300">✓ Burp registered</span>
+            <span className="text-[11px] text-muted flex-1 truncate">{burp.name} · {burp.transport} · {burp.url}</span>
+            <Button variant="ghost" onClick={() => api.deleteMcp(burp.id).then(reload)}>Remove</Button>
           </div>
-          {fs && (
-            <span className={`text-xs px-2 py-0.5 rounded border ${fs.mock_mode ? "border-amber-500/40 text-amber-300" : "border-emerald-500/40 text-emerald-300"}`}>
-              {fs.mock_mode ? "MOCK MODE" : `${fs.kind ?? "connected"} · ${fs.auth_mode}`}
-            </span>
-          )}
-        </div>
-        <div className="grid grid-cols-2 gap-3">
-          <label className="text-sm">Endpoint URL
-            <Input value={endpoint} onChange={(e) => setEndpoint(e.target.value)}
-              placeholder="http://localhost:11434 or https://my-foundry.openai.azure.com" />
+        ) : (
+          <Button variant="accent" onClick={burpPreset}>+ Add Burp (fills the form below)</Button>
+        )}
+      </Card>
+
+      <Card className="p-5">
+        <h2 className="font-semibold mb-1">MCP servers</h2>
+        <p className="text-xs text-muted mb-3">
+          Register MCP servers the platform can call — Burp, extra Semgrep/SonarQube bridges,
+          or custom scanners. Burp is used by DAST; the others contribute static candidates.
+        </p>
+        <div className="grid grid-cols-[1fr_8rem_7rem_1.4fr_auto] gap-2 mb-3 items-end">
+          <label className="text-[11px]">name
+            <Input value={newMcp.name} onChange={(e) => setNewMcp({ ...newMcp, name: e.target.value })} placeholder="burp" />
           </label>
-          <label className="text-sm">API key {fs?.api_key_set && <span className="text-emerald-400 text-xs">(set)</span>}
-            <Input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)}
-              placeholder={fs?.api_key_set ? "•••••• (unchanged)" : "paste key"} />
-          </label>
-          <label className="text-sm">Model / deployment name
-            <Input value={deployment} onChange={(e) => setDeployment(e.target.value)}
-              placeholder="e.g. llama3.1:70b, gpt-4o, qwen2.5-coder:32b" list="models-list" />
-            <datalist id="models-list">
-              {models.map((m) => <option key={m} value={m} />)}
-            </datalist>
-            {models.length > 0 && (
-              <div className="text-[11px] text-muted mt-1">Discovered: {models.join(", ")}</div>
-            )}
-          </label>
-          <label className="text-sm">API version
-            <Input value={apiVersion} onChange={(e) => setApiVersion(e.target.value)}
-              placeholder="preview" />
-          </label>
-          <label className="text-sm">API style
-            <select value={apiStyle} onChange={(e) => setApiStyle(e.target.value)}
-              className="w-full mt-1 px-3 py-2 rounded-md bg-bg border border-border text-sm">
-              <option value="v1">v1 — Azure Foundry Models API</option>
-              <option value="local">local — Ollama / vLLM / LM Studio / llama.cpp</option>
-              <option value="azure">azure — legacy Azure (deployments + api-version)</option>
+          <label className="text-[11px]">kind
+            <select value={newMcp.kind} onChange={(e) => setNewMcp({ ...newMcp, kind: e.target.value })} className={selectCls}>
+              <option>burp</option><option>semgrep</option><option>sonarqube</option><option>custom</option>
             </select>
-            <div className="text-[11px] text-muted mt-1">
-              {apiStyle === "local"
-                ? "Connects to any OpenAI-compatible local server at /v1. No API key needed."
-                : apiStyle === "azure"
-                ? "Legacy Azure path: /openai/deployments/…?api-version=…"
-                : "Azure Foundry v1: /openai/v1/. Auto-detects local endpoints."}
-            </div>
           </label>
-          <div className="grid grid-cols-2 gap-3">
-            <label className="text-sm">Context window (tokens)
-              <Input value={contextTokens} inputMode="numeric"
-                onChange={(e) => setContextTokens(e.target.value.replace(/\D/g, ""))}
-                placeholder="auto" />
-            </label>
-            <label className="text-sm">Parallel requests
-              <Input value={concurrency} inputMode="numeric"
-                onChange={(e) => setConcurrency(e.target.value.replace(/\D/g, ""))}
-                placeholder="4" />
-            </label>
-            <div className="col-span-2 text-[11px] text-muted -mt-1">
-              Local models: set the window your server actually loads (e.g. Ollama
-              <code className="mx-1">num_ctx</code>) and 1 parallel request. Blank = auto.
-            </div>
-          </div>
+          <label className="text-[11px]">transport
+            <select value={newMcp.transport} onChange={(e) => setNewMcp({ ...newMcp, transport: e.target.value })} className={selectCls}>
+              <option>sse</option><option>http</option><option>stdio</option>
+            </select>
+          </label>
+          <label className="text-[11px]">url
+            <Input value={newMcp.url} onChange={(e) => setNewMcp({ ...newMcp, url: e.target.value })}
+              placeholder="http://host.docker.internal:9876/sse" />
+          </label>
+          <Button onClick={add}>Add</Button>
         </div>
-        <div className="flex items-center gap-3 mt-4">
-          <Button onClick={save}>{fs?.active_profile_name ? `Save to “${fs.active_profile_name}”` : "Save"}</Button>
-          <Button variant="ghost" onClick={runTest}>Test connection</Button>
-          {msg && <span className="text-sm text-muted">{msg}</span>}
-          {test && <span className="text-sm text-muted">{test}</span>}
-        </div>
-        <p className="text-xs text-muted mt-3">
-          Leave the endpoint blank for mock mode (no AI needed).
-          For local models: install <a href="https://ollama.com" className="underline" target="_blank" rel="noreferrer">Ollama</a> and
-          run <code className="text-xs">ollama pull llama3.1:70b</code>, then set the endpoint
-          to <code className="text-xs">http://host.docker.internal:11434</code> (from Docker)
-          or <code className="text-xs">http://localhost:11434</code> (native).
-        </p>
-      </Card>
-
-      <Card className="p-4">
-        <h2 className="font-semibold mb-1">Model roles (multi-model pipeline)</h2>
-        <p className="text-xs text-muted mb-3">
-          Assign different deployments to each stage. Reviewers run in parallel (an
-          ensemble); the judge validates their findings, dedupes, and cuts false positives.
-          Transport <code>auto</code> picks the Responses API for Codex / o-series models.
-          Leave a role blank to fall back to the default deployment above.
-        </p>
-
-        <div className="space-y-4">
-          <div>
-            <div className="text-sm font-medium mb-1">Chat / reasoning</div>
-            <RoleEditor role={roles.chat ?? emptyRole()} models={models}
-              onChange={(r) => setRoles({ ...roles, chat: r })} />
-          </div>
-
-          <div>
-            <div className="flex items-center justify-between mb-1">
-              <div className="text-sm font-medium">Reviewers (vulnerability analysis)</div>
-              <Button variant="ghost" onClick={() => setRoles({ ...roles, reviewers: [...roles.reviewers, emptyRole()] })}>
-                + Add reviewer
-              </Button>
-            </div>
-            <div className="space-y-2">
-              {roles.reviewers.map((r, i) => (
-                <RoleEditor key={i} role={r} models={models} removable
-                  onRemove={() => setRoles({ ...roles, reviewers: roles.reviewers.filter((_, j) => j !== i) })}
-                  onChange={(nr) => setRoles({ ...roles, reviewers: roles.reviewers.map((x, j) => (j === i ? nr : x)) })} />
-              ))}
-              {roles.reviewers.length === 0 && (
-                <div className="text-xs text-muted">No reviewers set — the default deployment is used.</div>
-              )}
-            </div>
-          </div>
-
-          <div>
-            <div className="text-sm font-medium mb-1">Judge / validator (optional)</div>
-            <RoleEditor role={roles.judge ?? emptyRole()} models={models}
-              onChange={(r) => setRoles({ ...roles, judge: r })} />
-            <div className="text-[11px] text-muted mt-1">
-              Leave blank to skip adjudication and keep raw reviewer findings.
-            </div>
-          </div>
-
-          <div>
-            <div className="text-sm font-medium mb-1">False-positive verifier (optional)</div>
-            <RoleEditor role={roles.verifier ?? emptyRole()} models={models}
-              onChange={(r) => setRoles({ ...roles, verifier: r })} />
-            <div className="text-[11px] text-muted mt-1">
-              Runs after the judge and tries to <em>disprove</em> each medium+ finding using
-              a wider code window, the function's callers and the routes that reach it.
-              Blank = use the judge (or first reviewer). A different model family than the
-              reviewers gives the most independent second opinion.
-            </div>
-          </div>
-
-          <div>
-            <div className="text-sm font-medium mb-1">Exploit analyst (optional)</div>
-            <RoleEditor role={roles.exploit ?? emptyRole()} models={models}
-              onChange={(r) => setRoles({ ...roles, exploit: r })} />
-            <div className="text-[11px] text-muted mt-1">
-              Runs after the judge on confirmed findings: writes where-to-look, a
-              non-destructive proof-of-concept, a risk assessment, and a concrete
-              fix for each vulnerability. Leave blank to skip.
-            </div>
-          </div>
-        </div>
-
-        <div className="mt-4"><Button onClick={save}>Save roles</Button></div>
-      </Card>
-
-      <Card className="p-4">
-        <h2 className="font-semibold mb-1">Static scanners</h2>
-        <p className="text-xs text-muted mb-3">
-          The high-recall sweep that runs before the AI reviews code. Semgrep runs
-          on the worker; SonarQube uploads to a server and pulls issues back. Both
-          normalise into the same findings the AI judge then validates.
-        </p>
-
-        {/* Semgrep */}
-        <div className="flex items-center justify-between py-2 border-b border-border">
-          <div>
-            <div className="text-sm font-medium">Semgrep</div>
-            <div className="text-[11px] text-muted">
-              ruleset: <code>{scanners?.semgrep_ruleset || "auto"}</code> · runs locally
-            </div>
-          </div>
-          <Toggle on={!!scanners?.semgrep_enabled}
-            onChange={(v) => patchScanners({ semgrep_enabled: v })} />
-        </div>
-
-        {/* SonarQube */}
-        <div className="py-3">
-          <div className="flex items-center justify-between">
-            <div>
-              <div className="text-sm font-medium">SonarQube</div>
-              <div className="text-[11px] text-muted">
-                needs a server · start with <code>docker compose --profile sonar up</code>
-              </div>
-            </div>
-            <Toggle on={!!scanners?.sonarqube_enabled}
-              onChange={(v) => patchScanners({ sonarqube_enabled: v })} />
-          </div>
-          {scanners?.sonarqube_enabled && (
-            <div className="mt-3 grid grid-cols-2 gap-3">
-              <label className="text-sm">Server URL
-                <Input value={sonarUrl} onChange={(e) => setSonarUrl(e.target.value)}
-                  placeholder="http://sonarqube:9000" />
-              </label>
-              <label className="text-sm">Token {scanners?.sonarqube_token_set && <span className="text-emerald-400 text-xs">(set)</span>}
-                <Input type="password" value={sonarToken} onChange={(e) => setSonarToken(e.target.value)}
-                  placeholder={scanners?.sonarqube_token_set ? "•••••• (unchanged)" : "squ_…"} />
-              </label>
-              <div className="col-span-2 flex items-center gap-3">
-                <Button onClick={saveSonar}>Save</Button>
-                <Button variant="ghost" onClick={runSonarTest}>Test connection</Button>
-                {scanMsg && <span className="text-sm text-muted">{scanMsg}</span>}
-                {sonarTest && <span className="text-sm text-muted">{sonarTest}</span>}
-              </div>
-            </div>
-          )}
-        </div>
-      </Card>
-
-      <Card className="p-4">
-        <h2 className="font-semibold mb-3">MCP servers (Semgrep / SonarQube / custom)</h2>
-        <div className="grid grid-cols-5 gap-2 mb-3">
-          <Input placeholder="name" value={newMcp.name} onChange={(e) => setNewMcp({ ...newMcp, name: e.target.value })} />
-          <select value={newMcp.kind} onChange={(e) => setNewMcp({ ...newMcp, kind: e.target.value })}
-            className="px-2 rounded-md bg-bg border border-border text-sm">
-            <option>semgrep</option><option>sonarqube</option><option>custom</option>
-          </select>
-          <select value={newMcp.transport} onChange={(e) => setNewMcp({ ...newMcp, transport: e.target.value })}
-            className="px-2 rounded-md bg-bg border border-border text-sm">
-            <option>http</option><option>sse</option><option>stdio</option>
-          </select>
-          <Input placeholder="url" value={newMcp.url} onChange={(e) => setNewMcp({ ...newMcp, url: e.target.value })} />
-          <Button onClick={addMcp}>Add</Button>
-        </div>
-        <div className="space-y-1">
+        {msg && <div className="text-[11px] text-rose-300 mb-2">{msg}</div>}
+        <div className="space-y-1.5">
           {mcp.map((m) => (
-            <div key={m.id} className="flex items-center justify-between px-3 py-2 rounded border border-border text-sm">
-              <span>{m.name} <span className="text-muted text-xs">· {m.kind} · {m.transport} · {m.url}</span></span>
+            <div key={m.id} className="flex items-center justify-between px-3 py-2 rounded-lg border border-border text-sm">
+              <span className="flex items-center gap-2">
+                <span className="font-medium">{m.name}</span>
+                <span className="text-[10px] uppercase px-1.5 py-0.5 rounded bg-border/70 text-slate-300">{m.kind}</span>
+                <span className="text-muted text-[11px]">{m.transport} · {m.url}</span>
+              </span>
               <div className="flex items-center gap-2">
                 <span className={`text-xs ${m.enabled ? "text-emerald-400" : "text-muted"}`}>{m.enabled ? "enabled" : "disabled"}</span>
-                <Button variant="ghost" onClick={() => api.deleteMcp(m.id).then(() => api.listMcp().then(setMcp))}>Remove</Button>
+                <Button variant="ghost" onClick={() => api.deleteMcp(m.id).then(reload)}>Remove</Button>
               </div>
             </div>
           ))}
@@ -386,9 +412,8 @@ export default function SettingsPage() {
   );
 }
 
-function ProfilesCard({ activeId, onActivated }: {
-  activeId: string | null; onActivated: () => void;
-}) {
+// ---------------------------------------------------------------- Profiles
+function ProfilesCard({ activeId, onActivated }: { activeId: string | null; onActivated: () => void }) {
   const [profiles, setProfiles] = useState<AiProfile[]>([]);
   const [name, setName] = useState("");
   const [template, setTemplate] = useState("current");
@@ -403,62 +428,45 @@ function ProfilesCard({ activeId, onActivated }: {
     const t = TEMPLATES[template];
     setMsg("");
     try {
-      await api.createProfile({
-        name: name.trim(), activate: true,
-        from_current: !!t.fromCurrent, settings: t.settings,
-      });
+      await api.createProfile({ name: name.trim(), activate: true, from_current: !!t.fromCurrent, settings: t.settings });
       setName("");
-      setMsg(template === "azure"
-        ? "Created & activated — fill in the endpoint and API key below, then Save."
-        : "Created & activated ✓");
+      setMsg(template === "azure" ? "Created & activated — fill in the endpoint and API key on the Connection tab, then Save." : "Created & activated ✓");
       await reload(); onActivated();
     } catch (e) { setMsg(String(e)); }
   };
-
   const activate = async (p: AiProfile) => {
     try { await api.activateProfile(p.id); setMsg(`Now using “${p.name}”`); await reload(); onActivated(); }
     catch (e) { setMsg(String(e)); }
   };
-
   const remove = async (p: AiProfile) => {
-    if (!confirm(`Delete profile “${p.name}”? Scans pinned to it fall back to the active settings.`)) return;
-    try { await api.deleteProfile(p.id); await reload(); onActivated(); }
-    catch (e) { setMsg(String(e)); }
+    if (!confirm(`Delete profile “${p.name}”?`)) return;
+    try { await api.deleteProfile(p.id); await reload(); onActivated(); } catch (e) { setMsg(String(e)); }
   };
-
   const test = async (p: AiProfile) => {
     setTests((t) => ({ ...t, [p.id]: "testing…" }));
-    try {
-      const r = await api.testProfile(p.id);
-      setTests((t) => ({ ...t, [p.id]: `${r.ok ? "✓" : "✗"} ${r.detail}` }));
-    } catch (e) { setTests((t) => ({ ...t, [p.id]: String(e) })); }
+    try { const r = await api.testProfile(p.id); setTests((t) => ({ ...t, [p.id]: `${r.ok ? "✓" : "✗"} ${r.detail}` })); }
+    catch (e) { setTests((t) => ({ ...t, [p.id]: String(e) })); }
   };
 
   return (
-    <Card className="p-4">
-      <h2 className="font-semibold mb-1">AI profiles</h2>
-      <p className="text-xs text-muted mb-3">
+    <Card className="p-5">
+      <p className="text-xs text-muted mb-4">
         Save complete AI setups — connection, API key, model roles and tuning — and switch
-        between them (e.g. a local Ollama box for sensitive code, Azure for big scans). The
-        active profile is the default for new scans; any scan can pin a different one.
+        between them (a local Ollama box for sensitive code, Azure for big scans). The active
+        profile is the default for new scans; any scan can pin a different one.
       </p>
-
-      <div className="space-y-1.5 mb-4">
+      <div className="space-y-2 mb-5">
         {profiles.map((p) => {
           const reviewers = p.roles?.reviewers?.map((r) => r.deployment).join(", ") || p.deployment;
           return (
-            <div key={p.id} className={`px-3 py-2 rounded border text-sm ${p.active ? "border-emerald-500/50 bg-emerald-500/5" : "border-border"}`}>
+            <div key={p.id} className={`px-3 py-2.5 rounded-lg border text-sm ${p.active ? "border-emerald-500/50 bg-emerald-500/5" : "border-border"}`}>
               <div className="flex items-center gap-2">
                 <span className="font-medium">{p.name}</span>
-                <span className={`text-[10px] uppercase px-1.5 py-0.5 rounded border ${KIND_STYLE[(p.kind ?? "cloud") as ProfileKind]}`}>
-                  {p.kind}
-                </span>
+                <span className={`text-[10px] uppercase px-1.5 py-0.5 rounded border ${KIND_STYLE[(p.kind ?? "cloud") as ProfileKind]}`}>{p.kind}</span>
                 {p.active && <span className="text-[10px] uppercase px-1.5 py-0.5 rounded bg-emerald-600/30 text-emerald-300">active</span>}
                 <span className="flex-1 truncate text-[11px] text-muted">
-                  {p.endpoint || "no endpoint"} · reviewers: {reviewers}
-                  {p.concurrency ? ` · ×${p.concurrency}` : ""}
-                  {p.context_tokens ? ` · ${Math.round(p.context_tokens / 1024)}K ctx` : ""}
-                  {p.api_key_set ? " · key set" : ""}
+                  {p.endpoint || "no endpoint"} · {reviewers}
+                  {p.concurrency ? ` · ×${p.concurrency}` : ""}{p.context_tokens ? ` · ${Math.round(p.context_tokens / 1024)}K ctx` : ""}{p.api_key_set ? " · key set" : ""}
                 </span>
                 {!p.active && <Button variant="ghost" onClick={() => activate(p)}>Use</Button>}
                 <Button variant="ghost" onClick={() => test(p)}>Test</Button>
@@ -468,25 +476,18 @@ function ProfilesCard({ activeId, onActivated }: {
             </div>
           );
         })}
-        {profiles.length === 0 && (
-          <div className="text-sm text-muted">
-            No profiles yet — save the current settings as one, or start from a template.
-          </div>
-        )}
+        {profiles.length === 0 && <div className="text-sm text-muted">No profiles yet — save the current settings, or start from a template.</div>}
       </div>
-
       <div className="flex items-end gap-2">
         <label className="text-xs flex-1">New profile name
-          <Input value={name} onChange={(e) => setName(e.target.value)}
-            placeholder="e.g. Local Ollama, Azure prod" />
+          <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Local Ollama, Azure prod" />
         </label>
         <label className="text-xs">Start from
-          <select value={template} onChange={(e) => setTemplate(e.target.value)}
-            className="block mt-1 px-2 py-2 rounded-md bg-bg border border-border text-sm">
+          <select value={template} onChange={(e) => setTemplate(e.target.value)} className={selectCls}>
             {Object.entries(TEMPLATES).map(([k, t]) => <option key={k} value={k}>{t.label}</option>)}
           </select>
         </label>
-        <Button onClick={create}>Create & use</Button>
+        <Button variant="accent" onClick={create}>Create &amp; use</Button>
       </div>
       {msg && <div className="text-xs text-muted mt-2">{msg}</div>}
     </Card>
@@ -506,28 +507,24 @@ function RoleEditor({ role, models, onChange, removable, onRemove }: {
   role: ModelRole; models: string[]; onChange: (r: ModelRole) => void;
   removable?: boolean; onRemove?: () => void;
 }) {
-  // Cloud reasoning models + local ones that think (gpt-oss, Qwen3, DeepSeek-R1…).
-  const isReasoning = /codex|^o[134]|gpt-5|gpt-oss|qwen3|deepseek-r1|magistral|qwq|reasoning|thinking/i
-    .test(role.deployment);
+  const isReasoning = /codex|^o[134]|gpt-5|gpt-oss|qwen3|deepseek-r1|magistral|qwq|reasoning|thinking/i.test(role.deployment);
   return (
     <div className="flex items-end gap-2">
       <label className="text-xs flex-1">deployment
         <Input value={role.deployment} onChange={(e) => onChange({ ...role, deployment: e.target.value })}
-          placeholder="e.g. gpt-5-codex" list="role-models-list" />
+          placeholder="e.g. qwen3-coder:30b" list="role-models-list" />
         <datalist id="role-models-list">{models.map((m) => <option key={m} value={m} />)}</datalist>
       </label>
       <label className="text-xs">transport
-        <select value={role.transport} onChange={(e) => onChange({ ...role, transport: e.target.value })}
-          className="block mt-1 px-2 py-2 rounded-md bg-bg border border-border text-sm">
+        <select value={role.transport} onChange={(e) => onChange({ ...role, transport: e.target.value })} className={selectCls}>
           <option value="auto">auto</option><option value="chat">chat</option><option value="responses">responses</option>
         </select>
       </label>
       <label className="text-xs">reasoning
         <select value={role.reasoning_effort ?? ""} disabled={!isReasoning}
           onChange={(e) => onChange({ ...role, reasoning_effort: e.target.value || null })}
-          className="block mt-1 px-2 py-2 rounded-md bg-bg border border-border text-sm disabled:opacity-40">
-          <option value="">—</option><option value="low">low</option>
-          <option value="medium">medium</option><option value="high">high</option>
+          className={`${selectCls} disabled:opacity-40`}>
+          <option value="">—</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option>
         </select>
       </label>
       {removable && <Button variant="ghost" onClick={onRemove}>✕</Button>}

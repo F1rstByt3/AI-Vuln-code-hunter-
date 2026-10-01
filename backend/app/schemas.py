@@ -390,11 +390,11 @@ class SeverityBreakdown(BaseModel):
 
 
 class EndpointOut(BaseModel):
-    method: str
-    path: str
-    file_path: str
-    line: int
-    framework: str
+    method: str = "ANY"
+    path: str = "/"
+    file_path: str = ""
+    line: int = 0
+    framework: str = ""
     handler: str | None = None
     auth_hints: list[str] = Field(default_factory=list)
     # Access-control enrichment / AI verdicts (present when that check ran).

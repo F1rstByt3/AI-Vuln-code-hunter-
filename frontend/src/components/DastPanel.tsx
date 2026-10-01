@@ -204,7 +204,11 @@ export function DastLaunch({ scanId, projectId }: { scanId: string; projectId: s
   const [targetId, setTargetId] = useState("");
   const [confirming, setConfirming] = useState(false);
   const [allowMutating, setAllowMutating] = useState(false);
+  const [accessControl, setAccessControl] = useState(true);
   const [activeScan, setActiveScan] = useState(false);
+  const [includePaths, setIncludePaths] = useState("");
+  const [excludePaths, setExcludePaths] = useState("");
+  const [plan, setPlan] = useState<any>(null);
   const [msg, setMsg] = useState("");
 
   const reload = () => {
@@ -219,13 +223,24 @@ export function DastLaunch({ scanId, projectId }: { scanId: string; projectId: s
   }, [runs.map((r) => r.status).join()]);
 
   const target = targets.find((t) => t.id === targetId);
+  const splitPaths = (s: string) => s.split(/[\s,]+/).map((x) => x.trim()).filter(Boolean);
+  const opts = () => ({
+    target_id: targetId, access_control: accessControl, active_scan: activeScan,
+    include_paths: splitPaths(includePaths), exclude_paths: splitPaths(excludePaths),
+  });
+
+  const review = async () => {
+    if (!targetId) return;
+    setMsg(""); setPlan(null);
+    try { setPlan(await api.dastPlan(scanId, opts())); setConfirming(true); }
+    catch (e) { setMsg(String(e)); }
+  };
   const launch = async () => {
     if (!target) return;
     setMsg("");
     try {
-      await api.launchDast(scanId, { target_id: targetId, authorize: true,
-        allow_mutating: allowMutating, active_scan: activeScan });
-      setConfirming(false); setAllowMutating(false); setActiveScan(false); reload();
+      await api.launchDast(scanId, { ...opts(), authorize: true, allow_mutating: allowMutating });
+      setConfirming(false); setPlan(null); setAllowMutating(false); reload();
     } catch (e) { setMsg(String(e)); }
   };
 
@@ -238,34 +253,59 @@ export function DastLaunch({ scanId, projectId }: { scanId: string; projectId: s
           access-control findings against the running app.
         </p>
       ) : (
-        <div className="space-y-2">
+        <div className="space-y-3">
           <div className="flex items-center gap-2">
-            <select value={targetId} onChange={(e) => setTargetId(e.target.value)}
-              className="px-2 py-1.5 rounded-md bg-bg border border-border text-sm flex-1">
+            <select value={targetId} onChange={(e) => { setTargetId(e.target.value); setConfirming(false); setPlan(null); }}
+              className="px-2 py-1.5 rounded-lg bg-bg border border-border text-sm flex-1">
               {targets.map((t) => <option key={t.id} value={t.id}>{t.label} — {t.base_url}</option>)}
             </select>
-            <Button onClick={() => setConfirming(true)}>Run live confirmation</Button>
           </div>
-          {confirming && target && (
-            <div className="rounded border border-amber-500/40 bg-amber-500/10 p-3 text-xs space-y-2">
-              <div className="text-amber-200">
-                This sends live requests to <b>{target.base_url}</b> (hosts: {target.allowed_hosts.join(", ")})
-                as {target.credentials.length} configured role(s). Only run this against systems you are
-                authorized to test.
+
+          {/* what runs + where */}
+          <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 text-xs">
+            <label className="flex items-center gap-1.5">
+              <input type="checkbox" checked={accessControl} onChange={(e) => setAccessControl(e.target.checked)} />
+              Confirm access-control findings
+            </label>
+            <label className="flex items-center gap-1.5">
+              <input type="checkbox" checked={activeScan} onChange={(e) => setActiveScan(e.target.checked)} />
+              Active scan (SQLi/XSS/headers{target?.burp_mcp_id ? " + Burp" : ""})
+            </label>
+            <label className="text-[11px] text-muted">only paths (optional)
+              <input value={includePaths} onChange={(e) => setIncludePaths(e.target.value)}
+                placeholder="/api, /admin" className="block w-full mt-0.5 px-2 py-1 rounded bg-bg border border-border text-xs text-slate-200" />
+            </label>
+            <label className="text-[11px] text-muted">exclude paths (optional)
+              <input value={excludePaths} onChange={(e) => setExcludePaths(e.target.value)}
+                placeholder="/logout" className="block w-full mt-0.5 px-2 py-1 rounded bg-bg border border-border text-xs text-slate-200" />
+            </label>
+          </div>
+
+          <Button onClick={review}>Review plan →</Button>
+
+          {confirming && plan && target && (
+            <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-xs space-y-2">
+              <div className="font-medium text-amber-200">Review before authorizing</div>
+              <div className="grid grid-cols-2 gap-x-6 gap-y-1 text-slate-300">
+                <div>Target: <b>{plan.target.base_url}</b></div>
+                <div>In-scope hosts: {plan.target.allowed_hosts.join(", ")}</div>
+                <div>Endpoints in scope: <b>{plan.endpoints_in_scope}</b></div>
+                <div>Access findings to confirm: <b>{plan.access_findings_to_confirm}</b></div>
+                <div>Roles: {plan.roles.join(", ")}</div>
+                <div>Est. requests: <b>~{plan.estimated_requests}</b> @ {plan.rate_limit_rps}/s</div>
               </div>
+              {Object.keys(plan.access_by_kind || {}).length > 0 && (
+                <div className="text-muted">Checks: {Object.entries(plan.access_by_kind).map(([k, n]) => `${k} ×${n}`).join(", ")}
+                  {plan.checks.active_scan && " · active scan" }{plan.checks.burp && " · Burp" }</div>
+              )}
               <label className="flex items-center gap-1.5">
                 <input type="checkbox" checked={allowMutating} onChange={(e) => setAllowMutating(e.target.checked)} />
                 Allow state-changing requests (POST/PUT/DELETE) — off by default
               </label>
-              {target.active_scan_enabled && target.burp_mcp_id && (
-                <label className="flex items-center gap-1.5">
-                  <input type="checkbox" checked={activeScan} onChange={(e) => setActiveScan(e.target.checked)} />
-                  Run Burp active scan (seeds the authenticated surface, ingests issues)
-                </label>
-              )}
-              <div className="flex gap-2">
+              <div className="text-amber-200/90">Only run against systems you are authorized to test.</div>
+              <div className="flex gap-2 pt-1">
                 <Button variant="primary" onClick={launch}>I'm authorized — run</Button>
-                <Button variant="ghost" onClick={() => setConfirming(false)}>Cancel</Button>
+                <Button variant="ghost" onClick={() => { setConfirming(false); setPlan(null); }}>Cancel</Button>
               </div>
             </div>
           )}
@@ -277,24 +317,68 @@ export function DastLaunch({ scanId, projectId }: { scanId: string; projectId: s
   );
 }
 
+const PURPOSE_LABEL: Record<string, string> = {
+  "access:missing_authn": "missing-auth probe", "access:bfla": "privilege probe",
+  "access:idor": "IDOR probe", "access:idor-baseline": "IDOR owner baseline",
+  harvest: "id harvest", login: "login", "passive:headers": "security headers",
+  "passive:errors": "error check", "active:sqli": "SQLi probe", "active:xss": "XSS probe",
+};
+
 function RunRow({ r, onCancel }: { r: DastRun; onCancel: () => void }) {
   const s = r.summary || {};
   const live = ["queued", "running"].includes(r.status);
+  const [showLog, setShowLog] = useState(false);
+  const log: any[] = s.requests_log || [];
+  const byPurpose: Record<string, number> = s.by_purpose || {};
   return (
-    <div className="rounded border border-border p-2 text-[11px] flex items-center gap-2">
-      <span className={`px-1.5 py-0.5 rounded ${
-        r.status === "completed" ? "bg-emerald-500/15 text-emerald-300" :
-        r.status === "failed" ? "bg-rose-500/15 text-rose-300" :
-        live ? "bg-sky-500/15 text-sky-300" : "bg-border/60"}`}>{r.status}</span>
-      <span className="flex-1 text-muted">
-        {typeof s.confirmed === "number"
-          ? `${s.confirmed} confirmed · ${s.enforced} enforced · ${s.inconclusive} inconclusive · ${s.requests ?? 0} requests`
-            + (typeof s.active_issues === "number" ? ` · ${s.active_issues} Burp issues` : "")
-            + (typeof s.seeded === "number" && s.active_issues == null ? ` · ${s.seeded} seeded` : "")
-          : r.error || (live ? "running…" : "")}
-      </span>
-      {r.authorized_by && <span className="text-muted">by {r.authorized_by}</span>}
-      {live && <button className="text-rose-300 hover:underline" onClick={onCancel}>cancel</button>}
+    <div className="rounded-lg border border-border text-[11px]">
+      <div className="p-2 flex items-center gap-2">
+        <span className={`px-1.5 py-0.5 rounded ${
+          r.status === "completed" ? "bg-emerald-500/15 text-emerald-300" :
+          r.status === "failed" ? "bg-rose-500/15 text-rose-300" :
+          live ? "bg-sky-500/15 text-sky-300" : "bg-border/60"}`}>{r.status}</span>
+        <span className="flex-1 text-muted">
+          {typeof s.confirmed === "number"
+            ? `${s.confirmed} confirmed · ${s.enforced} enforced · ${s.inconclusive} inconclusive · ${s.requests ?? 0} requests`
+              + (typeof s.active_issues === "number" ? ` · ${s.active_issues} active findings` : "")
+              + (typeof s.burp_issues === "number" ? ` · ${s.burp_issues} Burp` : "")
+            : r.error || (live ? "running…" : "")}
+        </span>
+        {r.authorized_by && <span className="text-muted">by {r.authorized_by}</span>}
+        {log.length > 0 && <button className="text-accent-hover hover:underline" onClick={() => setShowLog((v) => !v)}>
+          {showLog ? "hide" : "requests"}</button>}
+        {live && <button className="text-rose-300 hover:underline" onClick={onCancel}>cancel</button>}
+      </div>
+      {showLog && (
+        <div className="border-t border-border p-2 space-y-2">
+          {Object.keys(byPurpose).length > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              {Object.entries(byPurpose).map(([p, n]) => (
+                <span key={p} className="px-1.5 py-0.5 rounded bg-border/60">
+                  {PURPOSE_LABEL[p] || p}: {n}
+                </span>
+              ))}
+            </div>
+          )}
+          <div className="max-h-56 overflow-auto font-mono text-[10px]">
+            <table className="w-full">
+              <tbody>
+                {log.map((e, i) => (
+                  <tr key={i} className="border-b border-border/40">
+                    <td className="pr-2 text-muted">{PURPOSE_LABEL[e.purpose] || e.purpose}</td>
+                    <td className="pr-2">{e.method}</td>
+                    <td className="pr-2 truncate max-w-md">{e.url}</td>
+                    <td className="pr-2">{e.identity}</td>
+                    <td className={e.status && e.status < 400 ? "text-emerald-400" : "text-amber-400"}>
+                      {e.note || e.status}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
