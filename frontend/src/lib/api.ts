@@ -80,6 +80,11 @@ export const api = {
   createMcp: (b: Partial<McpServer>, projectId?: string) =>
     req<McpServer>(`/mcp-servers${projectId ? `?project_id=${projectId}` : ""}`, { method: "POST", body: JSON.stringify(b) }),
   deleteMcp: (id: string) => req<void>(`/mcp-servers/${id}`, { method: "DELETE" }),
+  testMcp: (id: string) => req<{
+    ok: boolean; detail?: string; tools?: string[]; kind?: string; hint?: string;
+    warn?: string; note?: string; capabilities?: Record<string, boolean>;
+    ready?: Record<string, boolean>;
+  }>(`/mcp-servers/${id}/test`, { method: "POST" }),
   getFoundry: () => req<FoundrySettings>("/settings/foundry"),
   updateFoundry: (b: Record<string, any>) => req<FoundrySettings>("/settings/foundry", { method: "PUT", body: JSON.stringify(b) }),
   listModels: () => req<{ models: string[]; mock: boolean }>("/settings/foundry/models"),

@@ -363,11 +363,7 @@ function IntegrationsTab({ mcp, reload }: { mcp: McpServer[]; reload: () => Prom
           credentials never leave the app.
         </p>
         {burp ? (
-          <div className="flex items-center gap-2 text-sm px-3 py-2 rounded-lg border border-emerald-500/40 bg-emerald-500/5">
-            <span className="text-emerald-300">✓ Burp registered</span>
-            <span className="text-[11px] text-muted flex-1 truncate">{burp.name} · {burp.transport} · {burp.url}</span>
-            <Button variant="ghost" onClick={() => api.deleteMcp(burp.id).then(reload)}>Remove</Button>
-          </div>
+          <McpRow m={burp} reload={reload} />
         ) : (
           <Button variant="accent" onClick={burpPreset}>+ Add Burp (fills the form below)</Button>
         )}
@@ -401,22 +397,60 @@ function IntegrationsTab({ mcp, reload }: { mcp: McpServer[]; reload: () => Prom
         </div>
         {msg && <div className="text-[11px] text-rose-300 mb-2">{msg}</div>}
         <div className="space-y-1.5">
-          {mcp.map((m) => (
-            <div key={m.id} className="flex items-center justify-between px-3 py-2 rounded-lg border border-border text-sm">
-              <span className="flex items-center gap-2">
-                <span className="font-medium">{m.name}</span>
-                <span className="text-[10px] uppercase px-1.5 py-0.5 rounded bg-border/70 text-slate-300">{m.kind}</span>
-                <span className="text-muted text-[11px]">{m.transport} · {m.url}</span>
-              </span>
-              <div className="flex items-center gap-2">
-                <span className={`text-xs ${m.enabled ? "text-emerald-400" : "text-muted"}`}>{m.enabled ? "enabled" : "disabled"}</span>
-                <Button variant="ghost" onClick={() => api.deleteMcp(m.id).then(reload)}>Remove</Button>
-              </div>
-            </div>
-          ))}
+          {mcp.map((m) => <McpRow key={m.id} m={m} reload={reload} />)}
           {mcp.length === 0 && <div className="text-muted text-sm">No MCP servers registered.</div>}
         </div>
       </Card>
+    </div>
+  );
+}
+
+const BURP_READY_LABEL: Record<string, string> = {
+  active_scan: "active scan", active_scan_issues: "scan + read issues",
+  manual_repeater: "→ Repeater", manual_intruder: "→ Intruder",
+};
+
+/** One registered MCP server with a deployment health-check ("Test"). */
+function McpRow({ m, reload }: { m: McpServer; reload: () => Promise<any> }) {
+  const [res, setRes] = useState<Awaited<ReturnType<typeof api.testMcp>> | null>(null);
+  const [testing, setTesting] = useState(false);
+  const runTest = async () => {
+    setTesting(true); setRes(null);
+    try { setRes(await api.testMcp(m.id)); }
+    catch (e) { setRes({ ok: false, detail: String(e) }); }
+    finally { setTesting(false); }
+  };
+  return (
+    <div className="px-3 py-2 rounded-lg border border-border text-sm">
+      <div className="flex items-center justify-between gap-2">
+        <span className="flex items-center gap-2 min-w-0">
+          <span className="font-medium">{m.name}</span>
+          <span className="text-[10px] uppercase px-1.5 py-0.5 rounded bg-border/70 text-slate-300">{m.kind}</span>
+          <span className="text-muted text-[11px] truncate">{m.transport} · {m.url}</span>
+        </span>
+        <div className="flex items-center gap-2 shrink-0">
+          {res && <span className={res.ok ? "text-emerald-400 text-xs" : "text-rose-300 text-xs"}>
+            {res.ok ? "✓" : "✗"} {res.detail}</span>}
+          <Button variant="ghost" onClick={runTest} disabled={testing}>{testing ? "testing…" : "Test"}</Button>
+          <Button variant="ghost" onClick={() => api.deleteMcp(m.id).then(reload)}>Remove</Button>
+        </div>
+      </div>
+      {res?.ok && res.ready && (
+        <div className="mt-1.5 flex flex-wrap gap-1.5">
+          {Object.entries(res.ready).map(([k, on]) => (
+            <span key={k} className={`text-[10px] px-1.5 py-0.5 rounded border ${
+              on ? "border-emerald-500/40 text-emerald-300" : "border-border text-muted"}`}>
+              {on ? "✓" : "—"} {BURP_READY_LABEL[k] || k}
+            </span>
+          ))}
+        </div>
+      )}
+      {res?.ok && !res.ready && (res.tools?.length ?? 0) > 0 && (
+        <div className="mt-1 text-[11px] text-muted truncate">tools: {res.tools!.join(", ")}</div>
+      )}
+      {res?.warn && <div className="mt-1 text-[11px] text-amber-300">{res.warn}</div>}
+      {res?.note && <div className="mt-1 text-[11px] text-muted">{res.note}</div>}
+      {res && !res.ok && res.hint && <div className="mt-1 text-[11px] text-amber-300">{res.hint}</div>}
     </div>
   );
 }
