@@ -178,6 +178,17 @@ export default function ScanPage() {
         )}
       </div>
 
+      {scan?.status === "failed" && scan.error && (
+        <div className="mb-4 rounded-lg border border-rose-500/40 bg-rose-500/10 p-3 text-sm">
+          <div className="font-semibold text-rose-200 mb-1">Scan failed</div>
+          <div className="text-slate-200 whitespace-pre-wrap break-words">{scan.error}</div>
+          <div className="text-[11px] text-muted mt-2">
+            Fix the cause (usually Settings → AI Connection), then <b>↻ AI review</b> below to
+            retry without re-running the scanners. Full detail: <code>docker compose logs -f worker</code>.
+          </div>
+        </div>
+      )}
+
       {scan && !busy && (
         <div className="flex items-center gap-2 mb-4 text-sm">
           <span className="text-muted">Re-run stage:</span>
@@ -227,12 +238,16 @@ export default function ScanPage() {
             <pre className="text-xs whitespace-pre-wrap text-slate-300 max-h-48 overflow-auto">
               {narration || "Waiting for the agent…"}
             </pre>
-            <div className="mt-2 space-y-0.5 max-h-32 overflow-auto">
-              {events.filter((e) => ["status", "log"].includes(e.type)).map((e, i) => (
-                <div key={i} className="text-[11px] text-muted">
-                  · {e.status ? `status: ${e.status}` : e.message}
-                </div>
-              ))}
+            <div className="mt-2 space-y-0.5 max-h-40 overflow-auto">
+              {events.filter((e) => ["status", "log"].includes(e.type)).map((e, i) => {
+                const text = e.status ? `status: ${e.status}` : e.message || "";
+                const bad = /\bfail|error|timed out|unparseable|refused|\[auth\]|\[model\]|\[rate_limit\]|\[endpoint\]|\[context\]|\[timeout\]/i.test(text);
+                return (
+                  <div key={i} className={`text-[11px] ${bad ? "text-rose-300" : "text-muted"}`}>
+                    · {text}
+                  </div>
+                );
+              })}
             </div>
           </Card>
 

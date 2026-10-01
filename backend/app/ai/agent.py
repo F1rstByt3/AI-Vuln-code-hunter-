@@ -30,7 +30,7 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable
 
-from app.ai.foundry import FoundryClient, ModelRole, ReviewRoles
+from app.ai.foundry import FoundryClient, ModelRole, ReviewRoles, ai_error_summary
 from app.config import settings
 from app.control import ScanControlSignal, StageSkippedSignal  # noqa: F401
 from app.models import FindingSource, FindingState, Severity
@@ -344,6 +344,31 @@ async def run_review(
 
     coverage: dict = {"checks": checks}
 
+    # ---- 0. preflight: prove the model answers before any heavy work, so a bad
+    # endpoint / key / model name fails in seconds with a precise message rather
+    # than after loading the whole tree. Auth/model/endpoint errors are fatal;
+    # a slow (timeout) or flaky model is left for the real calls to surface.
+    await emit({"type": "status", "status": "checking model"})
+    pf_role = roles.reviewers[0] if roles.reviewers else roles.chat
+    try:
+        await asyncio.wait_for(
+            client.preflight(model=pf_role.deployment,
+                             transport=pf_role.effective_transport()),
+            timeout=90)
+    except TimeoutError:
+        await emit({"type": "log", "message":
+                    f"Model preflight slow (>90s) for {pf_role.deployment}; continuing"})
+    except Exception as exc:  # noqa: BLE001
+        from app.ai.foundry import classify_ai_error
+        cause, _ = classify_ai_error(exc)
+        summary = ai_error_summary(exc)
+        if cause in ("auth", "model", "endpoint"):
+            await emit({"type": "log", "message": f"Model preflight failed: {summary}"})
+            raise RuntimeError(
+                f"Model preflight failed on '{pf_role.deployment}'. {summary}") from exc
+        await emit({"type": "log", "message":
+                    f"Model preflight warning ({cause}); continuing: {summary}"})
+
     # ---- 1. load ALL source files from disk ----
     await emit({"type": "status", "status": "loading source"})
     all_sources, total_bytes = await _load_all_files(files, read_file, emit)
@@ -406,11 +431,12 @@ async def run_review(
             await emit({"type": "token", "text": token})
     except Exception as exc:  # noqa: BLE001
         await stage("ai_plan", "failed")
-        await emit({"type": "token", "text": f"\n\n[Foundry error: {exc}]\n"})
+        summary = ai_error_summary(exc)
+        await emit({"type": "token", "text": f"\n\n[AI error: {summary}]\n"})
+        await emit({"type": "log", "message":
+                    f"AI model call failed ({roles.chat.deployment}): {summary}"})
         raise RuntimeError(
-            f"AI model call failed: {exc}. Check Settings — the endpoint, API key, "
-            f"and the chat/reviewer/judge deployment names must match your Azure AI "
-            f"Foundry project. Clear the endpoint to use mock mode."
+            f"AI model call failed on the chat model '{roles.chat.deployment}'. {summary}"
         ) from exc
     await stage("ai_plan", "done")
 
@@ -430,6 +456,12 @@ async def run_review(
     failed_paths_by_reviewer: dict[str, set[str]] = {}
     health = {"done": 0, "failed": 0}  # fresh (non-resumed) batches, all reviewers
     retry_stats = {"batches_errored": 0, "batches_recovered": 0, "batches_failed": 0}
+    # Representative underlying errors, so a failed scan can report the real
+    # cause (401 / model-not-found / 429 / timeout …) instead of generic help.
+    diag_errors: list[str] = []
+
+    def _first_error() -> str:
+        return f" First error: {diag_errors[0]}" if diag_errors else ""
 
     async def run_reviewer(reviewer: ModelRole) -> list[dict]:
         sem = asyncio.Semaphore(concurrency)
@@ -459,7 +491,7 @@ async def run_review(
                 fails: list = []
                 bf = await _review_with_adaptive_split(
                     client, reviewer, batch, i, len(batches), instructions, emit,
-                    failed=fails)
+                    failed=fails, errors=diag_errors)
                 results[i] = bf
                 health["done"] += 1
                 if fails:
@@ -471,7 +503,7 @@ async def run_review(
                         await stage("ai_review", "failed")
                         raise RuntimeError(
                             f"Stopped early: the first {health['done']} review batches "
-                            f"all failed. " + _UNUSABLE_MODEL_HELP)
+                            f"all failed.{_first_error()} " + _UNUSABLE_MODEL_HELP)
                 else:
                     await save_chunk("review", key, bf)
                 await _publish(bf)
@@ -500,7 +532,7 @@ async def run_review(
                     fails: list = []
                     bf = await _review_with_adaptive_split(
                         client, reviewer, batches[i], i, len(batches), instructions,
-                        emit, failed=fails)
+                        emit, failed=fails, errors=diag_errors)
                 if fails:
                     retry_stats["batches_failed"] += 1
                     for paths in fails:
@@ -526,7 +558,8 @@ async def run_review(
     raw_findings = [f for sub in reviewer_results for f in sub]
     if batches and retry_stats["batches_failed"] >= len(batches) * len(roles.reviewers):
         await stage("ai_review", "failed")
-        raise RuntimeError("Every review batch failed. " + _UNUSABLE_MODEL_HELP)
+        raise RuntimeError("Every review batch failed." + _first_error() + " "
+                           + _UNUSABLE_MODEL_HELP)
     await stage("ai_review", "done", done=total_units, total=total_units)
 
     # A file is unreviewed only if EVERY reviewer failed on it.
@@ -828,6 +861,7 @@ async def _review_with_adaptive_split(
     system: str = REVIEWER_SYSTEM,
     task: str | None = None,
     failed: list | None = None,
+    errors: list | None = None,
 ) -> list[dict]:
     """Try to review a batch; if the model rejects it for context length,
     split it and retry each half. Multi-file batches split by file; a single
@@ -866,7 +900,7 @@ async def _review_with_adaptive_split(
     async def recurse(sub: dict, offset: int) -> list[dict]:
         return await _review_with_adaptive_split(
             client, reviewer, sub, batch_idx, total_batches, instructions, emit,
-            depth + 1, offset, system=system, task=task, failed=failed,
+            depth + 1, offset, system=system, task=task, failed=failed, errors=errors,
         )
 
     try:
@@ -937,9 +971,12 @@ async def _review_with_adaptive_split(
                 return (await recurse(batch_a, line_offset)
                         + await recurse(batch_b, line_offset + mid))
 
+        summary = ai_error_summary(exc)
         await emit({"type": "log",
                     "message": f"Reviewer {reviewer.deployment} batch "
-                               f"{batch_idx + 1} failed: {exc}"})
+                               f"{batch_idx + 1} failed: {summary}"})
+        if errors is not None:
+            errors.append(summary)
         if failed is not None:
             failed.append([f.get("path") for f in files if f.get("path")])
         return []

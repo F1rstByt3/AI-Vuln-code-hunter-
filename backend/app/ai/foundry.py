@@ -80,6 +80,64 @@ def _is_reasoning(model: str | None) -> bool:
             or any(h in m for h in _LOCAL_REASONING_HINTS))
 
 
+def classify_ai_error(exc: BaseException) -> tuple[str, str]:
+    """Map a model/HTTP exception to a short cause tag + an actionable hint, so
+    a failed scan can say *why* instead of a stack trace. Returns
+    (cause, hint). cause is one of: auth, model, rate_limit, context, timeout,
+    endpoint, bad_output, unknown."""
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    code = (getattr(getattr(exc, "body", None), "get", lambda *_: None)("code")
+            if hasattr(getattr(exc, "body", None), "get") else None)
+    msg = f"{type(exc).__name__}: {exc}".lower()
+
+    def has(*subs: str) -> bool:
+        return any(s in msg for s in subs)
+
+    if status in (401, 403) or has("invalid_api_key", "api key", "unauthorized",
+                                   "forbidden", "access denied", "permission",
+                                   "authentication"):
+        return "auth", ("Check the API key (or Entra credentials) in Settings → AI "
+                        "Connection. For Azure the key must belong to the same resource "
+                        "as the endpoint.")
+    if status == 404 or code == "DeploymentNotFound" or has(
+            "does not exist", "deploymentnotfound", "model not found",
+            "no deployment", "unknown model", "not found"):
+        return "model", ("The model / deployment name doesn't match one on the endpoint. "
+                         "Use the exact deployment name — click Test connection in "
+                         "Settings to list what's available.")
+    if status == 429 or has("rate limit", "too many requests", "quota",
+                            "insufficient_quota", "throttl"):
+        return "rate_limit", ("The endpoint is rate-limiting. Lower 'Parallel requests' in "
+                              "the profile (try 1–2), or request higher quota.")
+    if has("context_length_exceeded", "maximum context", "context window",
+           "reduce the length", "too many tokens"):
+        return "context", ("Prompts exceed the model's context window. Lower the profile's "
+                           "'Context window', or the model's real window is smaller than "
+                           "configured.")
+    if has("timeout", "timed out", "deadline"):
+        return "timeout", ("The model took too long (>10 min/call). It may be too slow for "
+                           "the batch size, or the server is overloaded. For local models "
+                           "use a smaller/faster model or raise the context window.")
+    if has("connection", "connect", "name or service not known", "econnrefused",
+           "nodename nor servname", "failed to establish", "getaddrinfo",
+           "ssl", "certificate", "network"):
+        return "endpoint", ("Can't reach the endpoint. Check the URL. From inside Docker a "
+                            "local model must be at http://host.docker.internal:<port>, "
+                            "not localhost.")
+    if has("json", "no parseable", "no usable json", "unparseable", "parse"):
+        return "bad_output", ("The model didn't return usable JSON — usually too small for "
+                              "structured output, or the context window is set larger than "
+                              "the server actually loads (prompts get truncated).")
+    return "unknown", "See the worker log for the full error (docker compose logs -f worker)."
+
+
+def ai_error_summary(exc: BaseException) -> str:
+    """One-line '[cause] message — hint' for a user-facing scan error."""
+    cause, hint = classify_ai_error(exc)
+    detail = f"{type(exc).__name__}: {exc}"
+    return f"[{cause}] {detail[:400]} — {hint}"
+
+
 @dataclass
 class TokenUsage:
     """Per-model token accounting accumulated over the lifetime of a client.
@@ -270,6 +328,14 @@ class FoundryClient(ABC):
     @abstractmethod
     async def list_models(self) -> list[str]:
         """Deployments/models available from the configured project/server."""
+
+    async def preflight(self, *, model: str | None = None, transport: str = "auto") -> None:
+        """A tiny round-trip to prove the endpoint/key/model work before a long
+        run. Raises the provider's exception on failure (callers classify it)."""
+        await self.complete_json(
+            [{"role": "system", "content": "You reply only with JSON."},
+             {"role": "user", "content": 'Reply with exactly {"ok": true}.'}],
+            model=model, transport=transport, cache_key="hunter-preflight")
 
     def chat_stream(self, messages, temperature: float = 0.2, model: str | None = None):
         return self.stream(messages, model=model, transport="chat", temperature=temperature)
