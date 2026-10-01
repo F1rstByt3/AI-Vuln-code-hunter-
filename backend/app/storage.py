@@ -34,6 +34,9 @@ class ObjectStorage(ABC):
     @abstractmethod
     async def stream(self, key: str) -> AsyncIterator[bytes]: ...
 
+    @abstractmethod
+    async def delete_object(self, key: str) -> None: ...
+
 
 class S3Storage(ObjectStorage):
     def __init__(self) -> None:
@@ -84,6 +87,10 @@ class S3Storage(ObjectStorage):
             async for chunk in resp["Body"]:
                 yield chunk
 
+    async def delete_object(self, key: str) -> None:
+        async with self._client() as s3:
+            await s3.delete_object(Bucket=self._bucket, Key=key)
+
 
 class AzureBlobStorage(ObjectStorage):
     """Prod backend. Block-blob staging maps cleanly onto S3 multipart semantics."""
@@ -133,6 +140,14 @@ class AzureBlobStorage(ObjectStorage):
         stream = await self._blob(key).download_blob()
         async for chunk in stream.chunks():
             yield chunk
+
+    async def delete_object(self, key: str) -> None:
+        from azure.core.exceptions import ResourceNotFoundError
+
+        try:
+            await self._blob(key).delete_blob()
+        except ResourceNotFoundError:
+            pass
 
 
 def get_storage() -> ObjectStorage:

@@ -48,6 +48,16 @@ async def get_client(client_id: str, session: AsyncSession = Depends(get_session
 
 @router.delete("/{client_id}", status_code=204, dependencies=[Depends(require_role(Role.admin))])
 async def delete_client(client_id: str, session: AsyncSession = Depends(get_session)):
+    """Delete a client and every project, scan, finding and artifact under it.
+    Stored artifact blobs and working trees are purged too (best-effort)."""
+    from app.api.artifacts import purge_artifact_storage
+    from app.models import Artifact, Project
+
     client = await get_or_404(session, Client, client_id)
+    artifacts = (await session.execute(
+        select(Artifact).join(Project, Artifact.project_id == Project.id)
+        .where(Project.client_id == client_id))).scalars().all()
+    for a in artifacts:
+        await purge_artifact_storage(a)
     await session.delete(client)
     await session.commit()

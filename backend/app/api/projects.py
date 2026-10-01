@@ -57,7 +57,16 @@ async def get_project(project_id: str, session: AsyncSession = Depends(get_sessi
     "/projects/{project_id}", status_code=204, dependencies=[Depends(require_role(Role.admin))]
 )
 async def delete_project(project_id: str, session: AsyncSession = Depends(get_session)):
+    """Delete a project and all its scans, findings, artifacts and DAST targets.
+    Stored artifact blobs and working trees are purged too (best-effort)."""
+    from app.api.artifacts import purge_artifact_storage
+    from app.models import Artifact
+
     project = await get_or_404(session, Project, project_id)
+    artifacts = (await session.execute(
+        select(Artifact).where(Artifact.project_id == project_id))).scalars().all()
+    for a in artifacts:
+        await purge_artifact_storage(a)
     await session.delete(project)
     await session.commit()
 

@@ -36,6 +36,8 @@ export const api = {
     req<Project>(`/clients/${clientId}/projects`, { method: "POST", body: JSON.stringify(b) }),
   getProject: (id: string) => req<Project>(`/projects/${id}`),
   dashboard: (id: string) => req<Dashboard>(`/projects/${id}/dashboard`),
+  deleteClient: (id: string) => req<void>(`/clients/${id}`, { method: "DELETE" }),
+  deleteProject: (id: string) => req<void>(`/projects/${id}`, { method: "DELETE" }),
 
   // artifacts
   listArtifacts: (projectId: string) => req<Artifact[]>(`/projects/${projectId}/artifacts`),
@@ -43,6 +45,7 @@ export const api = {
     req<Artifact>(`/projects/${projectId}/artifacts`, { method: "POST", body: JSON.stringify(b) }),
   listArtifactFiles: (artifactId: string) =>
     req<ArtifactFile[]>(`/artifacts/${artifactId}/files`),
+  deleteArtifact: (id: string) => req<void>(`/artifacts/${id}`, { method: "DELETE" }),
 
   // scans
   listScans: (projectId: string) => req<Scan[]>(`/projects/${projectId}/scans`),
@@ -53,6 +56,7 @@ export const api = {
     req<Scan>(`/projects/${projectId}/scans`, { method: "POST", body: JSON.stringify(b) }),
   getScan: (id: string) => req<Scan>(`/scans/${id}`),
   cancelScan: (id: string) => req<Scan>(`/scans/${id}/cancel`, { method: "POST" }),
+  deleteScan: (id: string) => req<void>(`/scans/${id}`, { method: "DELETE" }),
   controlScan: (id: string, action: "pause" | "resume" | "skip" | "cancel") =>
     req<Scan>(`/scans/${id}/control`, { method: "POST", body: JSON.stringify({ action }) }),
   rerunStage: (id: string, stage: string) =>

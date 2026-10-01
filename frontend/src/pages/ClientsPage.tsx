@@ -34,6 +34,23 @@ export default function ClientsPage() {
     setNewProject(""); openClient(selected);
   };
 
+  const removeClient = async (c: Client) => {
+    if (!confirm(`Delete client “${c.name}” and ALL its projects, scans, findings and `
+      + `uploaded code? This cannot be undone.`)) return;
+    try {
+      await api.deleteClient(c.id);
+      if (selected === c.id) setSelected(null);
+      load();
+    } catch (e) { setErr(String(e)); }
+  };
+
+  const removeProject = async (p: Project) => {
+    if (!confirm(`Delete project “${p.name}” and all its scans, findings and uploaded `
+      + `code? This cannot be undone.`)) return;
+    try { await api.deleteProject(p.id); if (selected) openClient(selected); }
+    catch (e) { setErr(String(e)); }
+  };
+
   return (
     <div>
       <h1 className="text-2xl font-bold mb-1">Clients & Projects</h1>
@@ -49,11 +66,15 @@ export default function ClientsPage() {
           </div>
           <div className="space-y-1">
             {clients.map((c) => (
-              <button key={c.id} onClick={() => openClient(c.id)}
-                className={`w-full text-left px-3 py-2 rounded-md text-sm ${selected === c.id ? "bg-emerald-600/20" : "hover:bg-border"}`}>
-                <div className="font-medium">{c.name}</div>
-                <div className="text-xs text-muted">{c.slug}</div>
-              </button>
+              <div key={c.id}
+                className={`group flex items-center gap-2 pr-2 rounded-md ${selected === c.id ? "bg-emerald-600/20" : "hover:bg-border"}`}>
+                <button onClick={() => openClient(c.id)} className="flex-1 text-left px-3 py-2 text-sm min-w-0">
+                  <div className="font-medium truncate">{c.name}</div>
+                  <div className="text-xs text-muted truncate">{c.slug}</div>
+                </button>
+                <button onClick={() => removeClient(c)} title="Delete client"
+                  className="opacity-0 group-hover:opacity-100 text-muted hover:text-rose-300 text-sm px-1 transition">✕</button>
+              </div>
             ))}
             {clients.length === 0 && <div className="text-muted text-sm">No clients yet.</div>}
           </div>
@@ -69,11 +90,15 @@ export default function ClientsPage() {
               </div>
               <div className="space-y-1">
                 {(projects[selected] || []).map((p) => (
-                  <button key={p.id} onClick={() => nav(`/projects/${p.id}`)}
-                    className="w-full text-left px-3 py-2 rounded-md text-sm hover:bg-border">
-                    <div className="font-medium">{p.name}</div>
-                    {p.repo_url && <div className="text-xs text-muted">{p.repo_url}</div>}
-                  </button>
+                  <div key={p.id} className="group flex items-center gap-2 pr-2 rounded-md hover:bg-border">
+                    <button onClick={() => nav(`/projects/${p.id}`)}
+                      className="flex-1 text-left px-3 py-2 text-sm min-w-0">
+                      <div className="font-medium truncate">{p.name}</div>
+                      {p.repo_url && <div className="text-xs text-muted truncate">{p.repo_url}</div>}
+                    </button>
+                    <button onClick={() => removeProject(p)} title="Delete project"
+                      className="opacity-0 group-hover:opacity-100 text-muted hover:text-rose-300 text-sm px-1 transition">✕</button>
+                  </div>
                 ))}
                 {(projects[selected] || []).length === 0 && <div className="text-muted text-sm">No projects yet.</div>}
               </div>

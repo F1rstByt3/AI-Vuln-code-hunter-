@@ -136,3 +136,45 @@ async def list_artifact_files(
     stmt = stmt.order_by(ArtifactFile.path)
     rows = (await session.execute(stmt.limit(limit))).scalars().all()
     return rows
+
+
+async def purge_artifact_storage(artifact: Artifact) -> None:
+    """Best-effort removal of an artifact's blob + materialised workdir. The DB
+    rows (files, scans, findings…) are removed by the cascading delete; this
+    reclaims the object store and local disk they left behind. Never raises."""
+    import os
+    import shutil
+
+    from app.ingestion import WORKROOT
+
+    if artifact.storage_key:
+        try:
+            await get_storage().delete_object(artifact.storage_key)
+        except Exception:  # noqa: BLE001 — object may already be gone
+            pass
+    # Workdir is WORKROOT/<artifact id>; only remove paths safely under it.
+    workdir = os.path.join(WORKROOT, artifact.id)
+    root = os.path.realpath(WORKROOT)
+    target = os.path.realpath(workdir)
+    if target.startswith(root + os.sep) and os.path.isdir(target):
+        shutil.rmtree(target, ignore_errors=True)
+
+
+@router.delete("/artifacts/{artifact_id}", status_code=204,
+               dependencies=[Depends(require_role(Role.admin))])
+async def delete_artifact(artifact_id: str, session: AsyncSession = Depends(get_session)):
+    """Delete an uploaded/linked artifact: its stored blob, its working tree,
+    and — by cascade — every scan, finding and event produced from it."""
+    from app.models import Scan
+
+    artifact = await get_or_404(session, Artifact, artifact_id)
+    await purge_artifact_storage(artifact)
+    # Delete dependent scans through the ORM so their findings/events/runs are
+    # removed via relationship cascades (DB ON DELETE CASCADE covers Postgres,
+    # but SQLite in tests needs the explicit delete).
+    scans = (await session.execute(
+        select(Scan).where(Scan.artifact_id == artifact_id))).scalars().all()
+    for sc in scans:
+        await session.delete(sc)
+    await session.delete(artifact)
+    await session.commit()

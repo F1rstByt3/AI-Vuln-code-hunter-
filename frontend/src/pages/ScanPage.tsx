@@ -164,6 +164,16 @@ export default function ScanPage() {
                 Burp pack (Intruder)
               </button>
             )}
+            <button
+              onClick={async () => {
+                if (!confirm("Delete this scan and all its findings? This cannot be undone.")) return;
+                try { await api.deleteScan(scanId!); nav(-1); }
+                catch (e) { alert(String(e)); }
+              }}
+              title="Delete this scan and its findings"
+              className="px-2 py-1 rounded text-xs border border-rose-500/40 text-rose-300 hover:bg-rose-500/10">
+              Delete scan
+            </button>
           </div>
         )}
       </div>

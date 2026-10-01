@@ -227,6 +227,24 @@ async def cancel_scan(scan_id: str, session: AsyncSession = Depends(get_session)
     return scan
 
 
+@router.delete("/scans/{scan_id}", status_code=204,
+               dependencies=[Depends(require_role(Role.admin))])
+async def delete_scan(scan_id: str, session: AsyncSession = Depends(get_session)):
+    """Delete a scan and everything it produced (findings, events, checkpoints,
+    live-test runs). Refuses a running scan — cancel it first. The artifact and
+    its working tree are left intact for other scans."""
+    scan = await get_or_404(session, Scan, scan_id)
+    if scan.status in (ScanStatus.queued, ScanStatus.running):
+        raise HTTPException(http_status.HTTP_409_CONFLICT,
+                            "cancel the scan before deleting it")
+    try:
+        await control.clear_control(scan_id)   # drop any stale cancel key
+    except Exception:  # noqa: BLE001 — redis down shouldn't block a delete
+        pass
+    await session.delete(scan)
+    await session.commit()
+
+
 @router.get("/scans/{scan_id}/findings", response_model=list[FindingOut])
 async def list_findings(
     scan_id: str,

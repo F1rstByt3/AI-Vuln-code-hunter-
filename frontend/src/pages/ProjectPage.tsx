@@ -44,6 +44,21 @@ export default function ProjectPage() {
   };
   useEffect(() => { reload().catch((e) => setErr(String(e))); }, [projectId]);
 
+  const removeArtifact = async (a: Artifact) => {
+    if (!confirm(`Delete “${a.label || a.source_ref || "this code"}” and every scan run `
+      + `on it (findings included)? This cannot be undone.`)) return;
+    try {
+      await api.deleteArtifact(a.id);
+      if (artifactId === a.id) setArtifactId("");
+      await reload();
+    } catch (e) { setErr(String(e)); }
+  };
+  const removeScan = async (s: Scan) => {
+    if (["queued", "running"].includes(s.status)) { setErr("Cancel the scan before deleting it."); return; }
+    if (!confirm("Delete this scan and all its findings? This cannot be undone.")) return;
+    try { await api.deleteScan(s.id); await reload(); } catch (e) { setErr(String(e)); }
+  };
+
   useEffect(() => {
     if (!artifactId) { setArtifactFiles([]); setSelectedPaths([]); return; }
     setLoadingFiles(true);
@@ -152,16 +167,20 @@ export default function ProjectPage() {
           </div>
           <div className="space-y-1 max-h-48 overflow-auto">
             {artifacts.map((a) => (
-              <label key={a.id} className="flex items-center gap-2 px-2 py-1 rounded hover:bg-border text-sm">
-                <input type="radio" name="artifact" checked={artifactId === a.id} onChange={() => setArtifactId(a.id)} />
-                <span className="flex-1 truncate">{a.label || a.source_ref || a.id}</span>
-                <span className="text-xs text-muted">
-                  {a.kind}
-                  {a.status === "pending" ? " · ready to scan" :
-                   a.status === "ingesting" ? " · indexing…" :
-                   ` · ${a.analyzable_count || 0} files`}
-                </span>
-              </label>
+              <div key={a.id} className="group flex items-center gap-2 px-2 py-1 rounded hover:bg-border text-sm">
+                <label className="flex items-center gap-2 flex-1 min-w-0 cursor-pointer">
+                  <input type="radio" name="artifact" checked={artifactId === a.id} onChange={() => setArtifactId(a.id)} />
+                  <span className="flex-1 truncate">{a.label || a.source_ref || a.id}</span>
+                  <span className="text-xs text-muted shrink-0">
+                    {a.kind}
+                    {a.status === "pending" ? " · ready to scan" :
+                     a.status === "ingesting" ? " · indexing…" :
+                     ` · ${a.analyzable_count || 0} files`}
+                  </span>
+                </label>
+                <button onClick={() => removeArtifact(a)} title="Delete this code + its scans"
+                  className="opacity-0 group-hover:opacity-100 text-muted hover:text-rose-300 px-1 transition shrink-0">✕</button>
+              </div>
             ))}
             {artifacts.length === 0 && <div className="text-muted text-sm">No code yet.</div>}
           </div>
@@ -255,11 +274,14 @@ export default function ProjectPage() {
           <h3 className="font-semibold mt-6 mb-2 text-sm">Recent scans</h3>
           <div className="space-y-1 max-h-40 overflow-auto">
             {scans.map((s) => (
-              <button key={s.id} onClick={() => nav(`/scans/${s.id}`)}
-                className="w-full flex justify-between px-2 py-1.5 rounded hover:bg-border text-sm">
-                <span>{new Date(s.created_at).toLocaleString()}</span>
-                <span className="text-xs text-muted">{s.status}</span>
-              </button>
+              <div key={s.id} className="group flex items-center gap-2 px-2 py-1.5 rounded hover:bg-border text-sm">
+                <button onClick={() => nav(`/scans/${s.id}`)} className="flex-1 flex justify-between gap-2 min-w-0 text-left">
+                  <span className="truncate">{new Date(s.created_at).toLocaleString()}</span>
+                  <span className="text-xs text-muted shrink-0">{s.status}</span>
+                </button>
+                <button onClick={() => removeScan(s)} title="Delete scan"
+                  className="opacity-0 group-hover:opacity-100 text-muted hover:text-rose-300 px-1 transition shrink-0">✕</button>
+              </div>
             ))}
             {scans.length === 0 && <div className="text-muted text-sm">No scans yet.</div>}
           </div>
