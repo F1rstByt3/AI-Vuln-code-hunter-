@@ -346,7 +346,18 @@ class DastRunCreate(BaseModel):
     # Explicit authorization: the operator attests they may test this host.
     authorize: bool = False
     allow_mutating: bool = False
+    access_control: bool = True          # confirm access-control findings
+    active_scan: bool = False            # native active checks (+ Burp if attached)
+    include_paths: list[str] | None = None   # only test paths starting with these
+    exclude_paths: list[str] | None = None   # never test paths starting with these
+
+
+class DastPlanRequest(BaseModel):
+    target_id: str
+    access_control: bool = True
     active_scan: bool = False
+    include_paths: list[str] | None = None
+    exclude_paths: list[str] | None = None
 
 
 class DastRunOut(ORMModel):

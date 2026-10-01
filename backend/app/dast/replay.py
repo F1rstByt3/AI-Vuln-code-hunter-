@@ -73,7 +73,7 @@ def _ev(role: str, r: LiveResponse, ident: Identity | None = None) -> dict:
 
 async def probe_missing_authn(client: LiveClient, url: str, method: str) -> tuple[str, dict]:
     """Confirmed if the anonymous request succeeds; enforced if denied."""
-    anon = await client.send(method, url, Identity.anonymous())
+    anon = await client.send(method, url, Identity.anonymous(), purpose="access:missing_authn")
     ev = {"requests": [_ev("none", anon)], "url": url, "method": method}
     if anon.error:
         return "inconclusive", {**ev, "reason": anon.error}
@@ -95,7 +95,7 @@ async def probe_bfla(client: LiveClient, url: str, method: str,
     reqs = []
     confirmed = False
     for ident in low:
-        r = await client.send(method, url, ident)
+        r = await client.send(method, url, ident, purpose="access:bfla")
         reqs.append(_ev(ident.role, r, ident))
         if not r.error and _is_success(r.status):
             confirmed = True
@@ -140,14 +140,14 @@ async def probe_idor(client: LiveClient, path: str, method: str, base_url: str,
                 continue
             values = {p: (pmap.get(p) or ["1"])[0] for p in id_params}
             url = base_url + fill_path(path, values)
-            r = await client.send(method, url, actor)
+            r = await client.send(method, url, actor, purpose="access:idor")
             reqs.append({**_ev(actor.role, r, actor), "owner": owner_role, "target": url})
             if r.error or not _is_success(r.status):
                 continue
             # Baseline: what the owner themselves gets for the same object.
             owner_ident = by_role.get(owner_role)
             if owner_ident is not None:
-                base_r = await client.send(method, url, owner_ident)
+                base_r = await client.send(method, url, owner_ident, purpose="access:idor-baseline")
                 reqs.append({**_ev(owner_role, base_r, owner_ident),
                              "owner": owner_role, "target": url, "baseline": True})
                 if (_is_success(base_r.status) and base_r.body_hash

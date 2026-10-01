@@ -83,6 +83,37 @@ async def run_dast(ctx: dict, run_id: str) -> None:
 
         counts = {"confirmed": 0, "enforced": 0, "inconclusive": 0,
                   "untestable": 0, "requests": 0}
+        checks = run.config.get("checks") or {}
+        do_access = checks.get("access_control", True)
+        do_active = checks.get("active_scan", bool(run.config.get("active_scan")))
+        inc = [p for p in (run.config.get("include_paths") or []) if p]
+        exc = [p for p in (run.config.get("exclude_paths") or []) if p]
+
+        def in_path_scope(path: str) -> bool:
+            path = path or ""
+            if inc and not any(path.startswith(p) for p in inc):
+                return False
+            return not any(path.startswith(p) for p in exc)
+
+        # Apply the operator's path filters to the endpoint surface + findings.
+        all_eps = [e for e in matrix.values() if in_path_scope(e.get("path", ""))]
+        if inc or exc:
+            findings = [f for f in findings
+                        if in_path_scope(((f.raw or {}).get("endpoint") or "")
+                                         .partition(" ")[2] or (f.file_path or ""))
+                        or not (f.raw or {}).get("endpoint")]
+        if not do_access:
+            findings = []
+
+        req_log: list[dict] = []          # audit trail across all phases
+        by_purpose: dict[str, int] = {}
+
+        def absorb(client) -> None:
+            req_log.extend(client.log)
+            for k, v in client.by_purpose.items():
+                by_purpose[k] = by_purpose.get(k, 0) + v
+            counts["requests"] = sum(by_purpose.values())
+
         low: list = []
         priv: list = []
         scope = Scope(target.allowed_hosts or [])
@@ -134,14 +165,14 @@ async def run_dast(ctx: dict, run_id: str) -> None:
                                     "id": f.id, "verdict": v}})
                     await emit({"type": "stage", "stage": "dast_access", "state": "running",
                                 "done": i + 1, "total": total})
-                counts["requests"] = client.count
+                absorb(client)
             await session.commit()
 
-            # Active scan (Burp) — seed the authenticated surface and ingest issues.
-            if run.config.get("active_scan") and target.burp_mcp_id:
+            # Active scan — native checks (and Burp if attached).
+            if do_active:
                 try:
                     await _run_active_scan(session, run, scan, target, scope, low, priv,
-                                           emit, counts)
+                                           emit, counts, all_eps, absorb)
                 except ScanCanceledSignal:
                     raise
                 except Exception as exc:  # noqa: BLE001
@@ -163,6 +194,10 @@ async def run_dast(ctx: dict, run_id: str) -> None:
             run.error = str(exc)[:1000]
             await emit({"type": "log", "message": f"DAST error: {exc}"})
 
+        # Persist the audit trail (bounded) so the operator can see what was
+        # sent, where, and why.
+        counts["by_purpose"] = by_purpose
+        counts["requests_log"] = req_log[:1000]
         run.summary = counts
         run.finished_at = _now()
         await session.commit()
@@ -179,18 +214,46 @@ async def run_dast(ctx: dict, run_id: str) -> None:
 
 
 async def _run_active_scan(session, run: DastRun, scan: Scan, target: DastTarget,
-                           scope: Scope, low, priv, emit, counts: dict) -> None:
-    """Seed the discovered request surface into Burp, run an active scan, and
-    ingest issues as ``dast`` findings. Gracefully degrades when the Burp MCP
-    server exposes no scan tool (the surface is still seeded)."""
-    from app.dast.burp import BurpClient, issue_to_finding, wait_and_fetch_issues
+                           scope: Scope, low, priv, emit, counts: dict,
+                           endpoints: list, absorb) -> None:
+    """Native active checks (needs no Burp) over *endpoints*, then — if a Burp
+    MCP server is attached — seed the surface into Burp and ingest its issues."""
+    from app.config import settings as cfg
+    from app.dast.active import native_active_scan
 
+    ident = (priv or low or [Identity.anonymous()])[0]
+    base = target.base_url.rstrip("/")
+    await emit({"type": "stage", "stage": "dast_active", "state": "running"})
+    await emit({"type": "status", "status": "dast: active scan"})
+
+    async def _canceled():
+        return await control.get_control(run.scan_id + ":dast") == "cancel"
+
+    # --- native active scan (always; no Burp required) ---
+    try:
+        async with LiveClient(scope, max_rps=target.max_rps or cfg.dast_default_max_rps,
+                              allow_mutating=run.allow_mutating, capture_bodies=True) as nclient:
+            native = await native_active_scan(nclient, base, endpoints, ident, emit,
+                                              is_canceled=_canceled)
+        absorb(nclient)
+    except Exception as exc:  # noqa: BLE001
+        native = []
+        await emit({"type": "log", "message": f"Native active scan error: {exc}"})
+    added = await _persist_dast_findings(session, run.scan_id, native)
+    counts["active_issues"] = added
+    await emit({"type": "finding", "finding": {"_dast": True, "active": added}})
+
+    if not target.burp_mcp_id:
+        await emit({"type": "stage", "stage": "dast_active", "state": "done"})
+        return
+
+    from app.dast.burp import BurpClient, issue_to_finding, wait_and_fetch_issues
     server = await session.get(McpServer, target.burp_mcp_id)
     if server is None:
-        await emit({"type": "log", "message": "Active scan skipped: Burp MCP server not found"})
+        await emit({"type": "log", "message": "Burp step skipped: MCP server not found"})
+        await emit({"type": "stage", "stage": "dast_active", "state": "done"})
         return
-    await emit({"type": "stage", "stage": "dast_active", "state": "running"})
-    await emit({"type": "status", "status": "dast: active scan (Burp)"})
+    await emit({"type": "status", "status": "dast: Burp active scan"})
     burp = BurpClient(server)
     try:
         caps = await burp.capabilities()
@@ -211,7 +274,7 @@ async def _run_active_scan(session, run: DastRun, scan: Scan, target: DastTarget
     base = target.base_url.rstrip("/")
     seeded_urls: list[str] = []
     skipped_mut = 0
-    for e in (scan.summary or {}).get("endpoints", []):
+    for e in endpoints:
         if not isinstance(e, dict):
             continue
         method = (e.get("method") or "GET").upper()
@@ -242,30 +305,34 @@ async def _run_active_scan(session, run: DastRun, scan: Scan, target: DastTarget
                 f"Burp active scan started on {len(seeded_urls) or 1} URL(s); "
                 f"polling for issues…"})
 
-    async def _canceled():
-        return await control.get_control(run.scan_id + ":dast") == "cancel"
-
     issues = await wait_and_fetch_issues(burp, is_canceled=_canceled)
-    # Ingest (dedupe against existing dast findings by title+endpoint).
-    existing = {(f.title, (f.raw or {}).get("endpoint")) for f in (await session.execute(
-        select(Finding).where(Finding.scan_id == run.scan_id,
-                              Finding.source == FindingSource.dast)
-    )).scalars().all()}
-    added = 0
-    for issue in issues:
-        fd = issue_to_finding(run.scan_id, issue)
-        if (fd["title"], fd.get("endpoint")) in existing:
-            continue
-        session.add(_dast_finding(run.scan_id, fd))
-        existing.add((fd["title"], fd.get("endpoint")))
-        added += 1
-    await session.commit()
-    counts["active_issues"] = added
+    burp_dicts = [issue_to_finding(run.scan_id, issue) for issue in issues]
+    added = await _persist_dast_findings(session, run.scan_id, burp_dicts)
+    counts["burp_issues"] = added
     counts["seeded"] = len(seeded_urls)
     await emit({"type": "stage", "stage": "dast_active", "state": "done"})
     await emit({"type": "finding", "finding": {"_dast": True, "active": added}})
     await emit({"type": "log", "message":
                 f"Burp active scan: ingested {added} issue(s) as findings"})
+
+
+async def _persist_dast_findings(session, scan_id: str, finding_dicts: list[dict]) -> int:
+    """Persist dast findings, deduped against existing ones by (title, endpoint)."""
+    existing = {(f.title, (f.raw or {}).get("endpoint")) for f in (await session.execute(
+        select(Finding).where(Finding.scan_id == scan_id,
+                              Finding.source == FindingSource.dast)
+    )).scalars().all()}
+    added = 0
+    for fd in finding_dicts:
+        key = (fd.get("title"), fd.get("endpoint"))
+        if key in existing:
+            continue
+        session.add(_dast_finding(scan_id, fd))
+        existing.add(key)
+        added += 1
+    if added:
+        await session.commit()
+    return added
 
 
 def _dast_finding(scan_id: str, fd: dict) -> Finding:
@@ -278,7 +345,8 @@ def _dast_finding(scan_id: str, fd: dict) -> Finding:
         severity=Severity(sev if sev in {s.value for s in Severity} else "medium"),
         confidence=fd.get("confidence", 0.7),
         source=FindingSource.dast, state=FindingState.proposed,
-        cwe=trunc(fd.get("cwe"), 200), category=trunc(fd.get("category"), 200),
+        cwe=trunc(fd.get("cwe"), 200), owasp=trunc(fd.get("owasp"), 200),
+        category=trunc(fd.get("category"), 200),
         remediation=fd.get("remediation"), code_snippet=fd.get("code_snippet"),
         raw={k: v for k, v in fd.items() if k not in ("severity",)},
     )

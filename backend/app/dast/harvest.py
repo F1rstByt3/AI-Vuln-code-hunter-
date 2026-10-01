@@ -75,7 +75,7 @@ async def harvest_object_ids(client, base_url: str, endpoints: list[dict],
         for coll, params in sorted(params_by_collection.items()):
             url = base_url.rstrip("/") + coll
             try:
-                resp = await client.raw("GET", url, ident)
+                resp = await client.raw("GET", url, ident, purpose="harvest")
             except Exception:  # noqa: BLE001
                 continue
             if resp.status_code >= 300:

@@ -45,7 +45,8 @@ class RequestCapExceeded(RuntimeError):
 
 class LiveClient:
     def __init__(self, scope: Scope, *, max_rps: float, allow_mutating: bool,
-                 max_requests: int | None = None, capture_bodies: bool = False) -> None:
+                 max_requests: int | None = None, capture_bodies: bool = False,
+                 log_cap: int = 3000) -> None:
         self.scope = scope
         self.allow_mutating = allow_mutating
         self._min_interval = 1.0 / max_rps if max_rps and max_rps > 0 else 0.0
@@ -53,6 +54,10 @@ class LiveClient:
         self._max_requests = max_requests or settings.dast_max_requests_per_run
         self._count = 0
         self._capture = capture_bodies
+        # Audit trail: every outbound request (what / where / why), bounded.
+        self.log: list[dict] = []
+        self.by_purpose: dict[str, int] = {}
+        self._log_cap = log_cap
         self._client = httpx.AsyncClient(
             follow_redirects=False,           # never auto-follow across hosts
             timeout=settings.dast_request_timeout,
@@ -62,6 +67,16 @@ class LiveClient:
     @property
     def count(self) -> int:
         return self._count
+
+    def _record(self, purpose: str, method: str, url: str, role: str,
+                status: int | None, ms: int, note: str = "") -> None:
+        self.by_purpose[purpose] = self.by_purpose.get(purpose, 0) + 1
+        if len(self.log) < self._log_cap:
+            e = {"purpose": purpose, "method": method, "url": url, "identity": role,
+                 "status": status, "ms": ms}
+            if note:
+                e["note"] = note
+            self.log.append(e)
 
     async def __aenter__(self) -> LiveClient:
         return self
@@ -77,7 +92,8 @@ class LiveClient:
         self._last = time.monotonic()
 
     async def raw(self, method: str, url: str, identity: Identity, *,
-                  json_body=None, data=None, allow_login: bool = False):
+                  json_body=None, data=None, allow_login: bool = False,
+                  purpose: str = "internal"):
         """Send and return the full httpx.Response, for INTERNAL use (scripted
         login, id harvesting) where the body/cookies are needed. Never used to
         build evidence — callers must not leak the body. Same scope/rate/cap
@@ -91,14 +107,20 @@ class LiveClient:
             raise RequestCapExceeded(f"request cap {self._max_requests} reached")
         await self._throttle()
         self._count += 1
-        return await self._client.request(
+        started = time.monotonic()
+        resp = await self._client.request(
             method, url, headers=identity.headers or None,
             cookies=identity.cookies or None, json=json_body, data=data)
+        self._record(purpose, method, url, identity.role, resp.status_code,
+                     int((time.monotonic() - started) * 1000))
+        return resp
 
     async def send(self, method: str, url: str, identity: Identity,
-                   *, json_body=None) -> LiveResponse:
+                   *, json_body=None, purpose: str = "probe") -> LiveResponse:
         method = method.upper()
         if method not in SAFE_METHODS and not self.allow_mutating:
+            self._record(purpose, method, url, identity.role, None, 0,
+                         note="blocked: mutating not allowed")
             return LiveResponse(0, 0, 0, "", "",
                                 error=f"blocked: {method} requires allow_mutating")
         self.scope.check(url)                 # raises ScopeError if out of scope
@@ -113,8 +135,13 @@ class LiveClient:
                 cookies=identity.cookies or None, json=json_body,
             )
         except httpx.HTTPError as exc:
+            self._record(purpose, method, url, identity.role, None,
+                         int((time.monotonic() - started) * 1000),
+                         note=type(exc).__name__)
             return LiveResponse(0, 0, int((time.monotonic() - started) * 1000),
                                 "", "", error=f"{type(exc).__name__}: {exc}"[:200])
+        self._record(purpose, method, url, identity.role, resp.status_code,
+                     int((time.monotonic() - started) * 1000))
         # A redirect to another host is a scope boundary — report, don't follow.
         if resp.is_redirect:
             loc = resp.headers.get("location", "")

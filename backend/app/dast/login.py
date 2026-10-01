@@ -69,7 +69,7 @@ async def perform_login(client, base_url: str, role: str, is_privileged: bool,
         return Identity(role=role, is_privileged=is_privileged, usable=False, note=note)
 
     try:
-        resp = await client.raw(method, url, Identity.anonymous(), allow_login=True, **kwargs)
+        resp = await client.raw(method, url, Identity.anonymous(), allow_login=True, purpose="login", **kwargs)
     except Exception as exc:  # noqa: BLE001
         return fail(f"login request error: {type(exc).__name__}")
     if resp.status_code >= 400:
