@@ -19,7 +19,7 @@ from sqlalchemy import delete as sql_delete
 from sqlalchemy import select
 
 from app import control, events
-from app.ai.agent import DEFAULT_CHECKS, run_review
+from app.ai.agent import DEFAULT_CHECKS, _as_int, run_review
 from app.ai.foundry import get_foundry_client
 from app.api.deps import get_arq
 from app.config import settings
@@ -738,17 +738,29 @@ def _dedup_candidates(candidates: list[dict]) -> list[dict]:
     return list(seen.values())
 
 
-def _trunc(val: str | None, maxlen: int) -> str | None:
-    if val and len(val) > maxlen:
-        return val[:maxlen]
-    return val
+def _trunc(val, maxlen: int) -> str | None:
+    """Coerce a model-supplied value to a bounded string. Models sometimes emit
+    non-strings (e.g. cwe: 89, or a list/dict), so never assume str here."""
+    if val is None:
+        return None
+    if not isinstance(val, str):
+        val = str(val)
+    return val[:maxlen] if len(val) > maxlen else val
+
+
+def _text(val) -> str | None:
+    """Coerce a model-supplied free-text field to str (or None). Models may
+    emit a list/dict/number where we expect text."""
+    if val is None:
+        return None
+    return val if isinstance(val, str) else str(val)
 
 
 def _finding_from_dict(scan_id: str, f: dict) -> Finding:
     return Finding(
         scan_id=scan_id,
         title=_trunc(f.get("title") or "Untitled finding", 300),
-        description=f.get("description", ""),
+        description=_text(f.get("description")) or "",
         severity=Severity(f.get("severity", "medium")),
         confidence=f.get("confidence", 0.5),
         source=FindingSource(f.get("source", "ai")),
@@ -757,13 +769,13 @@ def _finding_from_dict(scan_id: str, f: dict) -> Finding:
         owasp=_trunc(f.get("owasp"), 200),
         category=_trunc(f.get("category"), 200),
         file_path=_trunc(f.get("file_path"), 1024),
-        line_start=f.get("line_start"),
-        line_end=f.get("line_end"),
-        code_snippet=f.get("code_snippet"),
-        remediation=f.get("recommendation") or f.get("remediation"),
-        human_question=f.get("human_question"),
-        triage_note=f.get("triage_note"),
-        triaged_by=f.get("triaged_by"),
+        line_start=_as_int(f.get("line_start")),
+        line_end=_as_int(f.get("line_end")),
+        code_snippet=_text(f.get("code_snippet")),
+        remediation=_text(f.get("recommendation") or f.get("remediation")),
+        human_question=_text(f.get("human_question")),
+        triage_note=_text(f.get("triage_note")),
+        triaged_by=_text(f.get("triaged_by")),
         raw=f,
     )
 
