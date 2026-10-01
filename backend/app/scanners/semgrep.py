@@ -58,10 +58,14 @@ class SemgrepScanner:
             "--timeout", "120",
             # Memory bounds so the engine isn't OOM-killed on big repos / low RAM.
             "--jobs", str(max(1, settings.semgrep_jobs)),
-            "--severity", "INFO",
-            "--severity", "WARNING",
-            "--severity", "ERROR",
         ]
+        # Severity floor — WARNING+ERROR by default (security signal); INFO adds
+        # a lot of style/audit noise on large repos.
+        order = ["INFO", "WARNING", "ERROR"]
+        floor = (settings.semgrep_min_severity or "WARNING").upper()
+        keep = order[order.index(floor):] if floor in order else order[1:]
+        for sev in keep:
+            cmd += ["--severity", sev]
         if settings.semgrep_max_memory_mb and settings.semgrep_max_memory_mb > 0:
             cmd += ["--max-memory", str(settings.semgrep_max_memory_mb)]
         for ex in _EXCLUDES:

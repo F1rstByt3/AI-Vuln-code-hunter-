@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     # you have RAM and cores to spare.
     semgrep_jobs: int = 1
     semgrep_max_memory_mb: int = 2000
+    # Lowest severity Semgrep reports: INFO | WARNING | ERROR. Default WARNING
+    # drops low-value INFO/style rules (security signal is WARNING+ERROR) — on a
+    # big repo INFO can be thousands of noisy candidates. Set to INFO to include.
+    semgrep_min_severity: str = "WARNING"
     sonarqube_enabled: bool = False
     sonarqube_url: str | None = None
     sonarqube_token: str | None = None

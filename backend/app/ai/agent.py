@@ -294,6 +294,9 @@ DEFAULT_CHECKS = {"coverage": True, "verify": True, "access_control": True}
 # Circuit breaker: if the first N reviewer batches ALL fail, the model can't do
 # the job (too small / truncated context) — stop instead of grinding for hours.
 _EARLY_FAIL_BATCHES = 8
+# Above this many total model calls (batches × reviewers) a full review is
+# impractically slow; warn and point at Targeted scope / a bigger context.
+_BATCH_COUNT_WARN = 300
 _UNUSABLE_MODEL_HELP = (
     "The model returned no usable JSON. Usual causes with local models: the model is "
     "too small for structured output (try qwen2.5-coder:14b or larger), or the "
@@ -398,6 +401,19 @@ async def run_review(
                 f"Loaded {len(all_sources)}/{len(files)} files, "
                 f"{total_bytes // 1024}KB total — split into {len(batches)} batches "
                 f"(token limit {batch_token_limit:,}/batch, {concurrency} parallel)"})
+    # A very large batch count means an impractically long run — usually a big
+    # repo reviewed in "full" scope with a small model context window. Warn so
+    # the operator can switch to Targeted scope / raise the context instead of
+    # waiting hours. (A small window also truncates prompts → bad-output errors.)
+    reviewers_n = max(1, len(roles.reviewers))
+    if len(batches) * reviewers_n > _BATCH_COUNT_WARN:
+        await emit({"type": "log", "message": (
+            f"⚠ {len(batches)} batches × {reviewers_n} reviewer(s) = "
+            f"{len(batches) * reviewers_n} model calls — this will take a long time. "
+            f"The model context window is {batch_token_limit:,} tokens/batch; if that's "
+            f"smaller than the model really supports, raise the profile's 'Context window' "
+            f"(and OLLAMA_CONTEXT_LENGTH to match) so batches are bigger and fewer. Or "
+            f"re-run with Targeted scope to review only files with candidates/endpoints.")})
 
     # ---- 4. CHAT model narrates the plan (streamed) ----
     await checkpoint("ai_plan")

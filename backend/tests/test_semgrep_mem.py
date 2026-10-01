@@ -43,6 +43,27 @@ async def test_memory_flags_present(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_severity_floor_drops_info_by_default(monkeypatch):
+    captured: list = []
+    _patch_proc(monkeypatch, _FakeProc(stdout=b'{"results":[],"errors":[]}'), captured)
+    await sg.SemgrepScanner().scan("/tmp")
+    cmd = captured[-1]
+    sevs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--severity"]
+    assert sevs == ["WARNING", "ERROR"]            # default drops INFO noise
+
+
+@pytest.mark.asyncio
+async def test_severity_floor_info_includes_all(monkeypatch):
+    monkeypatch.setattr(sg.settings, "semgrep_min_severity", "INFO")
+    captured: list = []
+    _patch_proc(monkeypatch, _FakeProc(stdout=b'{"results":[],"errors":[]}'), captured)
+    await sg.SemgrepScanner().scan("/tmp")
+    cmd = captured[-1]
+    sevs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--severity"]
+    assert sevs == ["INFO", "WARNING", "ERROR"]
+
+
+@pytest.mark.asyncio
 async def test_oom_in_errors_is_reported(monkeypatch):
     out = json.dumps({"results": [], "errors": [
         {"message": "Error while running rules: the engine was killed. "
