@@ -40,6 +40,9 @@ _CAP_PATTERNS = {
     "issues": ("scan_issues", "get_issues", "get_scan_issues", "list_issues", "issues"),
     "history": ("proxy_http_history", "get_proxy_history", "http_history"),
     "scan_status": ("scan_status", "get_scan", "scan_progress"),
+    # Manual-testing hand-off (PortSwigger MCP: create_repeater_tab, send_to_intruder).
+    "repeater": ("create_repeater_tab", "send_to_repeater", "repeater"),
+    "intruder": ("send_to_intruder", "create_intruder", "intruder"),
 }
 
 _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
@@ -109,6 +112,21 @@ class BurpClient:
         except Exception as exc:  # noqa: BLE001
             log.info("burp seed failed for %s %s: %s", method, url, exc)
             return False
+
+    # ----------------------------------------------------------- manual hand-off
+    async def send_to_tool(self, tool_cap: str, raw: str, host: str, port: int,
+                           https: bool, tab_name: str) -> None:
+        """Open *raw* in Burp Repeater or Intruder. Raises if unsupported."""
+        tool = await self.tool_for(tool_cap)
+        if not tool:
+            raise RuntimeError(
+                f"This Burp MCP server exposes no {tool_cap} tool — update the Burp MCP "
+                f"Server extension, or use 'Copy for Burp' / the request pack instead")
+        await self.call_tool(tool, {
+            "tabName": tab_name[:60], "content": raw, "request": raw,
+            "targetHostname": host, "host": host, "targetPort": port, "port": port,
+            "usesHttps": https, "https": https, "secure": https,
+        })
 
     # ----------------------------------------------------------------- scanning
     async def active_scan(self, urls: list[str]) -> str | None:

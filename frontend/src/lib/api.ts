@@ -123,6 +123,20 @@ export const api = {
   listDastRuns: (scanId: string) => req<DastRun[]>(`/scans/${scanId}/dast-runs`),
   cancelDastRun: (id: string) => req<DastRun>(`/dast-runs/${id}/cancel`, { method: "POST" }),
 
+  // Burp manual testing (Repeater / Intruder)
+  burpPackUrl: (scanId: string, o: { base_url?: string; min_risk?: string; with_findings_only?: boolean } = {}) => {
+    const q = new URLSearchParams();
+    if (o.base_url) q.set("base_url", o.base_url);
+    if (o.min_risk) q.set("min_risk", o.min_risk);
+    if (o.with_findings_only) q.set("with_findings_only", "true");
+    return `${BASE}/api/scans/${scanId}/export/burp-pack?${q}`;
+  },
+  findingBurpRequest: (findingId: string, base_url?: string) =>
+    req<{ raw: string; host: string; port: number; https: boolean; endpoint: string; base_url: string }>(
+      `/findings/${findingId}/burp-request${base_url ? `?base_url=${encodeURIComponent(base_url)}` : ""}`),
+  burpSend: (b: { mcp_id: string; tool: "repeater" | "intruder"; finding_ids: string[]; base_url?: string }) =>
+    req<{ sent: number; errors: string[] }>("/burp/send", { method: "POST", body: JSON.stringify(b) }),
+
   exportUrl: (scanId: string, format: string) =>
     `${BASE}/api/scans/${scanId}/export/${format}`,
 

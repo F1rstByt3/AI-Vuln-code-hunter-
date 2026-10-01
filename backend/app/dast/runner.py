@@ -60,7 +60,7 @@ async def run_dast(ctx: dict, run_id: str) -> None:
         await emit({"type": "log", "message":
                     f"DAST run against {target.base_url} "
                     f"(scope: {', '.join(target.allowed_hosts or [])}) — "
-                    f"authorized by {run.authorized_by}"})
+                    f"authorised by {run.authorized_by}"})
 
         # Identities: anonymous baseline is implicit; split configured roles.
         creds = (await session.execute(
@@ -182,7 +182,7 @@ async def run_dast(ctx: dict, run_id: str) -> None:
         except ScanCanceledSignal:
             await session.commit()
             run.status = DastStatus.canceled
-            await emit({"type": "log", "message": "DAST run canceled"})
+            await emit({"type": "log", "message": "DAST run cancelled"})
         except ScopeError as exc:
             await session.rollback()
             run.status = DastStatus.failed

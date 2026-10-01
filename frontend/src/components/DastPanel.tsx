@@ -54,7 +54,7 @@ export function DastTargetsCard({ projectId }: { projectId: string }) {
       {open && (
         <div className="mt-3 space-y-3">
           <p className="text-[11px] text-muted">
-            Declare a running target you are authorized to test. A scan's access-control
+            Declare a running target you are authorised to test. A scan's access-control
             findings can then be confirmed live: each endpoint is replayed as different
             users to see whether the app actually enforces the control. Requests only ever
             reach the hosts you allow-list here.
@@ -285,7 +285,7 @@ export function DastLaunch({ scanId, projectId }: { scanId: string; projectId: s
 
           {confirming && plan && target && (
             <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-xs space-y-2">
-              <div className="font-medium text-amber-200">Review before authorizing</div>
+              <div className="font-medium text-amber-200">Review before authorising</div>
               <div className="grid grid-cols-2 gap-x-6 gap-y-1 text-slate-300">
                 <div>Target: <b>{plan.target.base_url}</b></div>
                 <div>In-scope hosts: {plan.target.allowed_hosts.join(", ")}</div>
@@ -302,9 +302,9 @@ export function DastLaunch({ scanId, projectId }: { scanId: string; projectId: s
                 <input type="checkbox" checked={allowMutating} onChange={(e) => setAllowMutating(e.target.checked)} />
                 Allow state-changing requests (POST/PUT/DELETE) — off by default
               </label>
-              <div className="text-amber-200/90">Only run against systems you are authorized to test.</div>
+              <div className="text-amber-200/90">Only run against systems you are authorised to test.</div>
               <div className="flex gap-2 pt-1">
-                <Button variant="primary" onClick={launch}>I'm authorized — run</Button>
+                <Button variant="primary" onClick={launch}>I'm authorised — run</Button>
                 <Button variant="ghost" onClick={() => { setConfirming(false); setPlan(null); }}>Cancel</Button>
               </div>
             </div>

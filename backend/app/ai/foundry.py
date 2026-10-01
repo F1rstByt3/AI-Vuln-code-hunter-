@@ -630,12 +630,12 @@ class MockFoundryClient(FoundryClient):
             "line_start": 1,
             "line_end": 1,
             "code_snippet": None,
-            "remediation": "Enforce per-object authorization tied to the session principal.",
+            "remediation": "Enforce per-object authorisation tied to the session principal.",
             "source": "ai",
             "state": "needs_info",
             "human_question": (
                 "Should this endpoint be restricted to the resource owner? "
-                "Confirm the intended authorization rule."
+                "Confirm the intended authorisation rule."
             ),
         })
         return findings
@@ -683,7 +683,7 @@ class MockFoundryClient(FoundryClient):
                 "control or data flow."
             )
             verdict["proof_of_concept"] = (
-                "# PoC (authorized testing only)\n"
+                "# PoC (authorised testing only)\n"
                 f"# Target: {where}\n"
                 "1. Identify the request that reaches this code path.\n"
                 "2. Replace the relevant parameter with a boundary-testing payload\n"
@@ -700,7 +700,7 @@ class MockFoundryClient(FoundryClient):
             verdict["recommendation"] = (
                 f.get("remediation")
                 or "Validate and canonicalize input, use safe APIs "
-                "(parameterized queries, allow-lists), and enforce authorization "
+                "(parameterised queries, allow-lists), and enforce authorisation "
                 "at the sink."
             )
             verdict["exploited_by"] = "exploit:mock"
@@ -791,7 +791,7 @@ class MockFoundryClient(FoundryClient):
                             "confidence": 0.4,
                             "reasoning": "Mock verifier: depends on business rules.",
                             "human_question": f.get("human_question")
-                            or "Confirm the intended authorization rule."})
+                            or "Confirm the intended authorisation rule."})
             else:
                 out.append({"id": f.get("id"), "verdict": "true_positive",
                             "confidence": max(float(f.get("confidence") or 0.5), 0.8),

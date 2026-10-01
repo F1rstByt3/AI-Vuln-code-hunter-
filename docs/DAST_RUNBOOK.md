@@ -139,3 +139,45 @@ finding to see the per-role request/response evidence (auth redacted).
 - Burp integration is verified against a mock MCP server; on first use against a
   real Burp, check the worker log for `burp seed failed` / `exposes no ... tool`
   and set tool-name overrides in the MCP server's config if the names differ.
+
+## Manual testing in Burp (Repeater / Intruder)
+
+Every finding with an HTTP endpoint can be handed to Burp for manual testing:
+
+- **Copy for Burp** (on a finding) — copies a raw HTTP/1.1 request. Object ids
+  are wrapped in Intruder markers (`§1§`, or a sample UUID for UUID routes), so
+  pasting into Intruder gives you the payload positions straight away.
+- **→ Repeater / → Intruder** — with the Burp MCP server registered
+  (Settings → Integrations), opens the request in Burp directly. In the
+  Access control and Live (DAST) tabs you can send up to 50 at once.
+- **Burp pack (Intruder)** (scan header) — a ZIP of raw requests for every
+  medium/high-risk endpoint, a combined file annotated with related findings,
+  id payload lists (`payloads/numeric-ids.txt`, `payloads/uuids-sample.txt`)
+  and a how-to `README.txt`.
+
+Requests carry `Authorization: Bearer REPLACE_WITH_YOUR_TOKEN`. Replace it, or
+let a Burp session-handling rule / Autorize supply real sessions. Stored DAST
+credentials are never exported or sent to Burp this way.
+
+## Access-control findings: how they are verified
+
+The regex pre-pass flags candidate problems (missing authentication, missing
+role check, IDOR). These are hints, not findings:
+
+1. Identifiers are classified as `numeric` (enumerable — IDOR directly
+   exploitable), `uuid` (hard to guess — read-only routes are not flagged,
+   write routes are low severity) or `unknown`.
+2. If authentication can't be located for most routes, one "authentication
+   mechanism not located" question replaces hundreds of per-route flags.
+3. When AI review is on, flags are **not** shown until the AI gives each one
+   an explicit verdict (confirmed / rejected / needs a human). Flags the main
+   endpoint review skips get a focused second-chance triage with the handler
+   code. Rejected flags, with the AI's reason, are listed under
+   "why rejected?" on the Access control tab.
+4. Anything the model still couldn't answer is kept but marked
+   **unverified heuristic** and hidden by default (tick "Unverified
+   heuristics" to see them).
+
+For an existing scan with a flood of old flags, use **↻ Access control
+(AI-verify)** on the scan page: it re-runs only this step and replaces only
+the access-control findings.

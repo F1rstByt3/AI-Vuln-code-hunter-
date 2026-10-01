@@ -195,7 +195,7 @@ async def test_target_and_credential_api_masks_secrets():
         scans = await _make_scan(pid)
         r = await client.post(f"/api/scans/{scans}/dast",
                               json={"target_id": t["id"], "authorize": False})
-        assert r.status_code == 400 and "authorization" in r.text.lower()
+        assert r.status_code == 400 and "authorisation" in r.text.lower()
 
 
 async def _make_scan(project_id: str) -> str:

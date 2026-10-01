@@ -402,7 +402,7 @@ def _bac_tests(ep: dict) -> list[str]:
         tests.append(f"As user A, request user B's object ({ids}) — expect 403/404 (IDOR/BOLA).")
     if ep.get("privileged") or ep.get("authz") in ("none", "unclear"):
         tests.append("Replay with a low-privilege user's session — expect 403 "
-                     "(missing function-level authorization).")
+                     "(missing function-level authorisation).")
     if ep.get("state_changing"):
         tests.append("Add privileged fields to the body (role, is_admin, owner_id, "
                      "tenant_id) — expect them ignored (mass assignment).")
@@ -468,7 +468,7 @@ async def export_openapi(
                 "security": [] if public else [{"bearerAuth": []}, {"cookieAuth": []}],
                 "x-access": {k: ep.get(k) for k in (
                     "authn", "authz", "risk", "auth_scope", "heuristic_risk", "role_hints",
-                    "ownership_hints", "id_params", "privileged", "state_changing")
+                    "ownership_hints", "id_params", "id_kind", "privileged", "state_changing")
                     if ep.get(k) not in (None, [], "")},
                 "x-bac-tests": tests,
             }

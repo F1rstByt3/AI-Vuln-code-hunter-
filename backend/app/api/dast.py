@@ -128,7 +128,7 @@ async def launch_run(scan_id: str, body: DastRunCreate,
         raise HTTPException(400, "target belongs to a different project")
     if not body.authorize:
         raise HTTPException(
-            400, "authorization required: confirm you are permitted to test "
+            400, "authorisation required: confirm you are permitted to test "
             f"{target.base_url} before launching a live run")
     if body.active_scan and not target.active_scan_enabled:
         raise HTTPException(400, "active scan is not enabled for this target")

@@ -346,12 +346,21 @@ function IntegrationsTab({ mcp, reload }: { mcp: McpServer[]; reload: () => Prom
   return (
     <div className="space-y-6">
       <Card className="p-5">
-        <h2 className="font-semibold mb-1">Burp Suite (for live DAST active scanning)</h2>
+        <h2 className="font-semibold mb-1">Burp Suite</h2>
         <p className="text-xs text-muted mb-3">
-          Connect Burp so a DAST run can seed the authenticated request surface and ingest
-          its active-scan issues. Install Burp's <b>MCP Server</b> extension (Burp 2025.x,
-          Pro for active scanning), note its URL, then register it below. Access-control
-          confirmation needs no Burp — this only adds the broad injection/XSS scanning.
+          Install Burp's <b>MCP Server</b> extension (Burp 2025.x; Pro for active scanning), note
+          its URL, then register it below. Once registered you can:
+        </p>
+        <ul className="text-xs text-slate-300 mb-3 space-y-1 list-disc pl-5">
+          <li><b>Manual testing</b> — send any finding with an endpoint straight to <b>Repeater</b> or
+            <b> Intruder</b> (object ids pre-marked with §) from the scan page, one at a time or in bulk.</li>
+          <li><b>Live DAST</b> — seed the authenticated request surface into Burp and pull its
+            active-scan issues back as findings.</li>
+        </ul>
+        <p className="text-[11px] text-muted mb-3">
+          No Burp MCP? Use <b>Copy for Burp</b> on a finding or the <b>Burp pack (Intruder)</b> download
+          on the scan page. Requests carry a placeholder Authorization header — stored DAST
+          credentials never leave the app.
         </p>
         {burp ? (
           <div className="flex items-center gap-2 text-sm px-3 py-2 rounded-lg border border-emerald-500/40 bg-emerald-500/5">

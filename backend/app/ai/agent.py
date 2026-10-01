@@ -595,14 +595,19 @@ async def run_review(
         if reviewed:
             acc_findings, endpoints_out, access_stats = reviewed
         else:
-            # Skipped: keep the heuristic flags so nothing is lost.
-            acc_findings = [dict(h) for h in (access_map or {}).get("candidates") or []]
+            # Skipped: keep the heuristic flags so nothing is lost — marked
+            # unverified and capped low-confidence, never mistaken for AI output.
+            acc_findings = [{**h, "unverified": True,
+                             "confidence": min(float(h.get("confidence") or 0.3), 0.3)}
+                            for h in (access_map or {}).get("candidates") or []]
         acc_findings, _ = await vchecks.check_evidence(
             acc_findings, read_file, [f["path"] for f in files])
         raw_findings += acc_findings
     else:
         if access_map and access_map.get("candidates"):
-            raw_findings += [dict(h) for h in access_map["candidates"]]
+            raw_findings += [{**h, "unverified": True,
+                              "confidence": min(float(h.get("confidence") or 0.3), 0.3)}
+                             for h in access_map["candidates"]]
         await stage("ai_access", "skipped")
     coverage["endpoints"] = {"total": len(endpoints_out),
                              "assessed": access_stats.get("assessed", 0)}
@@ -772,7 +777,8 @@ async def _run_judge_phase(
 # Metadata the judge tends not to echo back; re-attached by location so the
 # verifier and UI still see evidence status, agreement and endpoint links.
 _CARRY_KEYS = ("evidence", "reviewer_agreement", "endpoint", "endpoint_id", "origin",
-               "rule", "reviewed_by")
+               "rule", "reviewed_by", "flag_id", "ai_verdict", "unverified", "id_kind",
+               "affected_endpoints")
 
 
 def _carry_meta(judged: list[dict], inputs: list[dict]) -> list[dict]:
@@ -1312,6 +1318,11 @@ def _normalize(f: dict, judged_by: str | None) -> dict | None:
         "endpoint_id": f.get("endpoint_id"),
         "origin": f.get("origin"),
         "rule": f.get("rule"),
+        "flag_id": f.get("flag_id"),
+        "ai_verdict": f.get("ai_verdict"),
+        "unverified": f.get("unverified"),
+        "id_kind": f.get("id_kind"),
+        "affected_endpoints": f.get("affected_endpoints"),
     }
 
 

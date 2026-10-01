@@ -98,6 +98,35 @@ _PARAM_RE = re.compile(
     r"|\(\?P<([A-Za-z_]\w*)>"
 )
 
+# How guessable an object identifier is. Unguessable ids (UUIDv4, random
+# tokens) don't *fix* missing object-level authorisation, but they make IDOR
+# far harder to exploit — so those flags are down-ranked, not raised as noise.
+_UUID_HINT_RE = re.compile(r"""(?ix)
+    \buuid\b | \bguid\b | <uuid: | \{\w+:(?:uuid|guid)\} | :\w+\(\[0-9a-f
+  | parseuuidpipe | isuuid | @isuuid | uuid\.uuid\( | \buuid\s*\( | \.uuid\(\)
+  | :\s*uuid\b | \buuid\s+\w+ | \bguid\s+\w+ | uuid\.parse | uuid\.fromstring
+  | \[0-9a-f\]\{8\} | objectid\.isvalid | isvalidobjectid | nanoid | cuid
+""")
+_NUMERIC_HINT_RE = re.compile(r"""(?ix)
+    <int: | \{\w+:(?:int|long|\\d\+)\} | :\w+\(\\d\+\) | parseintpipe
+  | \bparseint\( | \bnumber\(\s*req\. | \bint\(\s*\w*id | :\s*int\b
+  | \b(?:int|long|integer)\s+\w*id\b
+  | strconv\.atoi | \.to_i\b | \\d\+
+""")
+
+
+def _id_kind(param: str, path: str, text: str) -> str:
+    """uuid | numeric | unknown for an id path param."""
+    p = param.lower()
+    if any(t in p for t in ("uuid", "guid", "token", "hash", "slug")):
+        return "uuid" if "slug" not in p else "unknown"
+    if _UUID_HINT_RE.search(path) or _UUID_HINT_RE.search(text):
+        return "uuid"
+    if _NUMERIC_HINT_RE.search(path) or _NUMERIC_HINT_RE.search(text):
+        return "numeric"
+    return "unknown"
+
+
 _SENSITIVE_RE = re.compile(
     r"(?i)(admin|internal|debug|manage|config|setting|user|account|role|permission|"
     r"privilege|token|secret|apikey|api-key|api_key|password|billing|payment|invoice|"
@@ -342,6 +371,9 @@ def _enrich(ep: dict, idx: int, lines_of, file_auth_of, all_paths: list[str],
 
     params = _path_params(path)
     id_params = [p for p in params if _is_id_param(p)]
+    kinds = {_id_kind(p, path, both) for p in id_params}
+    id_kind = ("numeric" if "numeric" in kinds else "unknown" if "unknown" in kinds
+               else "uuid" if kinds else None)
     haystack = f"{path} {ep.get('handler') or ''}"
     sensitive = bool(_SENSITIVE_RE.search(haystack))
     privileged = bool(_PRIVILEGED_RE.search(path)) or bool(
@@ -354,7 +386,8 @@ def _enrich(ep: dict, idx: int, lines_of, file_auth_of, all_paths: list[str],
         risk = "high"
     elif privileged and not role_hints and not likely_public:
         risk = "high"
-    elif (unauth and sensitive) or (id_params and not ownership_hints and not likely_public):
+    elif (unauth and sensitive) or (id_params and id_kind != "uuid"
+                                    and not ownership_hints and not likely_public):
         risk = "medium"
     else:
         risk = "low"
@@ -373,6 +406,7 @@ def _enrich(ep: dict, idx: int, lines_of, file_auth_of, all_paths: list[str],
         "auth_scope": scope,
         "path_params": params,
         "id_params": id_params,
+        "id_kind": id_kind,
         "state_changing": state_changing,
         "sensitive": sensitive,
         "privileged": privileged,
@@ -603,7 +637,7 @@ def _heuristic_findings(eps: list[dict], has_global_context: bool) -> list[dict]
                     f"pattern (a forgotten decorator/middleware).",
                     "high" if e["state_changing"] or e["privileged"] else "medium",
                     0.5, "CWE-862",
-                    "Apply the same authentication (and authorization) used by the "
+                    "Apply the same authentication (and authorisation) used by the "
                     "sibling routes, ideally at the router/controller level so new routes "
                     "inherit it."))
         # Same resource, authenticated everywhere, but role checks on only some.
@@ -615,7 +649,7 @@ def _heuristic_findings(eps: list[dict], has_global_context: bool) -> list[dict]
             for e in unroled:
                 add(e, _finding(
                     e, "access.inconsistent-authz",
-                    f"Inconsistent authorization: {e['method']} {e['path']} has no role "
+                    f"Inconsistent authorisation: {e['method']} {e['path']} has no role "
                     f"check while sibling routes do",
                     f"Sibling routes on '{family}' check roles/permissions ({peers}) but "
                     f"{e['method']} {e['path']} only requires authentication — any "
@@ -624,12 +658,53 @@ def _heuristic_findings(eps: list[dict], has_global_context: bool) -> list[dict]
                     "high" if e["privileged"] else "medium", 0.4, "CWE-863",
                     "Enforce the same role/permission policy as the sibling routes."))
 
+    # Systemic: when auth can't be located for most routes, the app almost
+    # certainly enforces it somewhere the regexes can't see (custom middleware,
+    # gateway, decorators with project-specific names). One finding asking a
+    # human/AI to locate it beats hundreds of per-route "missing auth" flags.
+    non_public = [e for e in eps if not e["likely_public"]]
+    unlocated = [e for e in non_public if e["auth_scope"] == "none"]
+    systemic = len(non_public) >= 15 and len(unlocated) / len(non_public) >= 0.6
+    systemic_finding = None
+    if systemic:
+        sample = ", ".join(f"{e['method']} {e['path']}" for e in unlocated[:12])
+        anchor = unlocated[0]
+        systemic_finding = {
+            **_finding(
+                anchor, "access.auth-not-located",
+                f"Authentication mechanism not located for {len(unlocated)} of "
+                f"{len(non_public)} routes",
+                f"No authentication was detected at route, controller or global level for "
+                f"{len(unlocated)}/{len(non_public)} non-public routes (e.g. {sample}). "
+                f"This usually means auth is enforced by custom middleware, an API "
+                f"gateway or project-specific decorators the static pre-pass doesn't "
+                f"recognise — per-route 'missing authentication' flags were suppressed "
+                f"to avoid noise. Confirm where authentication is enforced; if it isn't, "
+                f"every listed route is exposed.",
+                "medium", 0.3, "CWE-306",
+                "Identify the authentication layer and confirm it covers every non-public "
+                "route (ideally deny-by-default with an explicit allow-list)."),
+            "state": "needs_info",
+            "human_question": "Where is authentication enforced for these routes "
+                              "(middleware, gateway, base controller)?",
+            "endpoint": None, "endpoint_id": None,
+            "affected_endpoints": [f"{e['method']} {e['path']}" for e in unlocated[:200]],
+        }
+        # Sibling-inconsistency flags are meaningless when auth isn't located.
+        per_ep = {k: [f for f in v if f["rule"] != "access.inconsistent-authn"]
+                  for k, v in per_ep.items()}
+        per_ep = {k: v for k, v in per_ep.items() if v}
+
     flagged = set(per_ep)
     for e in eps:
         if e["likely_public"]:
             continue
         label = f"{e['method']} {e['path']}"
         exposed = e["auth_scope"] in ("none", "public")
+        # Under systemic "auth not located", only explicit opt-outs (public
+        # markers) are still worth a per-route flag.
+        if systemic and e["auth_scope"] == "none":
+            exposed = False
         # 2. Missing authentication on state-changing / sensitive routes.
         if exposed and e["id"] not in flagged and (e["state_changing"] or e["sensitive"]
                                                    or e["privileged"]):
@@ -658,22 +733,46 @@ def _heuristic_findings(eps: list[dict], has_global_context: bool) -> list[dict]
                 "Restrict the route to the privileged role (e.g. require_role('admin'), "
                 "@PreAuthorize(\"hasRole('ADMIN')\"), [Authorize(Roles=\"Admin\")])."))
         # 4. Object id in the path with no ownership check (IDOR / BOLA).
-        if e["id_params"] and not e["ownership_hints"] and not e["role_hints"]:
-            add(e, _finding(
+        #    Unguessable ids (UUIDs) on read-only routes are not flagged — the AI
+        #    review still sees them via the endpoint map; on writes they're low.
+        kind = e.get("id_kind")
+        if (e["id_params"] and not e["ownership_hints"] and not e["role_hints"]
+                and not (kind == "uuid" and not e["state_changing"])):
+            if kind == "uuid":
+                sev, conf = "low", 0.2
+                guess = (" The identifier appears to be a UUID, which makes it hard to "
+                         "guess — exploitation needs a leaked id (lists, URLs, emails, "
+                         "logs), so severity is reduced.")
+            elif kind == "numeric":
+                sev, conf = ("high" if e["state_changing"] else "medium"), 0.4
+                guess = (" The identifier appears numeric/sequential, so ids are "
+                         "trivially enumerable.")
+            else:
+                sev, conf = ("high" if e["state_changing"] else "medium"), 0.3
+                guess = ""
+            add(e, {**_finding(
                 e, "access.idor",
-                f"Possible IDOR / missing object-level authorization: {label}",
+                f"Possible IDOR / missing object-level authorisation: {label}",
                 f"{label} takes an object identifier ({', '.join(e['id_params'])}) from "
                 f"the client, but the handler shows no ownership or tenant check — a "
-                f"user may read or modify another user's object by changing the id.",
-                "high" if e["state_changing"] else "medium", 0.3, "CWE-639",
+                f"user may read or modify another user's object by changing the id."
+                + guess,
+                sev, conf, "CWE-639",
                 "Scope the lookup to the caller (e.g. WHERE id = :id AND owner_id = "
                 ":current_user) or enforce an object-level policy before returning or "
-                "mutating it."))
+                "mutating it."), "id_kind": kind})
 
     out = [f for fs in per_ep.values() for f in fs]
+    if systemic_finding:
+        out.append(systemic_finding)
     rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
     out.sort(key=lambda f: (rank.get(f["severity"], 9), -f["confidence"]))
-    return out[:_MAX_HEURISTIC_FINDINGS]
+    out = out[:_MAX_HEURISTIC_FINDINGS]
+    # Stable ids so the AI review can give an explicit verdict per flag.
+    for n, f in enumerate(out):
+        f["flag_id"] = f"h{n}"
+        f["origin"] = "heuristic"
+    return out
 
 
 def _finding(ep: dict, rule: str, title: str, description: str, severity: str,

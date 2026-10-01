@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import { BurpActions, BurpBulkSend } from "../components/BurpActions";
 import { Button, Card, SeverityBadge, Spinner, StateBadge } from "../components/ui";
 import { DastLaunch } from "../components/DastPanel";
 import { useScanEvents } from "../hooks/useScanEvents";
@@ -151,6 +152,18 @@ export default function ScanPage() {
                 OpenAPI (Burp)
               </button>
             )}
+            {(scan.summary?.endpoints?.length ?? 0) > 0 && (
+              <button
+                onClick={() => {
+                  const base = prompt("Target base URL for the requests (blank = this project's live-test target)", "");
+                  if (base === null) return;
+                  window.open(api.burpPackUrl(scanId!, { base_url: base || undefined, min_risk: "medium" }), "_blank");
+                }}
+                title="ZIP of Intruder-ready raw requests (object ids pre-marked with §), id payload lists and a how-to — medium/high-risk endpoints"
+                className="px-2 py-1 rounded text-xs border border-border hover:bg-border text-slate-300">
+                Burp pack (Intruder)
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -165,6 +178,12 @@ export default function ScanPage() {
             <Button variant="ghost" onClick={() => rerun("sonarqube")}>↻ SonarQube</Button>
           )}
           <Button variant="ghost" onClick={() => rerun("ai")}>↻ AI review</Button>
+          {(scan.summary?.endpoints?.length ?? 0) > 0 && (
+            <Button variant="ghost" onClick={() => {
+              if (confirm("Re-verify access control only? Every regex access-control flag gets an "
+                + "explicit AI verdict; this scan's access-control findings are replaced.")) rerun("access");
+            }}>↻ Access control (AI-verify)</Button>
+          )}
           <span className="text-[11px] text-muted">replaces just that stage's findings</span>
         </div>
       )}
@@ -215,7 +234,8 @@ export default function ScanPage() {
             <DastLaunch scanId={scanId!} projectId={scan.project_id} />
           )}
 
-          <FindingsPanel findings={findings} onTriage={triage} />
+          <FindingsPanel findings={findings} onTriage={triage}
+            accessStats={(scan?.summary as any)?.access_control} />
 
           {scan?.summary?.endpoints?.length > 0 && (
             <EndpointsPanel endpoints={scan.summary.endpoints} />
@@ -259,11 +279,21 @@ const SOURCE_TABS: { key: SourceBucket; label: string }[] = [
   { key: "dast", label: "Live (DAST)" },
 ];
 
-function FindingsPanel({ findings, onTriage }: {
-  findings: Finding[]; onTriage: (id: string, s: string) => void;
+function FindingsPanel({ findings: allFindings, onTriage, accessStats }: {
+  findings: Finding[]; onTriage: (id: string, s: string) => void; accessStats?: any;
 }) {
   const [grouped, setGrouped] = useState(true);
   const [tab, setTab] = useState<SourceBucket>("all");
+  const [showUnverified, setShowUnverified] = useState(false);
+  const [showDismissed, setShowDismissed] = useState(false);
+
+  // Unverified heuristic access flags and dismissed findings are noise by
+  // default — hidden unless asked for, with the hidden counts always shown.
+  const unverifiedCount = allFindings.filter((f) => f.raw?.unverified).length;
+  const dismissedCount = allFindings.filter((f) => f.state === "dismissed").length;
+  const findings = useMemo(() => allFindings.filter((f) =>
+    (showUnverified || !f.raw?.unverified) && (showDismissed || f.state !== "dismissed")),
+  [allFindings, showUnverified, showDismissed]);
 
   const counts = useMemo(() => {
     const c = { all: findings.length, semgrep: 0, sonarqube: 0, ai: 0, access: 0, dast: 0 };
@@ -297,10 +327,25 @@ function FindingsPanel({ findings, onTriage }: {
         {visible.length > 0 && (
           <span className="ml-2 text-xs text-muted">· {groups.length} issue types</span>
         )}
-        <label className="ml-auto text-xs text-muted flex items-center gap-1.5 cursor-pointer select-none">
-          <input type="checkbox" checked={grouped} onChange={(e) => setGrouped(e.target.checked)} />
-          Group by type
-        </label>
+        <div className="ml-auto flex items-center gap-4 text-xs text-muted">
+          {unverifiedCount > 0 && (
+            <label className="flex items-center gap-1.5 cursor-pointer select-none"
+              title="Regex-only access-control flags the AI could not give a verdict on">
+              <input type="checkbox" checked={showUnverified} onChange={(e) => setShowUnverified(e.target.checked)} />
+              Unverified heuristics ({unverifiedCount})
+            </label>
+          )}
+          {dismissedCount > 0 && (
+            <label className="flex items-center gap-1.5 cursor-pointer select-none">
+              <input type="checkbox" checked={showDismissed} onChange={(e) => setShowDismissed(e.target.checked)} />
+              Dismissed ({dismissedCount})
+            </label>
+          )}
+          <label className="flex items-center gap-1.5 cursor-pointer select-none">
+            <input type="checkbox" checked={grouped} onChange={(e) => setGrouped(e.target.checked)} />
+            Group by type
+          </label>
+        </div>
       </div>
       {/* Source split: Semgrep / SonarQube / AI (with a combined "All"). */}
       <div className="flex gap-1 mb-3 border-b border-border">
@@ -317,6 +362,15 @@ function FindingsPanel({ findings, onTriage }: {
           </button>
         ))}
       </div>
+      {tab === "access" && accessStats?.heuristic_flags > 0 && (
+        <AccessFlagSummary stats={accessStats} />
+      )}
+      {(tab === "access" || tab === "dast") && (
+        <div className="mb-3">
+          <BurpBulkSend findingIds={visible.filter((f) => f.raw?.endpoint && f.state !== "dismissed")
+            .sort((a, b) => (SEV_RANK[a.severity] ?? 9) - (SEV_RANK[b.severity] ?? 9)).map((f) => f.id)} />
+        </div>
+      )}
       {visible.length === 0 && (
         <div className="text-muted text-sm">
           {findings.length === 0 ? "No findings yet." : "No findings from this source."}
@@ -329,6 +383,45 @@ function FindingsPanel({ findings, onTriage }: {
             ))
           : visible.map((f) => <FindingRow key={f.id} f={f} onTriage={onTriage} />)}
       </div>
+    </div>
+  );
+}
+
+function AccessFlagSummary({ stats }: { stats: any }) {
+  const [open, setOpen] = useState(false);
+  const rejected: any[] = stats.rejected_flags || [];
+  const has = typeof stats.flags_rejected === "number";
+  return (
+    <div className="mb-3 rounded-lg border border-border bg-panel2 p-3 text-xs">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+        <span className="text-slate-300">
+          <b>{stats.heuristic_flags}</b> regex access-control flags
+          {has ? " → AI verdicts:" : " (no AI verdicts recorded for this scan)"}
+        </span>
+        {has && <>
+          <span className="text-rose-300">{stats.flags_confirmed} confirmed</span>
+          <span className="text-emerald-300">{stats.flags_rejected} rejected</span>
+          <span className="text-fuchsia-300">{stats.flags_uncertain} need a human</span>
+          {stats.flags_duplicate > 0 && <span className="text-muted">{stats.flags_duplicate} merged into AI findings</span>}
+          {stats.flags_unverified > 0 && <span className="text-amber-300">{stats.flags_unverified} unverified</span>}
+        </>}
+        {rejected.length > 0 && (
+          <button className="ml-auto text-accent-hover hover:underline" onClick={() => setOpen((o) => !o)}>
+            {open ? "hide" : "why rejected?"}
+          </button>
+        )}
+      </div>
+      {open && (
+        <div className="mt-2 max-h-64 overflow-auto space-y-1">
+          {rejected.map((r, i) => (
+            <div key={i} className="flex gap-2">
+              <span className="font-mono text-rose-200/80 shrink-0">{r.endpoint || "—"}</span>
+              <span className="text-muted shrink-0">{(r.rule || "").replace("access.", "")}</span>
+              <span className="text-slate-300">{r.reason || "(no reason given)"}{r.implicit ? " · from endpoint verdict" : ""}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -435,6 +528,20 @@ function FindingRow({ f, onTriage }: { f: Finding; onTriage: (id: string, s: str
           <span className="px-1.5 rounded font-mono bg-rose-500/15 text-rose-200">{f.raw.endpoint}</span>
         )}
         {f.file_path && <span>{f.file_path}:{f.line_start}</span>}
+        {f.raw?.ai_verdict === "confirmed" && (
+          <span className="px-1.5 rounded bg-rose-500/15 text-rose-200">AI-confirmed flag</span>
+        )}
+        {f.raw?.ai_verdict === "uncertain" && (
+          <span className="px-1.5 rounded bg-fuchsia-500/15 text-fuchsia-300">AI: needs a human</span>
+        )}
+        {f.raw?.unverified && (
+          <span className="px-1.5 rounded bg-amber-500/15 text-amber-300">unverified heuristic</span>
+        )}
+        {f.raw?.id_kind && (
+          <span className={`px-1.5 rounded ${f.raw.id_kind === "uuid" ? "bg-sky-500/15 text-sky-300" : f.raw.id_kind === "numeric" ? "bg-orange-500/15 text-orange-300" : "bg-border/60"}`}>
+            id: {f.raw.id_kind === "uuid" ? "UUID (hard to guess)" : f.raw.id_kind === "numeric" ? "numeric (enumerable)" : "unknown type"}
+          </span>
+        )}
         {f.raw?.reviewed_by && <span className="px-1.5 rounded bg-border/60">🔍 {f.raw.reviewed_by}</span>}
         {f.raw?.merged_count && f.raw.merged_count > 1 && <span>×{f.raw.merged_count} reviewers</span>}
         {f.raw?.reviewer_agreement && f.raw.reviewer_agreement.of > 1 && (
@@ -513,9 +620,10 @@ function FindingRow({ f, onTriage }: { f: Finding; onTriage: (id: string, s: str
               </Button>
             )}
             <Button variant="ghost" onClick={runAnalysis} disabled={analyzing}>
-              {analyzing ? "Analyzing…" : analysis ? "↻ Re-analyze" : "✨ AI analysis"}
+              {analyzing ? "Analysing…" : analysis ? "↻ Re-analyse" : "✨ AI analysis"}
             </Button>
           </div>
+          {f.raw?.endpoint && <BurpActions findingId={f.id} />}
 
           {showCode && (
             <CodeView code={code} highlight={f.line_start} snippet={f.code_snippet} />

@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 
 from app.api import (
     artifacts,
+    burp_manual,
     chat,
     clients,
     dast,
@@ -66,7 +67,7 @@ app.add_middleware(
 )
 
 for module in (clients, projects, artifacts, scans, findings, export, mcp, chat,
-               stream, settings_api, dast):
+               stream, settings_api, dast, burp_manual):
     app.include_router(module.router, prefix="/api")
 
 

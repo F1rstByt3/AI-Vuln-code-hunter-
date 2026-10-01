@@ -91,7 +91,7 @@ _DEFAULT_SCANNERS = ["semgrep", "sonarqube", "mcp", "ai"]
 
 # Re-runnable stages (UI buttons). Static scanners replace their own findings;
 # "ai" re-runs the reviewer/judge/exploit pipeline over current static candidates.
-RERUNNABLE_STAGES = ("semgrep", "sonarqube", "ai")
+RERUNNABLE_STAGES = ("semgrep", "sonarqube", "ai", "access")
 
 _RISK_WEIGHT = {"critical": 10.0, "high": 6.0, "medium": 3.0, "low": 1.0, "info": 0.2}
 
@@ -471,7 +471,15 @@ async def _run_scan(ctx: dict, scan_id: str) -> None:
                 if access_map:
                     endpoints = access_map["endpoints"]
                     access_findings = access_map["candidates"]
-                    if access_findings:
+                    if access_findings and "ai" in requested:
+                        # Heuristic flags are mostly false positives: hold them
+                        # back until the AI review gives each one a verdict.
+                        await emit({"type": "log", "message":
+                                    f"{len(access_findings)} heuristic access-control flags "
+                                    f"queued for AI verification (not shown as findings "
+                                    f"until verified)"})
+                    elif access_findings:
+                        access_findings = [_mark_unverified(f) for f in access_findings]
                         await _persist_findings(session, scan, access_findings)
                         await emit({"type": "finding", "finding": {
                             "_bulk": True, "count": len(access_findings)}})
@@ -522,7 +530,11 @@ async def _run_scan(ctx: dict, scan_id: str) -> None:
                                    bool(result["summary"].get("needs_review")))
                 except StageSkippedSignal:
                     await emit({"type": "log", "message":
-                                "AI review skipped; finalizing with static findings"})
+                                "AI review skipped; finalising with static findings"})
+                    if access_findings:
+                        await _delete_findings_by_source(session, scan.id, {"access"})
+                        await _persist_findings(
+                            session, scan, [_mark_unverified(f) for f in access_findings])
                     await set_stage("persist", "done")
                     await finalize(ScanStatus.completed,
                                    {**static_summary, "endpoints": endpoints}, False)
@@ -595,7 +607,7 @@ async def _ingest(session, artifact: Artifact, emit) -> str:
     artifact.meta = {**(artifact.meta or {}), "workdir": workdir}
     await session.commit()
     await emit({"type": "log", "message": f"Indexed {len(result.files)} files, "
-                                          f"{result.analyzable} analyzable"})
+                                          f"{result.analysable} analyzable"})
     return workdir
 
 
@@ -751,6 +763,14 @@ def _finding_from_dict(scan_id: str, f: dict) -> Finding:
         triaged_by=f.get("triaged_by"),
         raw=f,
     )
+
+
+def _mark_unverified(f: dict) -> dict:
+    """A heuristic access flag persisted without an AI verdict."""
+    return {**f, "unverified": True,
+            "confidence": min(float(f.get("confidence") or 0.3), 0.3),
+            "triage_note": f.get("triage_note") or
+            "Heuristic access-control flag — not verified by the AI review."}
 
 
 async def _persist_findings(session, scan: Scan, findings: list[dict]) -> None:
@@ -985,6 +1005,49 @@ async def _rerun_stage(ctx: dict, scan_id: str, stage: str, resume: bool = False
                               if k in result["summary"]}
                 if result.get("endpoints"):
                     ai_summary["endpoints"] = result["endpoints"]
+            elif stage == "access":
+                # Re-verify access control only: rebuild the (deterministic) map
+                # and give every heuristic flag an AI verdict. Replaces this
+                # scan's access-control findings; nothing else is touched.
+                from app.ai import checks as vchecks
+
+                endpoints = (scan.summary or {}).get("endpoints") or []
+                if not endpoints:
+                    raise RuntimeError("This scan has no extracted endpoints to review")
+                await store.clear()
+                access_map = await _build_access_map(endpoints, workdir, emit)
+                if not access_map:
+                    raise RuntimeError("Access-control map could not be built")
+                profile_id = (scan.config or {}).get("profile_id")
+                cfg = await get_foundry_config(session, profile_id=profile_id)
+                roles = cfg.resolve_roles(
+                    reviewer_override=(scan.config or {}).get("model") or None)
+
+                async def read_file(rel: str) -> str | None:
+                    return _safe_read(workdir, rel)
+
+                async def stage_fn(name, state, **kw):
+                    await emit({"type": "stage", "stage": name, "state": state, **kw})
+
+                async def _noop_findings(_phase, _batch):
+                    return None
+
+                acc, eps, astats = await vchecks.run_access_review(
+                    client=get_foundry_client(cfg), role=roles.reviewers[0],
+                    access_map=access_map, read_file=read_file, emit=emit, stage=stage_fn,
+                    checkpoint=controller.checkpoint, load_chunks=store.load,
+                    save_chunk=store.save, on_findings=_noop_findings,
+                    concurrency=roles.concurrency)
+                await store.clear()
+                from app.ai.agent import _normalize
+                final = [n for n in (_normalize(f, None) for f in acc) if n]
+                await _delete_findings_by_source(session, scan_id, {"access"})
+                await _persist_findings(session, scan, final)
+                await emit({"type": "finding", "finding": {"_final": True}})
+                ai_summary = {"endpoints": eps, "access_control": {
+                    **(access_map.get("stats") or {}), **astats,
+                    "global_auth": (access_map.get("global_auth") or [])[:50],
+                    "mechanisms": access_map.get("mechanisms") or []}}
             else:
                 raise ValueError(f"unknown stage: {stage}")
 
