@@ -1,0 +1,887 @@
+"""AI inference client — supports Azure AI Foundry, local models, and mock.
+
+Three implementations behind one interface:
+  * AzureFoundryClient  — real inference via the Azure AI Foundry v1 API or
+                          any OpenAI-compatible endpoint (Ollama, vLLM, LM
+                          Studio, llama.cpp, etc.). Auto-detects local vs
+                          Azure from the endpoint URL.
+  * MockFoundryClient   — deterministic, offline. Lets the entire review flow
+                          run (and stream) with zero setup, so you can demo.
+
+Connection settings come from a FoundryConfig, which the app builds at runtime
+by layering the in-app Settings (DB) over .env defaults — so the endpoint, API
+key and models can be changed from the UI without a redeploy.
+
+  No endpoint             => mock mode
+  localhost / 127.0.0.1   => local mode (Ollama, vLLM, etc.)
+  *.openai.azure.com      => Azure AI Foundry
+
+Transport: some Azure models (gpt-5-codex, o-series) are *Responses API only*
+and reject Chat Completions. We auto-detect from the model name unless a role
+pins it explicitly. Local models always use Chat Completions.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
+from urllib.parse import urlparse
+
+from app.config import settings
+
+log = logging.getLogger(__name__)
+
+_CTX_RE = re.compile(r"<<CONTEXT_JSON>>(.*?)<<END>>", re.DOTALL)
+_FINDINGS_RE = re.compile(r"<<FINDINGS_JSON>>(.*?)<<END>>", re.DOTALL)
+_EXPLOIT_RE = re.compile(r"<<EXPLOIT_JSON>>(.*?)<<END>>", re.DOTALL)
+_VERIFY_RE = re.compile(r"<<VERIFY_JSON>>(.*?)<<END>>", re.DOTALL)
+_ACCESS_RE = re.compile(r"<<ACCESS_JSON>>(.*?)<<END>>", re.DOTALL)
+_TRIAGE_RE = re.compile(r"<<TRIAGE_JSON>>(.*?)<<END>>", re.DOTALL)
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+
+# Models that only speak the Responses API (no Chat Completions).
+_RESPONSES_HINTS = ("codex", "o1", "o1-", "o3", "o3-", "o4", "o4-", "-reasoning")
+
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "host.docker.internal"}
+
+
+def _is_local_endpoint(endpoint: str | None) -> bool:
+    if not endpoint:
+        return False
+    try:
+        host = urlparse(endpoint).hostname or ""
+        return host in _LOCAL_HOSTS or host.startswith("192.168.") or host.startswith("10.")
+    except Exception:
+        return False
+
+
+def _auto_transport(model: str | None, local: bool = False) -> str:
+    if local:
+        return "chat"
+    m = (model or "").lower()
+    if any(h in m for h in _RESPONSES_HINTS) or m.startswith(("o1", "o3", "o4")):
+        return "responses"
+    return "chat"
+
+
+# Local open-weight models that think before answering.
+_LOCAL_REASONING_HINTS = ("gpt-oss", "qwen3", "deepseek-r1", "magistral", "phi4-reasoning",
+                          "qwq", "-thinking")
+
+
+def _is_reasoning(model: str | None) -> bool:
+    m = (model or "").lower()
+    return ("codex" in m or m.startswith(("o1", "o3", "o4")) or "gpt-5" in m
+            or any(h in m for h in _LOCAL_REASONING_HINTS))
+
+
+def classify_ai_error(exc: BaseException) -> tuple[str, str]:
+    """Map a model/HTTP exception to a short cause tag + an actionable hint, so
+    a failed scan can say *why* instead of a stack trace. Returns
+    (cause, hint). cause is one of: auth, model, rate_limit, context, timeout,
+    endpoint, bad_output, unknown."""
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    code = (getattr(getattr(exc, "body", None), "get", lambda *_: None)("code")
+            if hasattr(getattr(exc, "body", None), "get") else None)
+    msg = f"{type(exc).__name__}: {exc}".lower()
+
+    def has(*subs: str) -> bool:
+        return any(s in msg for s in subs)
+
+    if status in (401, 403) or has("invalid_api_key", "api key", "unauthorized",
+                                   "forbidden", "access denied", "permission",
+                                   "authentication"):
+        return "auth", ("Check the API key (or Entra credentials) in Settings → AI "
+                        "Connection. For Azure the key must belong to the same resource "
+                        "as the endpoint.")
+    if status == 404 or code == "DeploymentNotFound" or has(
+            "does not exist", "deploymentnotfound", "model not found",
+            "no deployment", "unknown model", "not found"):
+        return "model", ("The model / deployment name doesn't match one on the endpoint. "
+                         "Use the exact deployment name — click Test connection in "
+                         "Settings to list what's available.")
+    if status == 429 or has("rate limit", "too many requests", "quota",
+                            "insufficient_quota", "throttl"):
+        return "rate_limit", ("The endpoint is rate-limiting. Lower 'Parallel requests' in "
+                              "the profile (try 1–2), or request higher quota.")
+    if has("context_length_exceeded", "maximum context", "context window",
+           "reduce the length", "too many tokens"):
+        return "context", ("Prompts exceed the model's context window. Lower the profile's "
+                           "'Context window', or the model's real window is smaller than "
+                           "configured.")
+    if has("timeout", "timed out", "deadline"):
+        return "timeout", ("The model took too long (>10 min/call). It may be too slow for "
+                           "the batch size, or the server is overloaded. For local models "
+                           "use a smaller/faster model or raise the context window.")
+    if has("connection", "connect", "name or service not known", "econnrefused",
+           "nodename nor servname", "failed to establish", "getaddrinfo",
+           "ssl", "certificate", "network"):
+        return "endpoint", ("Can't reach the endpoint. Check the URL. From inside Docker a "
+                            "local model must be at http://host.docker.internal:<port>, "
+                            "not localhost.")
+    if has("json", "no parseable", "no usable json", "unparseable", "parse"):
+        return "bad_output", ("The model didn't return usable JSON — usually too small for "
+                              "structured output, or the context window is set larger than "
+                              "the server actually loads (prompts get truncated).")
+    return "unknown", "See the worker log for the full error (docker compose logs -f worker)."
+
+
+def ai_error_summary(exc: BaseException) -> str:
+    """One-line '[cause] message — hint' for a user-facing scan error."""
+    cause, hint = classify_ai_error(exc)
+    detail = f"{type(exc).__name__}: {exc}"
+    return f"[{cause}] {detail[:400]} — {hint}"
+
+
+@dataclass
+class TokenUsage:
+    """Per-model token accounting accumulated over the lifetime of a client.
+
+    One client instance is built per AI review, so this captures the whole
+    run's spend. Keyed by deployment name; the worker persists ``to_dict()``
+    into the scan summary so the UI can show usage per model.
+    """
+
+    by_model: dict[str, dict[str, int]] = field(default_factory=dict)
+
+    def add(self, model: str | None, prompt: int, completion: int) -> None:
+        m = model or "unknown"
+        e = self.by_model.setdefault(
+            m, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "calls": 0}
+        )
+        p, c = int(prompt or 0), int(completion or 0)
+        e["prompt_tokens"] += p
+        e["completion_tokens"] += c
+        e["total_tokens"] += p + c
+        e["calls"] += 1
+
+    def to_dict(self) -> dict:
+        return {
+            "by_model": self.by_model,
+            "total_tokens": sum(m["total_tokens"] for m in self.by_model.values()),
+            "prompt_tokens": sum(m["prompt_tokens"] for m in self.by_model.values()),
+            "completion_tokens": sum(m["completion_tokens"] for m in self.by_model.values()),
+            "calls": sum(m["calls"] for m in self.by_model.values()),
+        }
+
+
+def _usage_pair(usage) -> tuple[int, int]:
+    """Normalize Chat Completions (prompt/completion_tokens) and Responses
+    (input/output_tokens) usage objects into (prompt, completion)."""
+    if not usage:
+        return 0, 0
+    p = getattr(usage, "prompt_tokens", None)
+    if p is None:
+        p = getattr(usage, "input_tokens", 0)
+    c = getattr(usage, "completion_tokens", None)
+    if c is None:
+        c = getattr(usage, "output_tokens", 0)
+    return int(p or 0), int(c or 0)
+
+
+@dataclass
+class ModelRole:
+    """One model assignment: which deployment, how to call it, how hard to think."""
+
+    deployment: str
+    transport: str = "auto"           # auto | chat | responses
+    reasoning_effort: str | None = None  # low | medium | high (reasoning/codex only)
+
+    def effective_transport(self, local: bool = False) -> str:
+        t = (self.transport or "auto").lower()
+        return _auto_transport(self.deployment, local=local) if t == "auto" else t
+
+    @classmethod
+    def parse(cls, data) -> ModelRole | None:
+        if not data:
+            return None
+        if isinstance(data, str):
+            return cls(deployment=data)
+        if isinstance(data, dict) and data.get("deployment"):
+            return cls(
+                deployment=str(data["deployment"]),
+                transport=str(data.get("transport", "auto")),
+                reasoning_effort=data.get("reasoning_effort"),
+            )
+        return None
+
+    def to_dict(self) -> dict:
+        return {
+            "deployment": self.deployment,
+            "transport": self.transport,
+            "reasoning_effort": self.reasoning_effort,
+        }
+
+
+@dataclass
+class ReviewRoles:
+    """Resolved model assignments for one scan."""
+
+    chat: ModelRole
+    reviewers: list[ModelRole]
+    judge: ModelRole | None
+    exploit: ModelRole | None = None  # writes PoC / where-to-look / risk
+    verifier: ModelRole | None = None  # adversarial false-positive re-check
+    # Profile tuning: explicit context window (tokens) for batch sizing and the
+    # number of parallel requests. None = auto-detect / global default. Local
+    # servers (Ollama etc.) usually want a small window and concurrency 1.
+    context_tokens: int | None = None
+    concurrency: int | None = None
+
+    @property
+    def verifier_or_fallback(self) -> ModelRole:
+        return self.verifier or self.judge or self.reviewers[0]
+
+
+@dataclass
+class FoundryConfig:
+    """Effective connection config + model-role assignments."""
+
+    endpoint: str | None = None
+    api_key: str | None = None
+    deployment: str = "gpt-codex"     # the default/fallback model
+    api_version: str = "preview"
+    tenant_id: str | None = None
+    client_id: str | None = None
+    client_secret: str | None = None
+    use_agent_service: bool = False
+    # "v1" = new Foundry Models v1 API (OpenAI client, base_url .../openai/v1/);
+    # "azure" = legacy AzureOpenAI (/openai/deployments/{dep}/...?api-version=);
+    # "local" = OpenAI-compatible local server (Ollama, vLLM, LM Studio).
+    api_style: str = "v1"
+    # Multi-model roles (all optional; fall back to `deployment`).
+    chat_model: ModelRole | None = None
+    reviewer_models: list[ModelRole] = field(default_factory=list)
+    judge_model: ModelRole | None = None
+    exploit_model: ModelRole | None = None  # PoC / exploitation analyst
+    verifier_model: ModelRole | None = None  # FP verifier (falls back to judge)
+    context_tokens: int | None = None
+    concurrency: int | None = None
+
+    @property
+    def mock(self) -> bool:
+        return not self.endpoint
+
+    @property
+    def is_local(self) -> bool:
+        return (self.api_style or "").lower() == "local" or _is_local_endpoint(self.endpoint)
+
+    def resolve_roles(self, reviewer_override: str | None = None) -> ReviewRoles:
+        fallback = ModelRole(deployment=self.deployment)
+        chat = self.chat_model or fallback
+        if reviewer_override:
+            reviewers = [ModelRole(deployment=reviewer_override)]
+        else:
+            reviewers = list(self.reviewer_models) or [fallback]
+        return ReviewRoles(
+            chat=chat, reviewers=reviewers, judge=self.judge_model,
+            exploit=self.exploit_model, verifier=self.verifier_model,
+            context_tokens=self.context_tokens, concurrency=self.concurrency,
+        )
+
+    @classmethod
+    def from_settings(cls) -> FoundryConfig:
+        reviewers = [
+            ModelRole(deployment=d.strip())
+            for d in (settings.foundry_reviewer_models or "").split(",")
+            if d.strip()
+        ]
+        return cls(
+            endpoint=settings.foundry_endpoint,
+            api_key=settings.foundry_api_key,
+            deployment=settings.foundry_deployment,
+            api_version=settings.foundry_api_version,
+            tenant_id=settings.azure_tenant_id,
+            client_id=settings.azure_client_id,
+            client_secret=settings.azure_client_secret,
+            use_agent_service=settings.foundry_use_agent_service,
+            api_style=settings.foundry_api_style,
+            chat_model=ModelRole.parse(settings.foundry_chat_model),
+            reviewer_models=reviewers,
+            judge_model=ModelRole.parse(settings.foundry_judge_model),
+            exploit_model=ModelRole.parse(settings.foundry_exploit_model),
+        )
+
+
+class FoundryClient(ABC):
+    """Transport-aware inference. `transport` is auto | chat | responses."""
+
+    @abstractmethod
+    def stream(
+        self, messages: list[dict], *, model: str | None = None, transport: str = "auto",
+        temperature: float = 0.2, reasoning_effort: str | None = None,
+        cache_key: str | None = None,
+    ) -> AsyncIterator[str]: ...
+
+    @abstractmethod
+    async def complete_json(
+        self, messages: list[dict], *, model: str | None = None, transport: str = "auto",
+        temperature: float = 0.1, reasoning_effort: str | None = None,
+        cache_key: str | None = None,
+    ) -> dict: ...
+
+    @abstractmethod
+    async def list_models(self) -> list[str]:
+        """Deployments/models available from the configured project/server."""
+
+    async def preflight(self, *, model: str | None = None, transport: str = "auto") -> None:
+        """A tiny round-trip to prove the endpoint/key/model work before a long
+        run. Raises the provider's exception on failure (callers classify it)."""
+        await self.complete_json(
+            [{"role": "system", "content": "You reply only with JSON."},
+             {"role": "user", "content": 'Reply with exactly {"ok": true}.'}],
+            model=model, transport=transport, cache_key="hunter-preflight")
+
+    def chat_stream(self, messages, temperature: float = 0.2, model: str | None = None):
+        return self.stream(messages, model=model, transport="chat", temperature=temperature)
+
+    async def chat_json(self, messages, temperature: float = 0.1, model: str | None = None):
+        return await self.complete_json(
+            messages, model=model, transport="chat", temperature=temperature
+        )
+
+
+def _entra_token(cfg: FoundryConfig, scope: str) -> str:
+    if cfg.client_id and cfg.client_secret:
+        from azure.identity import ClientSecretCredential
+
+        cred = ClientSecretCredential(cfg.tenant_id, cfg.client_id, cfg.client_secret)
+    else:
+        from azure.identity import DefaultAzureCredential
+
+        cred = DefaultAzureCredential()
+    return cred.get_token(scope).token
+
+
+def _resolve_base_url(endpoint: str, api_style: str) -> str:
+    """Build the OpenAI client base_url from the user-provided endpoint.
+
+    Local servers (Ollama, vLLM, LM Studio) use /v1 directly.
+    Azure Foundry v1 API uses /openai/v1/.
+    If the URL already ends with /v1, use it as-is.
+    """
+    base = endpoint.rstrip("/")
+    lower = base.lower()
+    if lower.endswith("/v1") or lower.endswith("/openai/v1"):
+        return base + "/"
+    style = (api_style or "v1").lower()
+    if style == "local" or _is_local_endpoint(endpoint):
+        return base + "/v1/"
+    return base + "/openai/v1/"
+
+
+def _split_messages(messages: list[dict]) -> tuple[str, list[dict]]:
+    """Responses API takes system text as `instructions` and the rest as `input`."""
+    instructions = "\n\n".join(
+        str(m.get("content", "")) for m in messages if m.get("role") == "system"
+    )
+    inp = [
+        {"role": m["role"], "content": str(m.get("content", ""))}
+        for m in messages
+        if m.get("role") != "system"
+    ]
+    return instructions, inp
+
+
+# Reasoning models served locally (Qwen3, DeepSeek-R1, gpt-oss via some
+# servers) can prefix their answer with visible chain-of-thought, which often
+# contains braces that would derail the JSON extraction below.
+_THINK_RE = re.compile(r"<(think|thinking|reasoning)>.*?</\1>", re.DOTALL | re.IGNORECASE)
+
+
+def _parse_json(text: str | None) -> dict:
+    if not text:
+        return {}
+    text = _THINK_RE.sub("", text).strip()
+    if "</think>" in text:  # opening tag was stripped by the server
+        text = text.split("</think>", 1)[1].strip()
+    fence = _JSON_FENCE_RE.search(text)
+    if fence:
+        text = fence.group(1).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if 0 <= start < end:
+            try:
+                return json.loads(text[start : end + 1])
+            except json.JSONDecodeError:
+                pass
+        log.warning("unparseable model output (%d chars): %r", len(text), text[:400])
+        return {}
+
+
+class InferenceClient(FoundryClient):
+    """Connects to Azure AI Foundry OR any OpenAI-compatible server (Ollama,
+    vLLM, LM Studio, llama.cpp, text-generation-inference, etc.).
+
+    Auto-detects local vs Azure from the endpoint URL and adjusts behaviour:
+    - Local: always Chat Completions, no api-version, json_object mode optional
+    - Azure v1: /openai/v1/ base, Responses API for codex/o-series
+    - Azure legacy: AzureOpenAI client with api-version query param
+    """
+
+    def __init__(self, cfg: FoundryConfig) -> None:
+        self.cfg = cfg
+        self.usage = TokenUsage()
+        self._local = cfg.is_local
+        self._azure_style = (cfg.api_style or "v1").lower() == "azure" and not self._local
+        if self._azure_style:
+            self._client = self._build_azure(cfg)
+        else:
+            self._client = self._build_openai(cfg)
+
+    # Per-request timeout (seconds). Reasoning models can take minutes on
+    # large batches, but anything beyond 10 min is a hang, not deep thought.
+    REQUEST_TIMEOUT = 600
+
+    @staticmethod
+    def _build_openai(cfg: FoundryConfig):
+        from openai import AsyncOpenAI
+
+        base_url = _resolve_base_url(cfg.endpoint or "", cfg.api_style or "v1")
+        local = cfg.is_local
+
+        # API version: local servers don't need it; Azure v1 uses "preview"
+        ver = (cfg.api_version or "").strip() if not local else ""
+        if ver and re.match(r"^\d{4}-\d{2}-\d{2}", ver):
+            ver = "preview"
+        default_query = {"api-version": ver} if ver else None
+
+        if cfg.api_key:
+            api_key = cfg.api_key
+        elif local:
+            api_key = "not-needed"
+        else:
+            api_key = _entra_token(cfg, scope="https://ai.azure.com/.default")
+
+        return AsyncOpenAI(
+            base_url=base_url, api_key=api_key, default_query=default_query,
+            timeout=600,  # per-request; reasoning models can be slow
+        )
+
+    @staticmethod
+    def _build_azure(cfg: FoundryConfig):
+        from openai import AsyncAzureOpenAI
+
+        kwargs: dict = dict(azure_endpoint=cfg.endpoint, api_version=cfg.api_version)
+        if cfg.api_key:
+            kwargs["api_key"] = cfg.api_key
+        elif cfg.client_id and cfg.client_secret:
+            from azure.identity import ClientSecretCredential, get_bearer_token_provider
+
+            cred = ClientSecretCredential(cfg.tenant_id, cfg.client_id, cfg.client_secret)
+            kwargs["azure_ad_token_provider"] = get_bearer_token_provider(
+                cred, "https://cognitiveservices.azure.com/.default"
+            )
+        else:
+            from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+
+            kwargs["azure_ad_token_provider"] = get_bearer_token_provider(
+                DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"
+            )
+        kwargs["timeout"] = 600
+        return AsyncAzureOpenAI(**kwargs)
+
+    def _transport_for(self, model: str | None, transport: str) -> str:
+        t = (transport or "auto").lower()
+        return _auto_transport(model or self.cfg.deployment, local=self._local) if t == "auto" else t
+
+    def _cache_kw(self, cache_key: str | None) -> dict:
+        """prompt_cache_key routes identical prompt prefixes (our static system
+        prompts) to the provider's prompt cache, cutting repeat-input cost.
+        Local servers don't support it."""
+        return {"prompt_cache_key": cache_key} if (cache_key and not self._local) else {}
+
+    async def stream(self, messages, *, model=None, transport="auto",
+                     temperature=0.2, reasoning_effort=None, cache_key=None):
+        deployment = model or self.cfg.deployment
+        t = self._transport_for(deployment, transport)
+        log.info("stream: base_url=%s local=%s deployment=%s transport=%s",
+                 str(self._client.base_url), self._local, deployment, t)
+        if t == "responses" and not self._local:
+            async for tok in self._responses_stream(
+                messages, deployment, reasoning_effort, cache_key):
+                yield tok
+        else:
+            # include_usage adds a final usage-only chunk; some local servers
+            # reject the option, so fall back without it.
+            create_kw = dict(model=deployment, messages=messages,
+                             temperature=temperature, stream=True,
+                             **self._cache_kw(cache_key))
+            try:
+                stream = await self._client.chat.completions.create(
+                    **create_kw, stream_options={"include_usage": True})
+            except Exception:  # noqa: BLE001
+                stream = await self._client.chat.completions.create(**create_kw)
+            async for chunk in stream:
+                if getattr(chunk, "usage", None):
+                    self.usage.add(deployment, *_usage_pair(chunk.usage))
+                if chunk.choices and (delta := chunk.choices[0].delta.content):
+                    yield delta
+
+    async def complete_json(self, messages, *, model=None, transport="auto",
+                            temperature=0.1, reasoning_effort=None, cache_key=None):
+        deployment = model or self.cfg.deployment
+        t = self._transport_for(deployment, transport)
+        log.info("complete_json: deployment=%s transport=%s local=%s", deployment, t, self._local)
+
+        if t == "responses" and not self._local:
+            instructions, inp = _split_messages(messages)
+            kwargs: dict = dict(model=deployment, input=inp, **self._cache_kw(cache_key))
+            if instructions:
+                kwargs["instructions"] = instructions
+            if reasoning_effort and _is_reasoning(deployment):
+                kwargs["reasoning"] = {"effort": reasoning_effort}
+            resp = await self._client.responses.create(**kwargs)
+            self.usage.add(deployment, *_usage_pair(getattr(resp, "usage", None)))
+            return _parse_json(getattr(resp, "output_text", None))
+
+        # Chat Completions — try json_object mode, fall back to plain if unsupported.
+        # reasoning_effort: honoured by reasoning models on local servers
+        # (Ollama maps it for gpt-oss / Qwen3 thinking); dropped if refused.
+        extra = {"reasoning_effort": reasoning_effort} if reasoning_effort else {}
+        try:
+            resp = await self._chat_create(
+                model=deployment, messages=messages, temperature=temperature,
+                response_format={"type": "json_object"}, **extra, **self._cache_kw(cache_key),
+            )
+            self.usage.add(deployment, *_usage_pair(getattr(resp, "usage", None)))
+            return _parse_json(resp.choices[0].message.content)
+        except Exception as e:
+            if self._local and "json" in str(e).lower():
+                # Model doesn't support json_object mode; retry without it
+                log.warning("json_object mode unsupported by %s, retrying plain", deployment)
+                resp = await self._chat_create(
+                    model=deployment, messages=messages, temperature=temperature, **extra,
+                )
+                self.usage.add(deployment, *_usage_pair(getattr(resp, "usage", None)))
+                return _parse_json(resp.choices[0].message.content)
+            raise
+
+    async def _chat_create(self, **kwargs):
+        """chat.completions.create, retrying without reasoning_effort if the
+        server/model rejects that parameter."""
+        try:
+            return await self._client.chat.completions.create(**kwargs)
+        except Exception as e:
+            if "reasoning_effort" in kwargs and "reasoning" in str(e).lower():
+                log.warning("reasoning_effort not supported by %s; retrying without",
+                            kwargs.get("model"))
+                kwargs.pop("reasoning_effort")
+                return await self._client.chat.completions.create(**kwargs)
+            raise
+
+    async def _responses_stream(self, messages, deployment, reasoning_effort, cache_key=None):
+        instructions, inp = _split_messages(messages)
+        kwargs: dict = dict(model=deployment, input=inp, stream=True,
+                            **self._cache_kw(cache_key))
+        if instructions:
+            kwargs["instructions"] = instructions
+        if reasoning_effort and _is_reasoning(deployment):
+            kwargs["reasoning"] = {"effort": reasoning_effort}
+        stream = await self._client.responses.create(**kwargs)
+        async for event in stream:
+            etype = getattr(event, "type", "")
+            if etype == "response.output_text.delta":
+                yield getattr(event, "delta", "")
+            elif etype == "response.completed":
+                resp = getattr(event, "response", None)
+                self.usage.add(deployment, *_usage_pair(getattr(resp, "usage", None)))
+
+    async def list_models(self) -> list[str]:
+        try:
+            resp = await self._client.models.list()
+            return sorted({m.id for m in resp.data})
+        except Exception:  # noqa: BLE001
+            return []
+
+
+# Keep backward compat name
+AzureFoundryClient = InferenceClient
+
+
+class MockFoundryClient(FoundryClient):
+    """Offline reviewer + judge. Exercises the full pipeline with zero setup."""
+
+    MODELS = ["gpt-5-codex", "gpt-5", "gpt-4o", "gpt-4.1", "o4-mini",
+              "llama3.1:70b", "qwen2.5-coder:32b", "deepseek-coder-v2"]
+
+    def __init__(self) -> None:
+        self.usage = TokenUsage()
+
+    @staticmethod
+    def _est(messages: list[dict], output: str) -> tuple[int, int]:
+        prompt = sum(len(str(m.get("content", ""))) for m in messages) // 4
+        return prompt, max(1, len(output) // 4)
+
+    async def stream(self, messages, *, model=None, transport="auto",
+                     temperature=0.2, reasoning_effort=None, cache_key=None):
+        text = (
+            f"[MOCK {model or 'reviewer'}] Planning the review. I'll triage the "
+            "static-analysis candidates first, then hunt for logic flaws the scanners "
+            "miss (authz, IDOR, unsafe deserialization, secret handling).\n"
+        )
+        self.usage.add(model or "mock", *self._est(messages, text))
+        for token in re.findall(r"\S+\s*", text):
+            yield token
+            await asyncio.sleep(0.005)
+
+    async def complete_json(self, messages, *, model=None, transport="auto",
+                            temperature=0.1, reasoning_effort=None, cache_key=None):
+        result = await self._complete_json(messages, model=model)
+        self.usage.add(model or "mock", *self._est(messages, json.dumps(result)))
+        return result
+
+    async def _complete_json(self, messages, *, model=None):
+        exploit = self._extract(messages, _EXPLOIT_RE)
+        if exploit is not None:
+            return {"findings": self._exploit(exploit.get("findings", []))}
+        verify = self._extract(messages, _VERIFY_RE)
+        if verify is not None:
+            return {"verdicts": self._verify(verify.get("findings", []))}
+        access = self._extract(messages, _ACCESS_RE)
+        if access is not None:
+            return self._access(access)
+        triage = self._extract(messages, _TRIAGE_RE)
+        if triage is not None:
+            return {"findings": self._triage(triage.get("results", []))}
+        judged = self._extract(messages, _FINDINGS_RE)
+        if judged is not None:
+            return {"findings": self._judge(judged.get("findings", []))}
+        return {"findings": self._review(self._extract(messages, _CTX_RE) or {})}
+
+    def _review(self, ctx: dict) -> list[dict]:
+        findings: list[dict] = []
+        for c in (ctx.get("static_analysis_results") or ctx.get("candidates") or []):
+            findings.append({
+                "title": c.get("title") or c.get("rule") or "Static-analysis candidate",
+                "description": (
+                    f"Confirmed candidate from {c.get('source', 'semgrep')}: "
+                    f"{c.get('message', '')}".strip()
+                ),
+                "severity": c.get("severity", "medium"),
+                "confidence": 0.7,
+                "cwe": c.get("cwe"),
+                "owasp": c.get("owasp"),
+                "category": c.get("category") or "static-analysis",
+                "file_path": c.get("file_path"),
+                "line_start": c.get("line_start"),
+                "line_end": c.get("line_end"),
+                "code_snippet": c.get("code_snippet"),
+                "remediation": "Validate/parameterise inputs; see referenced rule.",
+                "source": "correlated",
+                "state": "proposed",
+            })
+        source_files = ctx.get("source_files") or []
+        first_file = (source_files[0].get("path") if source_files
+                       else None)
+        findings.append({
+            "title": "Possible broken access control on object lookup",
+            "description": (
+                "Object is fetched by client-supplied id without an ownership check. "
+                "Whether this is exploitable depends on business rules I can't infer."
+            ),
+            "severity": "high",
+            "confidence": 0.4,
+            "cwe": "CWE-639",
+            "owasp": "A01:2021",
+            "category": "access-control",
+            "file_path": first_file,
+            "line_start": 1,
+            "line_end": 1,
+            "code_snippet": None,
+            "remediation": "Enforce per-object authorisation tied to the session principal.",
+            "source": "ai",
+            "state": "needs_info",
+            "human_question": (
+                "Should this endpoint be restricted to the resource owner? "
+                "Confirm the intended authorisation rule."
+            ),
+        })
+        return findings
+
+    def _judge(self, findings: list[dict]) -> list[dict]:
+        seen: dict[tuple, dict] = {}
+        out: list[dict] = []
+        for f in findings:
+            key = (f.get("title"), f.get("file_path"))
+            if key in seen:
+                seen[key].setdefault("raw", {}).setdefault("merged_count", 1)
+                seen[key]["raw"]["merged_count"] += 1
+                continue
+            verdict = dict(f)
+            if f.get("state") == "needs_info":
+                pass
+            elif f.get("file_path"):
+                verdict["state"] = "confirmed"
+                verdict["confidence"] = max(float(f.get("confidence", 0.5)), 0.75)
+                verdict["triage_note"] = "Judge: evidence present (file:line); confirmed."
+            else:
+                verdict["state"] = "dismissed"
+                verdict["triage_note"] = "Judge: no file:line evidence; likely false positive."
+            verdict["triaged_by"] = "judge:mock"
+            seen[key] = verdict
+            out.append(verdict)
+        return out
+
+    def _exploit(self, findings: list[dict]) -> list[dict]:
+        """Attach a deterministic PoC / risk / recommendation to each finding."""
+        out: list[dict] = []
+        for f in findings:
+            loc = f.get("file_path") or "the affected handler"
+            line = f.get("line_start")
+            where = f"{loc}:{line}" if line else loc
+            verdict = dict(f)
+            verdict["where_to_look"] = (
+                f"Start at {where}. Trace the tainted input from its entry point "
+                f"(request parameter / header / body) to the sink quoted in the "
+                f"evidence, noting any validation or encoding along the way."
+            )
+            verdict["attack_scenario"] = (
+                "An unauthenticated or low-privileged attacker supplies crafted "
+                "input that reaches the vulnerable sink, altering the intended "
+                "control or data flow."
+            )
+            verdict["proof_of_concept"] = (
+                "# PoC (authorised testing only)\n"
+                f"# Target: {where}\n"
+                "1. Identify the request that reaches this code path.\n"
+                "2. Replace the relevant parameter with a boundary-testing payload\n"
+                "   appropriate to the vuln class (e.g. `' OR '1'='1` for SQLi,\n"
+                "   `../../etc/passwd` for path traversal, `${7*7}` for SSTI).\n"
+                "3. Observe the response for the injected effect and confirm impact."
+            )
+            verdict["risk"] = (
+                f"Severity {f.get('severity', 'medium')}. Impact depends on the sink; "
+                "successful exploitation could lead to data disclosure, integrity "
+                "loss, or remote code execution. Likelihood is a function of "
+                "reachability and required privileges."
+            )
+            verdict["recommendation"] = (
+                f.get("remediation")
+                or "Validate and canonicalize input, use safe APIs "
+                "(parameterised queries, allow-lists), and enforce authorisation "
+                "at the sink."
+            )
+            verdict["exploited_by"] = "exploit:mock"
+            out.append(verdict)
+        return out
+
+    def _triage(self, results: list[dict]) -> list[dict]:
+        """Give every unaddressed scanner hit an explicit verdict."""
+        out: list[dict] = []
+        for r in results:
+            sev = r.get("severity", "medium")
+            real = sev in ("critical", "high")
+            out.append({
+                "id": r.get("id"),
+                "title": r.get("title") or r.get("rule") or "Static-analysis result",
+                "description": f"Triage of {r.get('source', 'scanner')} result: "
+                               f"{r.get('message', '')}".strip(),
+                "severity": sev, "confidence": 0.6 if real else 0.3,
+                "cwe": r.get("cwe"), "owasp": r.get("owasp"),
+                "category": r.get("category") or "static-analysis",
+                "file_path": r.get("file_path"), "line_start": r.get("line_start"),
+                "line_end": r.get("line_end"), "code_snippet": r.get("code_snippet"),
+                "source": "correlated",
+                "state": "proposed" if real else "dismissed",
+                "triage_note": None if real else "Triage (mock): low-severity scanner "
+                                                 "noise; no attacker-controlled input.",
+            })
+        return out
+
+    def _access(self, payload: dict) -> dict:
+        """Deterministic endpoint verdicts: no auth hints on a state-changing
+        route → finding; id path params without ownership → needs_info."""
+        verdicts: list[dict] = []
+        findings: list[dict] = []
+        for ep in payload.get("endpoints") or []:
+            has_auth = ep.get("auth_scope") in ("route", "file", "global")
+            owned = bool(ep.get("ownership_hints"))
+            label = f"{ep.get('method')} {ep.get('path')}"
+            verdicts.append({
+                "id": ep.get("id"),
+                "authn": "required" if has_auth else (
+                    "public" if ep.get("likely_public") else "none"),
+                "authz": "ownership" if owned else (
+                    "role" if ep.get("role_hints") else "unclear"),
+                "risk": "high" if (not has_auth and ep.get("state_changing")
+                                   and not ep.get("likely_public")) else "low",
+                "notes": "mock verdict",
+            })
+            if ep.get("likely_public"):
+                continue
+            if not has_auth and ep.get("state_changing"):
+                findings.append({
+                    "title": f"Missing authentication on {label}",
+                    "description": "State-changing endpoint reachable without any "
+                                   "detected authentication.",
+                    "severity": "high", "confidence": 0.55, "cwe": "CWE-306",
+                    "owasp": "A01:2021", "category": "access-control",
+                    "file_path": ep.get("file_path"), "line_start": ep.get("line"),
+                    "line_end": ep.get("line"), "endpoint": label,
+                    "source": "access", "state": "proposed",
+                })
+            elif ep.get("path_params") and not owned:
+                findings.append({
+                    "title": f"Possible IDOR on {label}",
+                    "description": "Object fetched by client-supplied id with no "
+                                   "ownership check detected.",
+                    "severity": "medium", "confidence": 0.4, "cwe": "CWE-639",
+                    "owasp": "A01:2021", "category": "access-control",
+                    "file_path": ep.get("file_path"), "line_start": ep.get("line"),
+                    "line_end": ep.get("line"), "endpoint": label,
+                    "source": "access", "state": "needs_info",
+                    "human_question": "Should callers only reach objects they own?",
+                })
+        return {"endpoints": verdicts, "findings": findings}
+
+    def _verify(self, findings: list[dict]) -> list[dict]:
+        """Adversarial re-check: no evidence → FP; business logic → uncertain."""
+        out: list[dict] = []
+        for f in findings:
+            ev = (f.get("evidence") or {}).get("status")
+            if not f.get("file_path") or ev in ("file_missing", "line_out_of_range"):
+                out.append({"id": f.get("id"), "verdict": "false_positive",
+                            "confidence": 0.2,
+                            "reasoning": "Mock verifier: cited code could not be "
+                                         "located, so the claim is unsupported."})
+            elif f.get("state") == "needs_info":
+                out.append({"id": f.get("id"), "verdict": "uncertain",
+                            "confidence": 0.4,
+                            "reasoning": "Mock verifier: depends on business rules.",
+                            "human_question": f.get("human_question")
+                            or "Confirm the intended authorisation rule."})
+            else:
+                out.append({"id": f.get("id"), "verdict": "true_positive",
+                            "confidence": max(float(f.get("confidence") or 0.5), 0.8),
+                            "reasoning": "Mock verifier: no guard found between "
+                                         "source and sink."})
+        return out
+
+    async def list_models(self) -> list[str]:
+        return list(self.MODELS)
+
+    @staticmethod
+    def _extract(messages: list[dict], pattern: re.Pattern) -> dict | None:
+        for m in reversed(messages):
+            match = pattern.search(m.get("content", "") or "")
+            if match:
+                try:
+                    return json.loads(match.group(1))
+                except json.JSONDecodeError:
+                    return {}
+        return None
+
+
+def get_foundry_client(cfg: FoundryConfig | None = None) -> FoundryClient:
+    cfg = cfg or FoundryConfig.from_settings()
+    if cfg.mock:
+        return MockFoundryClient()
+    return InferenceClient(cfg)
