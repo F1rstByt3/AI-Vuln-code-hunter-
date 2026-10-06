@@ -1,0 +1,1108 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate, useParams } from "react-router-dom";
+import { BurpActions, BurpBulkSend } from "../components/BurpActions";
+import { Button, Card, SeverityBadge, Spinner, StateBadge } from "../components/ui";
+import { DastLaunch } from "../components/DastPanel";
+import { useScanEvents } from "../hooks/useScanEvents";
+import { api } from "../lib/api";
+import type {
+  ChatMessage, CoverageReport, Endpoint, Finding, FindingCode, Scan, ScanDiff,
+  StageInfo, TokenUsage,
+} from "../lib/types";
+
+// Some AI-produced raw fields can be objects (e.g. an attack_scenario with
+// {entry_point, sink, code_path} or a PoC with {steps, http_requests}). Coerce
+// any value to readable text so React never tries to render a raw object.
+function asText(v: unknown): string {
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  if (Array.isArray(v)) return v.map(asText).join("\n");
+  if (typeof v === "object") {
+    return Object.entries(v as Record<string, unknown>)
+      .map(([k, val]) => `${k}: ${asText(val)}`)
+      .join("\n");
+  }
+  return String(v);
+}
+
+export default function ScanPage() {
+  const { scanId } = useParams();
+  const nav = useNavigate();
+  const { events, status, narration, live, stages, tokens, paused } = useScanEvents(scanId);
+  const [scan, setScan] = useState<Scan>();
+  const [findings, setFindings] = useState<Finding[]>([]);
+  const [chat, setChat] = useState<ChatMessage[]>([]);
+  const [msg, setMsg] = useState("");
+  const [sending, setSending] = useState(false);
+  const [resumeInfo, setResumeInfo] = useState<{ resumable: boolean; completed: Record<string, number> }>();
+
+  const refresh = () => {
+    if (!scanId) return;
+    api.getScan(scanId).then(setScan).catch(() => {});
+    api.listFindings(scanId).then(setFindings).catch(() => {});
+    api.scanResumable(scanId).then(setResumeInfo).catch(() => {});
+  };
+  useEffect(() => { refresh(); api.listChat(scanId!).then(setChat).catch(() => {}); }, [scanId]);
+
+  // Re-pull authoritative findings whenever a finding lands or the scan finishes.
+  // Debounced so rapid batches don't hammer the API — but we must NOT clear the
+  // pending timer on unrelated events (logs/status/stages stream constantly), or
+  // the refresh would never fire while a scan is active.
+  const refreshTimer = useRef<ReturnType<typeof setTimeout>>();
+  const lastType = events[events.length - 1]?.type;
+  useEffect(() => {
+    if (lastType === "done" || lastType === "failed") {
+      refresh();
+    } else if (lastType === "dast_done") {
+      refresh();
+    } else if (lastType === "finding") {
+      clearTimeout(refreshTimer.current);
+      refreshTimer.current = setTimeout(refresh, 1200);
+    }
+  }, [events.length]);
+
+  // Surface chat events streamed from the server (e.g. during-scan questions).
+  useEffect(() => {
+    const chats = events.filter((e) => e.type === "chat");
+    if (chats.length) api.listChat(scanId!).then(setChat).catch(() => {});
+  }, [events.length]);
+
+  const send = async () => {
+    if (!msg.trim() || !scanId) return;
+    setSending(true);
+    try { await api.postChat(scanId, msg.trim()); setMsg(""); await api.listChat(scanId).then(setChat); }
+    finally { setSending(false); }
+  };
+
+  const triage = async (id: string, state: string) => {
+    await api.triageFinding(id, { state });
+    refresh();
+  };
+
+  const rerun = async (stage: string) => {
+    if (!scanId) return;
+    await api.rerunStage(scanId, stage).then(setScan).catch((e) => alert(String(e)));
+  };
+
+  const control = async (action: "pause" | "resume" | "skip" | "cancel") => {
+    if (!scanId) return;
+    await api.controlScan(scanId, action).then(setScan).catch((e) => alert(String(e)));
+  };
+
+  const resume = async () => {
+    if (!scanId) return;
+    await api.resumeScan(scanId).then(setScan).catch((e) => alert(String(e)));
+  };
+
+  const busy = ["queued", "running"].includes(scan?.status || "");
+  const scanners: string[] = (scan?.config?.scanners as string[]) || [];
+
+  // Live stage map wins; fall back to the persisted snapshot for finished scans.
+  const liveStages = Object.values(stages);
+  const stageList: StageInfo[] = (liveStages.length
+    ? liveStages
+    : ((scan?.summary?.stages as StageInfo[]) || [])
+  ).slice().sort((a, b) => (a.order ?? 99) - (b.order ?? 99));
+  const usage: TokenUsage | undefined = tokens || (scan?.summary?.tokens as TokenUsage | undefined);
+
+  return (
+    <div>
+      <button onClick={() => nav(-1)} className="text-sm text-muted hover:text-slate-200 mb-2">← Back</button>
+      <div className="flex items-center gap-3 mb-4">
+        <h1 className="text-2xl font-bold">Scan</h1>
+        <span className="px-2 py-0.5 rounded text-xs border border-border flex items-center gap-1">
+          {live && !paused && <Spinner />} {paused ? "paused" : (status || scan?.status)}
+        </span>
+        {(scan?.status === "running" || scan?.status === "queued") && (
+          <div className="flex gap-1">
+            {paused
+              ? <Button variant="ghost" onClick={() => control("resume")}>▶ Resume</Button>
+              : <Button variant="ghost" onClick={() => control("pause")}>⏸ Pause</Button>}
+            <Button variant="ghost" onClick={() => {
+              if (confirm("Skip the current stage and move on?")) control("skip");
+            }}>⏭ Skip stage</Button>
+            <Button variant="danger" onClick={() => control("cancel").then(refresh)}>Cancel</Button>
+          </div>
+        )}
+        {scan?.status && !["queued", "running"].includes(scan.status) && (
+          <div className="flex gap-1 ml-auto">
+            <a href={api.exportUrl(scanId!, "report")} target="_blank" rel="noreferrer"
+              className="px-2 py-1 rounded text-xs font-medium bg-accent text-white hover:opacity-90">
+              📄 Report
+            </a>
+            <ExportBtn scanId={scanId!} format="burp" label="Burp XML" />
+            <ExportBtn scanId={scanId!} format="sarif" label="SARIF" />
+            <ExportBtn scanId={scanId!} format="csv" label="CSV" />
+            <ExportBtn scanId={scanId!} format="endpoints" label="Endpoints" />
+            {scan.summary?.endpoints?.some((e: Endpoint) => e.auth_scope || e.authn) && (
+              <ExportBtn scanId={scanId!} format="access-matrix" label="Access matrix" />
+            )}
+            {(scan.summary?.endpoints?.length ?? 0) > 0 && (
+              <button
+                onClick={() => {
+                  const base = prompt("Target base URL for the OpenAPI spec (e.g. https://app.example.com)",
+                    "https://");
+                  if (!base || base === "https://") return;
+                  const url = `${api.exportUrl(scanId!, "openapi")}?base_url=${encodeURIComponent(base)}`;
+                  window.open(url, "_blank");
+                }}
+                title="OpenAPI spec of the endpoints, annotated for broken-access-control testing — import into Burp"
+                className="px-2 py-1 rounded text-xs border border-border hover:bg-border text-slate-300">
+                OpenAPI (Burp)
+              </button>
+            )}
+            {(scan.summary?.endpoints?.length ?? 0) > 0 && (
+              <button
+                onClick={() => {
+                  const base = prompt("Target base URL for the requests (blank = this project's live-test target)", "");
+                  if (base === null) return;
+                  window.open(api.burpPackUrl(scanId!, { base_url: base || undefined, min_risk: "medium" }), "_blank");
+                }}
+                title="ZIP of Intruder-ready raw requests (object ids pre-marked with §), id payload lists and a how-to — medium/high-risk endpoints"
+                className="px-2 py-1 rounded text-xs border border-border hover:bg-border text-slate-300">
+                Burp pack (Intruder)
+              </button>
+            )}
+            <button
+              onClick={async () => {
+                if (!confirm("Delete this scan and all its findings? This cannot be undone.")) return;
+                try { await api.deleteScan(scanId!); nav(-1); }
+                catch (e) { alert(String(e)); }
+              }}
+              title="Delete this scan and its findings"
+              className="px-2 py-1 rounded text-xs border border-rose-500/40 text-rose-300 hover:bg-rose-500/10">
+              Delete scan
+            </button>
+          </div>
+        )}
+      </div>
+
+      {scan?.status === "failed" && scan.error && (
+        <div className="mb-4 rounded-lg border border-rose-500/40 bg-rose-500/10 p-3 text-sm">
+          <div className="font-semibold text-rose-200 mb-1">Scan failed</div>
+          <div className="text-slate-200 whitespace-pre-wrap break-words">{scan.error}</div>
+          <div className="text-[11px] text-muted mt-2">
+            Fix the cause (usually Settings → AI Connection), then <b>↻ AI review</b> below to
+            retry without re-running the scanners. Full detail: <code>docker compose logs -f worker</code>.
+          </div>
+        </div>
+      )}
+
+      {scan && !busy && (
+        <div className="flex items-center gap-2 mb-4 text-sm">
+          <span className="text-muted">Re-run stage:</span>
+          {(scanners.includes("semgrep") || scanners.length === 0) && (
+            <Button variant="ghost" onClick={() => rerun("semgrep")}>↻ Semgrep</Button>
+          )}
+          {scanners.includes("sonarqube") && (
+            <Button variant="ghost" onClick={() => rerun("sonarqube")}>↻ SonarQube</Button>
+          )}
+          <Button variant="ghost" onClick={() => rerun("ai")}>↻ AI review</Button>
+          {(scan.summary?.endpoints?.length ?? 0) > 0 && (
+            <Button variant="ghost" onClick={() => {
+              if (confirm("Re-verify access control only? Every regex access-control flag gets an "
+                + "explicit AI verdict; this scan's access-control findings are replaced.")) rerun("access");
+            }}>↻ Access control (AI-verify)</Button>
+          )}
+          <span className="text-[11px] text-muted">replaces just that stage's findings</span>
+        </div>
+      )}
+
+      {/* Checkpoints also exist while a scan is running normally — only offer
+          a resume once it has actually stopped (failed / canceled / crashed). */}
+      {resumeInfo?.resumable && !busy && (
+        <div className="flex items-center gap-3 mb-4 p-3 rounded border border-amber-500/40 bg-amber-500/10 text-sm">
+          <span className="text-amber-300">⏸ This scan was interrupted with saved progress.</span>
+          <span className="flex-1 text-[11px] text-muted">
+            {[
+              resumeInfo.completed.review && `${resumeInfo.completed.review} reviewer batches`,
+              resumeInfo.completed.coverage && `${resumeInfo.completed.coverage} coverage chunks`,
+              resumeInfo.completed.access && `${resumeInfo.completed.access} access-control batches`,
+              resumeInfo.completed.judge && `${resumeInfo.completed.judge} judge chunks`,
+              resumeInfo.completed.verify && `${resumeInfo.completed.verify} verification batches`,
+              resumeInfo.completed.exploit && `${resumeInfo.completed.exploit} exploit batches`,
+            ].filter(Boolean).join(" · ")} already done
+          </span>
+          <Button variant="primary" onClick={resume}>▶ Resume from checkpoint</Button>
+        </div>
+      )}
+
+      <div className="grid grid-cols-3 gap-6">
+        <div className="col-span-2 space-y-6">
+          {stageList.length > 0 && <PipelinePanel stages={stageList} paused={paused} />}
+          {usage && <TokenPanel usage={usage} />}
+
+          <Card className="p-4">
+            <h2 className="font-semibold mb-2 text-sm">Reviewer output {live && "(live)"}</h2>
+            <pre className="text-xs whitespace-pre-wrap text-slate-300 max-h-48 overflow-auto">
+              {narration || "Waiting for the agent…"}
+            </pre>
+            <div className="mt-2 space-y-0.5 max-h-40 overflow-auto">
+              {events.filter((e) => ["status", "log"].includes(e.type)).map((e, i) => {
+                const text = e.status ? `status: ${e.status}` : e.message || "";
+                const bad = /\bfail|error|timed out|unparseable|refused|\[auth\]|\[model\]|\[rate_limit\]|\[endpoint\]|\[context\]|\[timeout\]/i.test(text);
+                return (
+                  <div key={i} className={`text-[11px] ${bad ? "text-rose-300" : "text-muted"}`}>
+                    · {text}
+                  </div>
+                );
+              })}
+            </div>
+          </Card>
+
+          {scan && !busy && <DiffPanel scanId={scanId!} />}
+
+          {scan?.summary?.coverage && <CoveragePanel c={scan.summary.coverage as CoverageReport} />}
+
+          {scan && !busy && scan.project_id && (
+            <DastLaunch scanId={scanId!} projectId={scan.project_id} />
+          )}
+
+          <FindingsPanel findings={findings} onTriage={triage}
+            accessStats={(scan?.summary as any)?.access_control} />
+
+          {scan?.summary?.endpoints?.length > 0 && (
+            <EndpointsPanel endpoints={scan.summary.endpoints} />
+          )}
+        </div>
+
+        <ChatPanel chat={chat} msg={msg} setMsg={setMsg} send={send} sending={sending} />
+      </div>
+    </div>
+  );
+}
+
+const SEV_RANK: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
+
+// Group findings the way Burp groups issues: by issue type (CWE → category →
+// normalized title), so 50 instances of the same SQLi collapse under one header.
+function groupKeyOf(f: Finding): string {
+  const base = f.cwe || f.category || f.title || "other";
+  return String(base).trim().toLowerCase();
+}
+function groupLabelOf(f: Finding): string {
+  return f.category || f.title || f.cwe || "Other";
+}
+
+// Map a finding's raw source to one of the buckets we surface as tabs.
+type SourceBucket = "all" | "semgrep" | "sonarqube" | "ai" | "access" | "dast";
+function bucketOf(f: Finding): Exclude<SourceBucket, "all"> {
+  if (f.source === "semgrep") return "semgrep";
+  if (f.source === "sonarqube") return "sonarqube";
+  if (f.source === "access") return "access";
+  if (f.source === "dast") return "dast";
+  return "ai"; // "ai" + "correlated"
+}
+
+const SOURCE_TABS: { key: SourceBucket; label: string }[] = [
+  { key: "all", label: "All" },
+  { key: "semgrep", label: "Semgrep" },
+  { key: "sonarqube", label: "SonarQube" },
+  { key: "ai", label: "AI" },
+  { key: "access", label: "Access control" },
+  { key: "dast", label: "Live (DAST)" },
+];
+
+function FindingsPanel({ findings: allFindings, onTriage, accessStats }: {
+  findings: Finding[]; onTriage: (id: string, s: string) => void; accessStats?: any;
+}) {
+  const [grouped, setGrouped] = useState(true);
+  const [tab, setTab] = useState<SourceBucket>("all");
+  const [showUnverified, setShowUnverified] = useState(false);
+  const [showDismissed, setShowDismissed] = useState(false);
+
+  // Unverified heuristic access flags and dismissed findings are noise by
+  // default — hidden unless asked for, with the hidden counts always shown.
+  const unverifiedCount = allFindings.filter((f) => f.raw?.unverified).length;
+  const dismissedCount = allFindings.filter((f) => f.state === "dismissed").length;
+  const findings = useMemo(() => allFindings.filter((f) =>
+    (showUnverified || !f.raw?.unverified) && (showDismissed || f.state !== "dismissed")),
+  [allFindings, showUnverified, showDismissed]);
+
+  const counts = useMemo(() => {
+    const c = { all: findings.length, semgrep: 0, sonarqube: 0, ai: 0, access: 0, dast: 0 };
+    for (const f of findings) c[bucketOf(f)]++;
+    return c as Record<SourceBucket, number>;
+  }, [findings]);
+
+  const visible = useMemo(
+    () => (tab === "all" ? findings : findings.filter((f) => bucketOf(f) === tab)),
+    [findings, tab],
+  );
+
+  const groups = useMemo(() => {
+    const m = new Map<string, Finding[]>();
+    for (const f of visible) {
+      const k = groupKeyOf(f);
+      const arr = m.get(k); if (arr) arr.push(f); else m.set(k, [f]);
+    }
+    // Most-severe group first; ties broken by instance count.
+    return [...m.entries()].sort((a, b) => {
+      const sa = Math.min(...a[1].map((f) => SEV_RANK[f.severity] ?? 9));
+      const sb = Math.min(...b[1].map((f) => SEV_RANK[f.severity] ?? 9));
+      return sa - sb || b[1].length - a[1].length;
+    });
+  }, [visible]);
+
+  return (
+    <div>
+      <div className="flex items-center mb-2">
+        <h2 className="font-semibold">Findings ({findings.length})</h2>
+        {visible.length > 0 && (
+          <span className="ml-2 text-xs text-muted">· {groups.length} issue types</span>
+        )}
+        <div className="ml-auto flex items-center gap-4 text-xs text-muted">
+          {unverifiedCount > 0 && (
+            <label className="flex items-center gap-1.5 cursor-pointer select-none"
+              title="Regex-only access-control flags the AI could not give a verdict on">
+              <input type="checkbox" checked={showUnverified} onChange={(e) => setShowUnverified(e.target.checked)} />
+              Unverified heuristics ({unverifiedCount})
+            </label>
+          )}
+          {dismissedCount > 0 && (
+            <label className="flex items-center gap-1.5 cursor-pointer select-none">
+              <input type="checkbox" checked={showDismissed} onChange={(e) => setShowDismissed(e.target.checked)} />
+              Dismissed ({dismissedCount})
+            </label>
+          )}
+          <label className="flex items-center gap-1.5 cursor-pointer select-none">
+            <input type="checkbox" checked={grouped} onChange={(e) => setGrouped(e.target.checked)} />
+            Group by type
+          </label>
+        </div>
+      </div>
+      {/* Source split: Semgrep / SonarQube / AI (with a combined "All"). */}
+      <div className="flex gap-1 mb-3 border-b border-border">
+        {SOURCE_TABS.map((t) => (
+          <button key={t.key} onClick={() => setTab(t.key)}
+            className={`px-3 py-1.5 text-xs -mb-px border-b-2 transition-colors ${
+              tab === t.key
+                ? "border-accent text-slate-100 font-medium"
+                : "border-transparent text-muted hover:text-slate-300"}`}>
+            {t.label}
+            <span className="ml-1.5 px-1.5 py-0.5 rounded-full bg-border/60 tabular-nums">
+              {counts[t.key]}
+            </span>
+          </button>
+        ))}
+      </div>
+      {tab === "access" && accessStats?.heuristic_flags > 0 && (
+        <AccessFlagSummary stats={accessStats} />
+      )}
+      {(tab === "access" || tab === "dast") && (
+        <div className="mb-3">
+          <BurpBulkSend findingIds={visible.filter((f) => f.raw?.endpoint && f.state !== "dismissed")
+            .sort((a, b) => (SEV_RANK[a.severity] ?? 9) - (SEV_RANK[b.severity] ?? 9)).map((f) => f.id)} />
+        </div>
+      )}
+      {visible.length === 0 && (
+        <div className="text-muted text-sm">
+          {findings.length === 0 ? "No findings yet." : "No findings from this source."}
+        </div>
+      )}
+      <div className="space-y-2">
+        {grouped
+          ? groups.map(([key, items]) => (
+              <FindingGroup key={key} items={items} onTriage={onTriage} />
+            ))
+          : visible.map((f) => <FindingRow key={f.id} f={f} onTriage={onTriage} />)}
+      </div>
+    </div>
+  );
+}
+
+function AccessFlagSummary({ stats }: { stats: any }) {
+  const [open, setOpen] = useState(false);
+  const rejected: any[] = stats.rejected_flags || [];
+  const has = typeof stats.flags_rejected === "number";
+  return (
+    <div className="mb-3 rounded-lg border border-border bg-panel2 p-3 text-xs">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+        <span className="text-slate-300">
+          <b>{stats.heuristic_flags}</b> regex access-control flags
+          {has ? " → AI verdicts:" : " (no AI verdicts recorded for this scan)"}
+        </span>
+        {has && <>
+          <span className="text-rose-300">{stats.flags_confirmed} confirmed</span>
+          <span className="text-emerald-300">{stats.flags_rejected} rejected</span>
+          <span className="text-fuchsia-300">{stats.flags_uncertain} need a human</span>
+          {stats.flags_duplicate > 0 && <span className="text-muted">{stats.flags_duplicate} merged into AI findings</span>}
+          {stats.flags_unverified > 0 && <span className="text-amber-300">{stats.flags_unverified} unverified</span>}
+        </>}
+        {rejected.length > 0 && (
+          <button className="ml-auto text-accent-hover hover:underline" onClick={() => setOpen((o) => !o)}>
+            {open ? "hide" : "why rejected?"}
+          </button>
+        )}
+      </div>
+      {open && (
+        <div className="mt-2 max-h-64 overflow-auto space-y-1">
+          {rejected.map((r, i) => (
+            <div key={i} className="flex gap-2">
+              <span className="font-mono text-rose-200/80 shrink-0">{r.endpoint || "—"}</span>
+              <span className="text-muted shrink-0">{(r.rule || "").replace("access.", "")}</span>
+              <span className="text-slate-300">{r.reason || "(no reason given)"}{r.implicit ? " · from endpoint verdict" : ""}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FindingGroup({ items, onTriage }: {
+  items: Finding[]; onTriage: (id: string, s: string) => void;
+}) {
+  // A single instance needs no group chrome — render the row directly.
+  if (items.length === 1) return <FindingRow f={items[0]} onTriage={onTriage} />;
+  const [open, setOpen] = useState(false);
+  const top = items.reduce((a, b) =>
+    (SEV_RANK[a.severity] ?? 9) <= (SEV_RANK[b.severity] ?? 9) ? a : b);
+  const cwe = items.find((f) => f.cwe)?.cwe;
+  const confirmed = items.filter((f) => f.state === "confirmed").length;
+  return (
+    <Card className="p-0 overflow-hidden">
+      <div className="flex items-center gap-3 p-3 cursor-pointer hover:bg-border/30"
+        onClick={() => setOpen((o) => !o)}>
+        <span className="w-3 text-muted">{open ? "▾" : "▸"}</span>
+        <SeverityBadge severity={top.severity} />
+        <span className="flex-1 font-medium text-sm">{groupLabelOf(top)}</span>
+        {cwe && <span className="text-[11px] text-muted">{cwe}</span>}
+        {confirmed > 0 && (
+          <span className="text-[11px] text-emerald-400">{confirmed} confirmed</span>
+        )}
+        <span className="text-xs px-2 py-0.5 rounded-full bg-border/60 text-slate-200">
+          {items.length} instances
+        </span>
+      </div>
+      {open && (
+        <div className="px-3 pb-3 pt-2 space-y-2 border-t border-border">
+          {items.map((f) => <FindingRow key={f.id} f={f} onTriage={onTriage} />)}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+const SOURCE_STYLE: Record<string, string> = {
+  semgrep: "bg-violet-500/20 text-violet-300",
+  sonarqube: "bg-cyan-500/20 text-cyan-300",
+  ai: "bg-emerald-500/20 text-emerald-300",
+  correlated: "bg-amber-500/20 text-amber-300",
+  access: "bg-rose-500/20 text-rose-300",
+  dast: "bg-fuchsia-500/20 text-fuchsia-300",
+};
+
+// [label, classes] for the adversarial verifier's verdict.
+const VERDICT_STYLE: Record<string, [string, string]> = {
+  true_positive: ["✓ verified", "bg-emerald-500/15 text-emerald-300"],
+  false_positive: ["✗ verifier: false positive", "bg-slate-500/20 text-slate-300"],
+  uncertain: ["? verifier unsure", "bg-fuchsia-500/15 text-fuchsia-300"],
+  not_verified: ["not verified", "bg-border/60"],
+};
+
+// Live (DAST) confirmation verdict.
+const DAST_VERDICT_STYLE: Record<string, [string, string]> = {
+  confirmed_vuln: ["🎯 confirmed live", "bg-rose-500/20 text-rose-200"],
+  enforced: ["🛡 enforced by app", "bg-emerald-500/15 text-emerald-300"],
+  inconclusive: ["live: inconclusive", "bg-border/60 text-slate-300"],
+};
+
+// Only citation problems get a badge; verified/location-only stay quiet.
+const EVIDENCE_LABEL: Record<string, string> = {
+  relocated: "⚠ line corrected",
+  snippet_mismatch: "⚠ quote not found in code",
+  line_out_of_range: "⚠ cited line doesn't exist",
+  file_missing: "⚠ cited file doesn't exist",
+};
+
+function FindingRow({ f, onTriage }: { f: Finding; onTriage: (id: string, s: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const [code, setCode] = useState<FindingCode | null>(null);
+  const [showCode, setShowCode] = useState(false);
+  const [analysis, setAnalysis] = useState<string | undefined>(f.raw?.ai_analysis);
+  const [analyzing, setAnalyzing] = useState(false);
+
+  const toggleCode = async () => {
+    setShowCode((s) => !s);
+    if (!code && f.file_path) {
+      try { setCode(await api.getFindingCode(f.id)); } catch { /* ignore */ }
+    }
+  };
+  const runAnalysis = async () => {
+    setAnalyzing(true);
+    try { setAnalysis((await api.analyzeFinding(f.id)).analysis); }
+    catch (e) { setAnalysis(`Analysis failed: ${String(e)}`); }
+    finally { setAnalyzing(false); }
+  };
+
+  return (
+    <Card className="p-3">
+      <div className="flex items-center gap-3 cursor-pointer" onClick={() => setOpen((o) => !o)}>
+        <SeverityBadge severity={f.severity} />
+        <span className="flex-1 font-medium text-sm">{f.title}</span>
+        <span className={`text-[10px] uppercase px-1.5 py-0.5 rounded ${SOURCE_STYLE[f.source] || "bg-border/60 text-slate-300"}`}>
+          {f.source}
+        </span>
+        {f.cwe && <span className="text-[11px] text-muted">{f.cwe}</span>}
+        <StateBadge state={f.state} />
+      </div>
+      <div className="flex flex-wrap items-center gap-2 mt-1 text-[11px] text-muted">
+        {f.raw?.endpoint && (
+          <span className="px-1.5 rounded font-mono bg-rose-500/15 text-rose-200">{f.raw.endpoint}</span>
+        )}
+        {f.file_path && <span>{f.file_path}:{f.line_start}</span>}
+        {f.raw?.ai_verdict === "confirmed" && (
+          <span className="px-1.5 rounded bg-rose-500/15 text-rose-200">AI-confirmed flag</span>
+        )}
+        {f.raw?.ai_verdict === "uncertain" && (
+          <span className="px-1.5 rounded bg-fuchsia-500/15 text-fuchsia-300">AI: needs a human</span>
+        )}
+        {f.raw?.unverified && (
+          <span className="px-1.5 rounded bg-amber-500/15 text-amber-300">unverified heuristic</span>
+        )}
+        {f.raw?.id_kind && (
+          <span className={`px-1.5 rounded ${f.raw.id_kind === "uuid" ? "bg-sky-500/15 text-sky-300" : f.raw.id_kind === "numeric" ? "bg-orange-500/15 text-orange-300" : "bg-border/60"}`}>
+            id: {f.raw.id_kind === "uuid" ? "UUID (hard to guess)" : f.raw.id_kind === "numeric" ? "numeric (enumerable)" : "unknown type"}
+          </span>
+        )}
+        {f.raw?.reviewed_by && <span className="px-1.5 rounded bg-border/60">🔍 {f.raw.reviewed_by}</span>}
+        {f.raw?.merged_count && f.raw.merged_count > 1 && <span>×{f.raw.merged_count} reviewers</span>}
+        {f.raw?.reviewer_agreement && f.raw.reviewer_agreement.of > 1 && (
+          <span className={`px-1.5 rounded ${f.raw.reviewer_agreement.count > 1 ? "bg-emerald-500/15 text-emerald-300" : "bg-border/60"}`}
+            title="Independent reviewers that reported this issue">
+            {f.raw.reviewer_agreement.count}/{f.raw.reviewer_agreement.of} reviewers agree
+          </span>
+        )}
+        {f.raw?.verification && VERDICT_STYLE[f.raw.verification.verdict] && (
+          <span className={`px-1.5 rounded ${VERDICT_STYLE[f.raw.verification.verdict][1]}`}
+            title={f.raw.verification.reasoning}>
+            {VERDICT_STYLE[f.raw.verification.verdict][0]}
+          </span>
+        )}
+        {f.raw?.evidence && EVIDENCE_LABEL[f.raw.evidence.status] && (
+          <span className="px-1.5 rounded bg-amber-500/15 text-amber-300" title={f.raw.evidence.note}>
+            {EVIDENCE_LABEL[f.raw.evidence.status]}
+          </span>
+        )}
+        {f.raw?.origin === "heuristic" && (
+          <span className="px-1.5 rounded bg-border/60" title="Regex-based access-control flag">heuristic</span>
+        )}
+        {f.raw?.dast && DAST_VERDICT_STYLE[f.raw.dast.verdict] && (
+          <span className={`px-1.5 rounded ${DAST_VERDICT_STYLE[f.raw.dast.verdict][1]}`}
+            title={f.raw.dast.evidence?.reason}>
+            {DAST_VERDICT_STYLE[f.raw.dast.verdict][0]}
+          </span>
+        )}
+        {f.triaged_by && <span className="px-1.5 rounded bg-border/60">⚖ {f.triaged_by}</span>}
+      </div>
+      {open && (
+        <div className="mt-3 text-sm space-y-2">
+          <p className="text-slate-300 whitespace-pre-wrap">{asText(f.description)}</p>
+          {f.triage_note && <p className="text-xs text-amber-300/90">⚖ {f.triage_note}</p>}
+          {f.raw?.dast && (
+            <div className="text-xs p-2 rounded border border-rose-500/30 bg-rose-500/5">
+              <span className="font-medium text-slate-200">
+                Live test ({f.raw.dast.by || "access-replay"}):
+              </span>{" "}
+              <span className="text-slate-300">{f.raw.dast.evidence?.reason}</span>
+              {f.raw.dast.evidence?.requests && f.raw.dast.evidence.requests.length > 0 && (
+                <table className="mt-1 text-[11px] text-muted">
+                  <tbody>
+                    {f.raw.dast.evidence.requests.map((rq, i) => (
+                      <tr key={i}>
+                        <td className="pr-2 font-mono">{rq.role}</td>
+                        <td className="pr-2">{rq.error ? rq.error : `HTTP ${rq.status}`}</td>
+                        <td className="pr-2 font-mono truncate max-w-xs">{rq.target || ""}</td>
+                        {rq.owner && <td className="text-muted">owner: {rq.owner}</td>}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
+          {f.raw?.verification?.reasoning && (
+            <div className="text-xs p-2 rounded border border-border bg-bg/60">
+              <span className="font-medium text-slate-200">
+                Verifier{f.raw.verification.by ? ` (${f.raw.verification.by})` : ""}:
+              </span>{" "}
+              <span className="text-slate-300">{f.raw.verification.reasoning}</span>
+              {f.raw.severity_original && f.raw.severity_original !== f.severity && (
+                <span className="block text-muted mt-0.5">
+                  severity adjusted {f.raw.severity_original} → {f.severity}
+                </span>
+              )}
+            </div>
+          )}
+
+          {/* Code view + AI analysis controls */}
+          <div className="flex gap-2">
+            {f.file_path && (
+              <Button variant="ghost" onClick={toggleCode}>
+                {showCode ? "Hide code" : "View code"}
+              </Button>
+            )}
+            <Button variant="ghost" onClick={runAnalysis} disabled={analyzing}>
+              {analyzing ? "Analysing…" : analysis ? "↻ Re-analyse" : "✨ AI analysis"}
+            </Button>
+          </div>
+          {f.raw?.endpoint && <BurpActions findingId={f.id} />}
+
+          {showCode && (
+            <CodeView code={code} highlight={f.line_start} snippet={f.code_snippet} />
+          )}
+          {!showCode && f.code_snippet && (
+            <pre className="text-xs bg-bg border border-border rounded p-2 overflow-auto">{f.code_snippet}</pre>
+          )}
+
+          {analysis && (
+            <div className="text-xs p-3 rounded border border-emerald-500/30 bg-emerald-500/5">
+              <div className="text-emerald-400 font-medium mb-1">✨ AI analysis</div>
+              <div className="text-slate-200 whitespace-pre-wrap leading-relaxed">{analysis}</div>
+            </div>
+          )}
+
+          {f.raw?.where_to_look && (
+            <div className="text-xs">
+              <span className="text-sky-400 font-medium">🔎 Where to look:</span>{" "}
+              <span className="text-slate-300 whitespace-pre-wrap">{asText(f.raw.where_to_look)}</span>
+            </div>
+          )}
+          {f.raw?.attack_scenario && (
+            <div className="text-xs">
+              <span className="text-orange-400 font-medium">🎯 Attack scenario:</span>{" "}
+              <span className="text-slate-300 whitespace-pre-wrap">{asText(f.raw.attack_scenario)}</span>
+            </div>
+          )}
+          {f.raw?.proof_of_concept && (
+            <div className="text-xs">
+              <div className="text-rose-400 font-medium mb-1">
+                💥 Proof of concept {f.raw.exploited_by && <span className="text-muted font-normal">· {asText(f.raw.exploited_by)}</span>}
+              </div>
+              <pre className="text-xs bg-bg border border-rose-500/30 rounded p-2 overflow-auto whitespace-pre-wrap">{asText(f.raw.proof_of_concept)}</pre>
+            </div>
+          )}
+          {f.raw?.risk && (
+            <div className="text-xs">
+              <span className="text-amber-400 font-medium">⚠ Risk:</span>{" "}
+              <span className="text-slate-300 whitespace-pre-wrap">{asText(f.raw.risk)}</span>
+            </div>
+          )}
+          {(f.raw?.recommendation || f.remediation) && (
+            <p className="text-xs">
+              <span className="text-emerald-400 font-medium">✓ Recommendation:</span>{" "}
+              <span className="text-slate-300 whitespace-pre-wrap">{asText(f.raw?.recommendation || f.remediation)}</span>
+            </p>
+          )}
+          {f.human_question && (
+            <div className="text-xs p-2 rounded border border-fuchsia-500/40 bg-fuchsia-500/10 text-fuchsia-200">
+              ❓ {f.human_question}
+            </div>
+          )}
+          <div className="flex gap-2 pt-1">
+            <Button variant="ghost" onClick={() => onTriage(f.id, "confirmed")}>Confirm</Button>
+            <Button variant="ghost" onClick={() => onTriage(f.id, "dismissed")}>Dismiss (FP)</Button>
+            <Button variant="ghost" onClick={() => onTriage(f.id, "needs_info")}>Needs review</Button>
+          </div>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+// Inline source viewer with line numbers; highlights the flagged line.
+function CodeView({ code, highlight, snippet }: {
+  code: FindingCode | null; highlight?: number; snippet?: string;
+}) {
+  if (!code) {
+    return <div className="text-xs text-muted py-2">Loading code…</div>;
+  }
+  if (!code.available) {
+    return (
+      <div className="text-xs">
+        <div className="text-muted mb-1">
+          Source not on disk (workdir recycled) — showing stored snippet.
+        </div>
+        {snippet
+          ? <pre className="bg-bg border border-border rounded p-2 overflow-auto">{snippet}</pre>
+          : <div className="text-muted">No snippet available.</div>}
+      </div>
+    );
+  }
+  return (
+    <div className="text-xs bg-bg border border-border rounded overflow-auto max-h-96">
+      <table className="w-full border-collapse font-mono">
+        <tbody>
+          {code.lines.map((ln) => {
+            const hot = highlight != null && ln.n === highlight;
+            return (
+              <tr key={ln.n} className={hot ? "bg-rose-500/15" : ""}>
+                <td className={`select-none text-right pr-3 pl-2 py-0.5 align-top tabular-nums ${hot ? "text-rose-300" : "text-muted/60"}`}>
+                  {ln.n}
+                </td>
+                <td className="whitespace-pre pr-3 py-0.5 text-slate-200">{ln.text || " "}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+const STAGE_ICON: Record<string, string> = {
+  pending: "○", running: "◐", done: "●", skipped: "⊘", failed: "✕",
+};
+const STAGE_COLOR: Record<string, string> = {
+  pending: "text-muted", running: "text-sky-400", done: "text-emerald-400",
+  skipped: "text-amber-400", failed: "text-rose-400",
+};
+
+function PipelinePanel({ stages, paused }: { stages: StageInfo[]; paused: boolean }) {
+  return (
+    <Card className="p-4">
+      <h2 className="font-semibold mb-3 text-sm flex items-center gap-2">
+        Pipeline {paused && <span className="text-amber-400 text-xs">⏸ paused</span>}
+      </h2>
+      <div className="space-y-1.5">
+        {stages.map((s) => {
+          const pct = s.total ? Math.round(((s.done || 0) / s.total) * 100) : null;
+          return (
+            <div key={s.stage} className="flex items-center gap-2 text-xs">
+              <span className={`w-4 text-center ${STAGE_COLOR[s.state] || "text-muted"} ${s.state === "running" ? "animate-pulse" : ""}`}>
+                {STAGE_ICON[s.state] || "○"}
+              </span>
+              <span className={`w-40 ${s.state === "pending" ? "text-muted" : "text-slate-200"}`}>
+                {s.label || s.stage}
+              </span>
+              {s.total != null && s.total > 0 ? (
+                <div className="flex-1 flex items-center gap-2">
+                  <div className="flex-1 h-1.5 rounded bg-border overflow-hidden">
+                    <div className="h-full bg-sky-500 transition-all"
+                      style={{ width: `${pct}%` }} />
+                  </div>
+                  <span className="text-muted tabular-nums w-20 text-right">
+                    {s.done || 0}/{s.total}
+                  </span>
+                </div>
+              ) : (
+                <span className="flex-1 text-muted">{s.state}</span>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </Card>
+  );
+}
+
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return String(n);
+}
+
+function TokenPanel({ usage }: { usage: TokenUsage }) {
+  const models = Object.entries(usage.by_model || {})
+    .sort((a, b) => b[1].total_tokens - a[1].total_tokens);
+  return (
+    <Card className="p-4">
+      <h2 className="font-semibold mb-1 text-sm">Token usage</h2>
+      <div className="text-xs text-muted mb-3">
+        {fmtTokens(usage.total_tokens)} total · {fmtTokens(usage.prompt_tokens)} in ·{" "}
+        {fmtTokens(usage.completion_tokens)} out · {usage.calls} calls
+      </div>
+      <table className="w-full text-xs">
+        <thead>
+          <tr className="text-muted border-b border-border">
+            <th className="text-left px-2 py-1">Model</th>
+            <th className="text-right px-2 py-1">Input</th>
+            <th className="text-right px-2 py-1">Output</th>
+            <th className="text-right px-2 py-1">Total</th>
+            <th className="text-right px-2 py-1">Calls</th>
+          </tr>
+        </thead>
+        <tbody>
+          {models.map(([model, t]) => (
+            <tr key={model} className="border-b border-border/50">
+              <td className="px-2 py-0.5 font-mono text-slate-200">{model}</td>
+              <td className="px-2 py-0.5 text-right tabular-nums text-muted">{fmtTokens(t.prompt_tokens)}</td>
+              <td className="px-2 py-0.5 text-right tabular-nums text-muted">{fmtTokens(t.completion_tokens)}</td>
+              <td className="px-2 py-0.5 text-right tabular-nums text-slate-200">{fmtTokens(t.total_tokens)}</td>
+              <td className="px-2 py-0.5 text-right tabular-nums text-muted">{t.calls}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </Card>
+  );
+}
+
+function ExportBtn({ scanId, format, label }: { scanId: string; format: string; label: string }) {
+  return (
+    <a href={api.exportUrl(scanId, format)} target="_blank" rel="noreferrer"
+      className="px-2 py-1 rounded text-xs border border-border hover:bg-border text-slate-300">
+      {label}
+    </a>
+  );
+}
+
+const RISK_RANK: Record<string, number> = { high: 0, medium: 1, low: 2 };
+const AUTHN_STYLE: Record<string, string> = {
+  required: "text-emerald-400", public: "text-sky-300", none: "text-rose-400",
+  unclear: "text-amber-300", unassessed: "text-muted",
+};
+const RISK_STYLE: Record<string, string> = {
+  high: "bg-rose-500/20 text-rose-300", medium: "bg-amber-500/20 text-amber-300",
+  low: "bg-border/60 text-muted",
+};
+
+function EndpointsPanel({ endpoints }: { endpoints: Endpoint[] }) {
+  const [open, setOpen] = useState(false);
+  const [riskyOnly, setRiskyOnly] = useState(true);
+  const riskOf = (e: Endpoint) => e.risk || e.heuristic_risk || "low";
+  const hasMatrix = endpoints.some((e) => e.authn || e.auth_scope);
+  const unauth = endpoints.filter((e) =>
+    e.authn ? e.authn === "none" : (e.auth_scope ? e.auth_scope === "none" : e.auth_hints.length === 0));
+  const risky = endpoints.filter((e) => riskOf(e) !== "low");
+  const rows = (hasMatrix && riskyOnly ? risky : endpoints).slice()
+    .sort((a, b) => (RISK_RANK[riskOf(a)] ?? 3) - (RISK_RANK[riskOf(b)] ?? 3));
+  return (
+    <Card className="p-4">
+      <button onClick={() => setOpen((o) => !o)}
+        className="flex items-center gap-2 w-full text-left">
+        <span className="text-sm font-semibold">
+          {open ? "▼" : "▶"} {hasMatrix ? "Access-control matrix" : "Discovered endpoints"} ({endpoints.length})
+        </span>
+        {unauth.length > 0 && (
+          <span className="text-xs text-rose-400">{unauth.length} without authentication</span>
+        )}
+        {hasMatrix && risky.length > 0 && (
+          <span className="text-xs text-amber-400">{risky.length} medium/high risk</span>
+        )}
+      </button>
+      {open && (
+        <>
+          {hasMatrix && (
+            <label className="flex items-center gap-1.5 text-xs text-muted mt-2 cursor-pointer select-none">
+              <input type="checkbox" checked={riskyOnly} onChange={(e) => setRiskyOnly(e.target.checked)} />
+              Only medium/high risk
+            </label>
+          )}
+          <div className="mt-2 max-h-96 overflow-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="text-muted border-b border-border">
+                  <th className="text-left px-2 py-1">Method</th>
+                  <th className="text-left px-2 py-1">Path</th>
+                  {hasMatrix ? (<>
+                    <th className="text-left px-2 py-1">Authn</th>
+                    <th className="text-left px-2 py-1">Authz</th>
+                    <th className="text-left px-2 py-1">Risk</th>
+                  </>) : <th className="text-left px-2 py-1">Auth</th>}
+                  <th className="text-left px-2 py-1">Handler</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((ep, i) => (
+                  <tr key={ep.id || i} className="border-b border-border/50 align-top">
+                    <td className="px-2 py-0.5 font-mono">{ep.method}</td>
+                    <td className="px-2 py-0.5 font-mono">
+                      {ep.path}
+                      {ep.notes && <div className="font-sans text-[10px] text-muted max-w-xs">{ep.notes}</div>}
+                    </td>
+                    {hasMatrix ? (<>
+                      <td className={`px-2 py-0.5 ${AUTHN_STYLE[ep.authn || ""] || "text-muted"}`}
+                        title={`detected: ${ep.auth_scope ?? "?"}${ep.auth_hints.length ? ` (${ep.auth_hints.join(", ")})` : ""}`}>
+                        {ep.authn || `${ep.auth_scope} (heuristic)`}
+                      </td>
+                      <td className="px-2 py-0.5 text-slate-300"
+                        title={[...(ep.role_hints || []), ...(ep.ownership_hints || [])].join(", ")}>
+                        {ep.authz || (ep.ownership_hints?.length ? "ownership?" : ep.role_hints?.length ? "role?" : "—")}
+                      </td>
+                      <td className="px-2 py-0.5">
+                        <span className={`px-1.5 rounded ${RISK_STYLE[riskOf(ep)]}`}>{riskOf(ep)}</span>
+                      </td>
+                    </>) : (
+                      <td className="px-2 py-0.5">
+                        {ep.auth_hints.length > 0
+                          ? <span className="text-emerald-400">{ep.auth_hints.join(", ")}</span>
+                          : <span className="text-amber-400">none</span>}
+                      </td>
+                    )}
+                    <td className="px-2 py-0.5 text-muted">
+                      {(ep.handler_file || ep.file_path)}:{ep.handler_line || ep.line}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {rows.length === 0 && <div className="text-xs text-muted p-2">No medium/high-risk endpoints.</div>}
+          </div>
+        </>
+      )}
+    </Card>
+  );
+}
+
+function DiffPanel({ scanId }: { scanId: string }) {
+  const [diff, setDiff] = useState<ScanDiff | null>(null);
+  const [open, setOpen] = useState(false);
+  useEffect(() => { api.scanDiff(scanId).then(setDiff).catch(() => setDiff(null)); }, [scanId]);
+  if (!diff || !diff.baseline) return null;
+  const { counts } = diff;
+  const when = diff.baseline.created_at
+    ? new Date(diff.baseline.created_at).toLocaleDateString() : "previous scan";
+  const row = (label: string, items: typeof diff.new, color: string) => items.length > 0 && (
+    <div className="mt-2">
+      <div className={`text-xs font-medium ${color}`}>{label} ({items.length})</div>
+      <ul className="mt-1 space-y-0.5">
+        {items.slice(0, 40).map((it) => (
+          <li key={it.fingerprint} className="text-[11px] text-muted flex items-center gap-2">
+            <span className={`uppercase ${SEV_TEXT[it.severity] || ""}`}>{it.severity}</span>
+            <span className="text-slate-300">{it.title}</span>
+            {it.severity_changed_from && <span className="text-amber-400">↑ was {it.severity_changed_from}</span>}
+            {(it.file_path || it.endpoint) && <span className="font-mono">{it.file_path || it.endpoint}</span>}
+          </li>
+        ))}
+        {items.length > 40 && <li className="text-[11px] text-muted">…and {items.length - 40} more</li>}
+      </ul>
+    </div>
+  );
+  return (
+    <Card className="p-4">
+      <button onClick={() => setOpen((o) => !o)} className="flex items-center gap-2 w-full text-left">
+        <span className="font-semibold text-sm">{open ? "▼" : "▶"} Changes since {when}</span>
+        <span className="text-[11px] flex gap-2">
+          <span className="text-rose-300">+{counts.new} new</span>
+          <span className="text-emerald-300">−{counts.fixed} fixed</span>
+          <span className="text-muted">{counts.still_open} still open</span>
+        </span>
+      </button>
+      {open && (
+        <div>
+          {row("🆕 New issues", diff.new, "text-rose-300")}
+          {row("✅ Fixed since baseline", diff.fixed, "text-emerald-300")}
+          {row("↔ Still open", diff.still_open, "text-slate-300")}
+          {counts.new + counts.fixed + counts.still_open === 0 &&
+            <div className="text-[11px] text-muted mt-2">No open issues in either scan.</div>}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+const SEV_TEXT: Record<string, string> = {
+  critical: "text-red-400", high: "text-orange-400", medium: "text-amber-400",
+  low: "text-sky-400", info: "text-slate-400",
+};
+
+function CoveragePanel({ c }: { c: CoverageReport }) {
+  const [showGaps, setShowGaps] = useState(false);
+  const loaded = c.files_loaded ?? 0;
+  const reviewed = loaded - (c.files_unreviewed ?? 0);
+  const staticTotal = c.static_candidates ?? 0;
+  const withVerdict = (c.candidates_addressed_by_review ?? 0) + (c.candidates_triaged ?? 0);
+  const v = c.verification;
+  const ev = c.evidence || {};
+  const evProblems = (ev.snippet_mismatch ?? 0) + (ev.line_out_of_range ?? 0) + (ev.file_missing ?? 0);
+  const gaps = [
+    (c.files_unreviewed ?? 0) > 0 && `${c.files_unreviewed} file(s) no reviewer could read (after retry)`,
+    (c.files_unreadable ?? 0) > 0 && `${c.files_unreadable} file(s) unreadable (binary / too large)`,
+    (c.candidates_over_cap ?? 0) > 0 && `${c.candidates_over_cap} scanner hit(s) over the triage cap`,
+    (c.candidates_triage_missing ?? 0) > 0 && `${c.candidates_triage_missing} scanner hit(s) got no AI verdict (see their Semgrep/SonarQube findings)`,
+    c.checks && !c.checks.coverage && staticTotal > withVerdict &&
+      `${staticTotal - withVerdict} scanner hit(s) not addressed (coverage sweep off)`,
+    (v?.over_cap ?? 0) > 0 && `${v!.over_cap} finding(s) over the verification cap`,
+    (v?.not_verified ?? 0) > 0 && `${v!.not_verified} finding(s) got no verdict from the verifier (model returned no usable output)`,
+    c.endpoints && c.endpoints.total > c.endpoints.assessed && c.checks?.access_control &&
+      `${c.endpoints.total - c.endpoints.assessed} endpoint(s) not assessed`,
+  ].filter(Boolean) as string[];
+  const tile = (label: string, value: string, sub?: string, warn?: boolean) => (
+    <div className="rounded-md border border-border p-2">
+      <div className={`text-base font-semibold tabular-nums ${warn ? "text-amber-300" : ""}`}>{value}</div>
+      <div className="text-[11px] text-muted">{label}</div>
+      {sub && <div className="text-[10px] text-muted mt-0.5">{sub}</div>}
+    </div>
+  );
+  return (
+    <Card className="p-4">
+      <div className="flex items-center mb-2">
+        <h2 className="font-semibold text-sm">Coverage & verification</h2>
+        <span className={`ml-2 text-[11px] ${gaps.length ? "text-amber-300" : "text-emerald-400"}`}>
+          {gaps.length ? `${gaps.length} gap(s)` : "no gaps detected"}
+        </span>
+      </div>
+      <div className="grid grid-cols-5 gap-2">
+        {tile("files reviewed", `${reviewed}/${c.files_total ?? loaded}`,
+          (c.batches_recovered ?? 0) > 0 ? `${c.batches_recovered} batch(es) recovered on retry` : undefined,
+          reviewed < (c.files_total ?? loaded))}
+        {tile("scanner hits with AI verdict", `${withVerdict}/${staticTotal}`,
+          c.candidates_triaged ? `${c.candidates_triaged} via coverage sweep` : undefined,
+          withVerdict < staticTotal)}
+        {tile("second look", c.second_look_files != null ? `${c.second_look_files} files` : "off",
+          c.second_look_files != null ? `${c.second_look_findings ?? 0} new findings` : undefined)}
+        {tile("endpoints assessed", c.endpoints ? `${c.endpoints.assessed}/${c.endpoints.total}` : "—",
+          undefined, !!c.endpoints && c.endpoints.assessed < c.endpoints.total)}
+        {tile("FP verification", v ? `${v.eligible ?? 0} checked` : "off",
+          v ? `${v.true_positive ?? 0} confirmed · ${v.false_positive ?? 0} rejected · ${v.uncertain ?? 0} → human`
+            + ((v.not_verified ?? 0) > 0 ? ` · ${v.not_verified} no verdict` : "") : undefined,
+          (v?.not_verified ?? 0) > 0)}
+      </div>
+      <div className="flex flex-wrap gap-1.5 mt-2 text-[11px]">
+        <span className="text-muted">Citations:</span>
+        {Object.entries(ev).map(([k, n]) => (
+          <span key={k} className={`px-1.5 rounded ${EVIDENCE_LABEL[k] ? "bg-amber-500/15 text-amber-300" : "bg-border/60 text-slate-300"}`}>
+            {k.replace(/_/g, " ")}: {n}
+          </span>
+        ))}
+        {evProblems > 0 && <span className="text-muted">— bad citations were corrected, down-weighted or dismissed</span>}
+      </div>
+      {gaps.length > 0 && (
+        <div className="mt-2 text-[11px]">
+          <button onClick={() => setShowGaps((s) => !s)} className="text-amber-300 hover:underline">
+            {showGaps ? "▾" : "▸"} Coverage gaps
+          </button>
+          {showGaps && (
+            <ul className="mt-1 ml-4 list-disc text-slate-300 space-y-0.5">
+              {gaps.map((g) => <li key={g}>{g}</li>)}
+              {(c.unreviewed_files || []).slice(0, 50).map((p) => (
+                <li key={p} className="font-mono text-muted list-none -ml-4">· {p}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function ChatPanel({ chat, msg, setMsg, send, sending }: {
+  chat: ChatMessage[]; msg: string; setMsg: (s: string) => void; send: () => void; sending: boolean;
+}) {
+  const endRef = useRef<HTMLDivElement>(null);
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [chat.length]);
+  return (
+    <Card className="p-4 flex flex-col h-[70vh]">
+      <h2 className="font-semibold mb-2 text-sm">Interact with the reviewer</h2>
+      <div className="flex-1 overflow-auto space-y-2">
+        {chat.map((m) => (
+          <div key={m.id} className={`text-sm p-2 rounded-md ${m.role === "user" ? "bg-emerald-600/15 ml-6" : "bg-bg border border-border mr-6"}`}>
+            <div className="text-[10px] uppercase text-muted mb-0.5">{m.role}</div>
+            {m.content}
+          </div>
+        ))}
+        {chat.length === 0 && <div className="text-muted text-sm">Ask about a finding, refocus the review, or answer the agent's questions — during or after the scan.</div>}
+        <div ref={endRef} />
+      </div>
+      <div className="mt-2 flex gap-2">
+        <input value={msg} onChange={(e) => setMsg(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && send()} placeholder="Message…"
+          className="flex-1 px-3 py-2 rounded-md bg-bg border border-border text-sm outline-none" />
+        <Button onClick={send} disabled={sending}>{sending ? "…" : "Send"}</Button>
+      </div>
+    </Card>
+  );
+}
