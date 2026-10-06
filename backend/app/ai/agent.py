@@ -856,11 +856,39 @@ def _carry_meta(judged: list[dict], inputs: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 _CONTEXT_OVERFLOW_MARKERS = ("context_length_exceeded", "context window", "maximum context")
+# A truncated prompt (profile context window larger than the server actually
+# loads) doesn't error — the model just returns junk, which we raise as "no
+# parseable JSON". Shrinking the batch makes the prompt fit the real window, so
+# we split on this too, not only on an explicit overflow error.
+_BAD_OUTPUT_MARKERS = ("no parseable", "no usable json", "unparseable")
 
 
 def _is_context_overflow(exc: Exception) -> bool:
     msg = str(exc).lower()
     return any(m in msg for m in _CONTEXT_OVERFLOW_MARKERS)
+
+
+# Bad output is an ambiguous signal (could be a truncated prompt, or just a
+# model too weak for JSON). Split on it, but shallower than a definite overflow
+# and only by file — so a genuinely broken model wastes few calls before the
+# circuit breaker stops the run, while a real truncation still self-heals.
+_BAD_OUTPUT_SPLIT_DEPTH = 2
+
+
+def _is_bad_output(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(m in msg for m in _BAD_OUTPUT_MARKERS)
+
+
+def _split_mode(exc: Exception, depth: int, n_files: int) -> str:
+    """How to shrink a failed batch: 'file' (split multi-file), 'slice' (slice a
+    single oversized file), or '' (give up). Overflow is a hard signal → split
+    deep, including single-file slicing; bad output → shallow, multi-file only."""
+    if _is_context_overflow(exc) and depth < 4:
+        return "file" if n_files > 1 else ("slice" if n_files == 1 else "")
+    if _is_bad_output(exc) and depth < _BAD_OUTPUT_SPLIT_DEPTH and n_files > 1:
+        return "file"
+    return ""
 
 
 async def _review_with_adaptive_split(
@@ -940,7 +968,8 @@ async def _review_with_adaptive_split(
     except Exception as exc:  # noqa: BLE001
         files = batch["source_files"]
         hints = batch.get("hints") or []
-        if _is_context_overflow(exc) and depth < 4 and len(files) > 1:
+        mode = _split_mode(exc, depth, len(files))
+        if mode == "file":
             # Multi-file batch: split by file (each half keeps true line numbers).
             mid = len(files) // 2
             files_a = files[:mid]
@@ -955,13 +984,13 @@ async def _review_with_adaptive_split(
             size_a = sum(len(f.get("content") or "") for f in files_a)
             size_b = sum(len(f.get("content") or "") for f in files_b)
             await emit({"type": "log",
-                        "message": f"Batch {batch_idx + 1} overflowed context "
-                                   f"(depth={depth}); splitting into "
+                        "message": f"Batch {batch_idx + 1} too large for the model "
+                                   f"window (depth={depth}); splitting into "
                                    f"{len(files_a)} files ({size_a // 1024}KB) + "
                                    f"{len(files_b)} files ({size_b // 1024}KB)"})
             return await recurse(batch_a, line_offset) + await recurse(batch_b, line_offset)
 
-        if _is_context_overflow(exc) and depth < 4 and len(files) == 1:
+        if mode == "slice" and len(files) == 1:
             # A single file is too big for the window. Slice it along line
             # boundaries and review each half; findings from the second half get
             # their line numbers shifted back so they reference the real file.
